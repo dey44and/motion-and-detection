@@ -27,9 +27,9 @@ CAMERA_LAYOUT = (
     CameraInfo("CAM_FRONT_LEFT", "Front left", 0, 0),
     CameraInfo("CAM_FRONT", "Front", 0, 1),
     CameraInfo("CAM_FRONT_RIGHT", "Front right", 0, 2),
-    CameraInfo("CAM_BACK_LEFT", "Back left", 1, 0),
+    CameraInfo("CAM_BACK_RIGHT", "Back right", 1, 0),
     CameraInfo("CAM_BACK", "Back", 1, 1),
-    CameraInfo("CAM_BACK_RIGHT", "Back right", 1, 2),
+    CameraInfo("CAM_BACK_LEFT", "Back left", 1, 2),
 )
 _CAMERAS = {info.channel: info for info in CAMERA_LAYOUT}
 _CATEGORY_TO_DETECTION = {

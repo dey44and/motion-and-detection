@@ -194,8 +194,8 @@ class CameraViewer:
         self.grid_frame.grid(row=0, column=1, sticky="nsew")
         self._set_layout((
             CameraInfo("CAM_FRONT_LEFT", "Front left", 0, 0), CameraInfo("CAM_FRONT", "Front", 0, 1),
-            CameraInfo("CAM_FRONT_RIGHT", "Front right", 0, 2), CameraInfo("CAM_BACK_LEFT", "Rear left", 1, 0),
-            CameraInfo("CAM_BACK", "Rear", 1, 1), CameraInfo("CAM_BACK_RIGHT", "Rear right", 1, 2),
+            CameraInfo("CAM_FRONT_RIGHT", "Front right", 0, 2), CameraInfo("CAM_BACK_RIGHT", "Rear right", 1, 0),
+            CameraInfo("CAM_BACK", "Rear", 1, 1), CameraInfo("CAM_BACK_LEFT", "Rear left", 1, 2),
         ))
         self._sync_navigation()
 
