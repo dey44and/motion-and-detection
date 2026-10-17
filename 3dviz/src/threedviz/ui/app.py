@@ -14,6 +14,9 @@ from threedviz.visualization.renderer import SceneRenderer
 
 
 class ViewerWindow:
+    window_title = "3dviz · Dataset viewer"
+    viewer_title = "3dviz"
+
     def __init__(
         self,
         *,
@@ -25,7 +28,7 @@ class ViewerWindow:
         autoload=False,
     ):
         self.application = gui.Application.instance
-        self.window = self.application.create_window("3dviz · Dataset viewer", 1440, 900)
+        self.window = self.application.create_window(self.window_title, 1440, 900)
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="3dviz-loader")
         self._future: Future | None = None
         self._request_id = 0
@@ -55,7 +58,7 @@ class ViewerWindow:
     def _build_sidebar(self, dataset, root, version):
         em = self.window.theme.font_size
         self.sidebar = gui.ScrollableVert(0.5 * em, gui.Margins(em, em, em, em))
-        self.sidebar.add_child(gui.Label("3dviz"))
+        self.sidebar.add_child(gui.Label(self.viewer_title))
         self.sidebar.add_child(gui.Label("Autonomous driving datasets"))
 
         connection = gui.CollapsableVert("Dataset", 0.4 * em)
@@ -82,9 +85,12 @@ class ViewerWindow:
         self.load_button = gui.Button("Load dataset")
         self.load_button.set_on_clicked(self.load_dataset)
         connection.add_child(self.load_button)
+        self._extend_dataset_controls(connection, em)
+        self.connection_section = connection
         self.sidebar.add_child(connection)
 
         navigation = gui.CollapsableVert("Scene and frame", 0.4 * em)
+        self._extend_navigation_controls(navigation, em)
         self.scene_choice = gui.Combobox()
         self.scene_choice.set_on_selection_changed(self._on_scene_choice)
         navigation.add_child(self.scene_choice)
@@ -139,8 +145,38 @@ class ViewerWindow:
         self.raw_hint = gui.Label("Boxes stay at the sweep reference time.")
         self.raw_hint.visible = False
         cloud.add_child(self.raw_hint)
+        self._configure_cloud_section(cloud)
         self.sidebar.add_child(cloud)
 
+        self.sidebar.add_child(self._build_box_section(em))
+        self._extend_sidebar(em)
+
+        self.axes_checkbox = gui.Checkbox("Show coordinate axes")
+        self.axes_checkbox.checked = True
+        self.axes_checkbox.tooltip = "3 m reference axes at the sensor origin: X red, Y green, Z blue"
+        self.axes_checkbox.set_on_checked(self.renderer.show_axes)
+        self.sidebar.add_child(self.axes_checkbox)
+        reset_button = gui.Button("Reset camera")
+        reset_button.set_on_clicked(self.renderer.reset_camera)
+        self.sidebar.add_child(reset_button)
+        self.sidebar.add_child(gui.Label("Drag: rotate · Scroll: zoom\nRight drag: pan"))
+        self.status = gui.Label("Choose a dataset root or select demo.")
+        self.sidebar.add_child(self.status)
+        self._on_dataset_choice(dataset, 0)
+
+    def _extend_dataset_controls(self, connection, em):
+        """Optional controls for applications sharing this viewer."""
+
+    def _extend_navigation_controls(self, navigation, em):
+        """Optional scene selection controls, such as dataset splits."""
+
+    def _extend_sidebar(self, em):
+        """Optional application controls after the box section."""
+
+    def _configure_cloud_section(self, cloud):
+        """Optional presentation of the shared point-cloud controls."""
+
+    def _build_box_section(self, em):
         boxes = gui.CollapsableVert("3D bounding boxes", 0.4 * em)
         boxes.add_child(gui.Label("Line width (pixels)"))
         self.line_width = gui.Slider(gui.Slider.DOUBLE)
@@ -159,19 +195,13 @@ class ViewerWindow:
         self.class_list = gui.WidgetProxy()
         self.class_list.set_widget(gui.Label("Classes appear after loading."))
         boxes.add_child(self.class_list)
-        self.sidebar.add_child(boxes)
+        return boxes
 
-        self.axes_checkbox = gui.Checkbox("Show coordinate axes")
-        self.axes_checkbox.checked = True
-        self.axes_checkbox.set_on_checked(self.viewport.scene.show_axes)
-        self.sidebar.add_child(self.axes_checkbox)
-        reset_button = gui.Button("Reset camera")
-        reset_button.set_on_clicked(self.renderer.reset_camera)
-        self.sidebar.add_child(reset_button)
-        self.sidebar.add_child(gui.Label("Drag: rotate · Scroll: zoom\nRight drag: pan"))
-        self.status = gui.Label("Choose a dataset root or select demo.")
-        self.sidebar.add_child(self.status)
-        self._on_dataset_choice(dataset, 0)
+    def _create_dataset_adapter(self, name, root, version):
+        return create_dataset(name, root=root, version=version)
+
+    def _render_loaded_frame(self, data, *, reset_camera=False):
+        self.renderer.set_frame(data, reset_camera=reset_camera)
 
     def _on_layout(self, context):
         rect = self.window.content_rect
@@ -249,7 +279,7 @@ class ViewerWindow:
         raw = self.renderer.settings.use_raw_points
 
         def job():
-            adapter = create_dataset(name, root=root, version=version)
+            adapter = self._create_dataset_adapter(name, root, version)
             scenes = adapter.list_scenes()
             if not scenes:
                 raise ValueError("This dataset contains no scenes with LiDAR keyframes.")
@@ -305,7 +335,7 @@ class ViewerWindow:
 
         def loaded(result):
             frames, data = result
-            self.renderer.set_frame(data, reset_camera=True)
+            self._render_loaded_frame(data, reset_camera=True)
             self._frames = frames
             self._scene_index, self._frame_index = index, 0
             self.scene_choice.selected_index = index
@@ -325,7 +355,7 @@ class ViewerWindow:
         mode, raw = self.renderer.settings.color_scheme, self.renderer.settings.use_raw_points
 
         def loaded(data):
-            self.renderer.set_frame(data, reset_camera=False)
+            self._render_loaded_frame(data, reset_camera=False)
             self._frame_index = index
             self._update_frame_controls(data)
 
@@ -473,7 +503,7 @@ class ViewerWindow:
         previous_mode, previous_raw = settings.color_scheme, settings.use_raw_points
         settings.color_scheme, settings.use_raw_points = mode, raw
         try:
-            self.renderer.set_frame(frame, reset_camera=reset_camera)
+            self._render_loaded_frame(frame, reset_camera=reset_camera)
         except Exception:
             settings.color_scheme, settings.use_raw_points = previous_mode, previous_raw
             raise
@@ -516,7 +546,7 @@ class ViewerWindow:
         self.renderer.update_boxes()
 
     def _show_error(self, error):
-        print(f"3dviz: {error}", file=sys.stderr)
+        print(f"{self.viewer_title}: {error}", file=sys.stderr)
         dialog = gui.Dialog("Unable to load dataset")
         em = self.window.theme.font_size
         content = gui.Vert(em, gui.Margins(em, em, em, em))

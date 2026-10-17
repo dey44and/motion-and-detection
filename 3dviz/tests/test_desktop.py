@@ -266,15 +266,39 @@ def test_native_loading_navigation_styles_and_error_recovery(tmp_path, monkeypat
         assert viewer.renderer.frame.rgb_colors is None
         assert viewer.renderer.frame.raw_points is None
         viewer.renderer.reset_camera()
-        images = []
-        viewer.viewport.scene.scene.render_to_image(lambda image: images.append(np.asarray(image).copy()))
-        deadline = time.monotonic() + 20
-        while not images and time.monotonic() < deadline:
-            application.run_one_tick()
-            time.sleep(0.01)
-        assert images, "The renderer did not produce an image"
-        assert np.all(images[0][5, 5, :3] >= 254), "The viewport background must be white"
-        assert (images[0][:, :, :3] < 200).any(), "The viewport must contain visible geometry"
+        def capture_viewport():
+            images = []
+            viewer.viewport.scene.scene.render_to_image(lambda image: images.append(np.asarray(image).copy()))
+            # An unchanged SceneWidget may serve its cached view; request a
+            # fresh draw after queuing each image readback.
+            viewer.viewport.force_redraw()
+            viewer.window.post_redraw()
+            deadline = time.monotonic() + 20
+            while not images and time.monotonic() < deadline:
+                application.run_one_tick()
+                time.sleep(0.01)
+            assert images, "The renderer did not produce an image"
+            return images[0]
+
+        before = capture_viewport()
+        assert np.all(before[5, 5, :3] >= 254), "The viewport background must be white"
+        assert (before[:, :, :3] < 200).any(), "The viewport must contain visible geometry"
+        camera = viewer.viewport.scene.camera.get_view_matrix().copy()
+        cloud = viewer.renderer._cloud
+        axes = viewer.renderer._axes_geometry
+        vertices = np.asarray(axes.vertices).copy()
+        for _ in range(3):
+            viewer.renderer.show_axes(False)
+            assert not viewer.viewport.scene.geometry_is_visible("coordinate_axes")
+            viewer.renderer.show_axes(True)
+            assert viewer.viewport.scene.geometry_is_visible("coordinate_axes")
+        assert viewer.renderer._cloud is cloud
+        np.testing.assert_array_equal(camera, viewer.viewport.scene.camera.get_view_matrix())
+        np.testing.assert_array_equal(vertices, np.asarray(axes.vertices))
+        np.testing.assert_allclose(vertices.max(axis=0), [3, 3, 3])
+        # Same camera and scene should render identically after toggling. This
+        # catches the original screen-spanning axes, not only widget state.
+        np.testing.assert_array_equal(capture_viewport(), before)
         # Allow native layout and drawing to settle before optional inspection.
         deadline = time.monotonic() + 0.5
         while time.monotonic() < deadline:

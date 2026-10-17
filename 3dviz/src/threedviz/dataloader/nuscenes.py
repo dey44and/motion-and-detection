@@ -273,6 +273,12 @@ class NuScenesAdapter(DatasetAdapter):
     def list_scenes(self) -> tuple[SceneInfo, ...]:
         return self._scenes
 
+    def list_scenes_for_split(self, split: str = "all") -> tuple[SceneInfo, ...]:
+        from .splits import scene_names_for_split
+
+        names = scene_names_for_split(split, self.version)
+        return self._scenes if names is None else tuple(scene for scene in self._scenes if scene.name in names)
+
     def list_frames(self, scene_token: str) -> tuple[FrameInfo, ...]:
         try:
             return self._frames_by_scene[scene_token]
@@ -319,6 +325,9 @@ class NuScenesAdapter(DatasetAdapter):
         sensor_translation = _vector(calibration.get("translation"), 3, "calibrated sensor translation")
         ego_translation = _vector(pose.get("translation"), 3, "ego pose translation")
         global_to_sensor = sensor_to_ego.T @ ego_to_global.T
+        reference_sensor_to_world = np.eye(4)
+        reference_sensor_to_world[:3, :3] = ego_to_global @ sensor_to_ego
+        reference_sensor_to_world[:3, 3] = ego_to_global @ sensor_translation + ego_translation
 
         boxes = []
         for annotation, class_name in self._annotations.get(frame_token, ()):
@@ -343,6 +352,7 @@ class NuScenesAdapter(DatasetAdapter):
             points=np.ascontiguousarray(scan[:, :3]),
             intensity=np.ascontiguousarray(scan[:, 3]),
             boxes=tuple(boxes),
+            reference_sensor_to_world=reference_sensor_to_world,
             lidar_timestamp_us=(
                 frame_info.timestamp_us if _timestamp(data.get("timestamp")) is None
                 else _timestamp(data.get("timestamp"))

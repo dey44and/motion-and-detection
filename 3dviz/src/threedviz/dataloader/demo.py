@@ -41,6 +41,11 @@ class DemoAdapter(DatasetAdapter):
     def list_scenes(self) -> tuple[SceneInfo, ...]:
         return self._scenes
 
+    def list_scenes_for_split(self, split: str = "all") -> tuple[SceneInfo, ...]:
+        if isinstance(split, str) and split.strip().lower() in {"all", "val", "mini_val"}:
+            return self._scenes
+        raise DatasetError(f"Demo data supports all, val and mini_val splits, not {split!r}.")
+
     def list_frames(self, scene_token: str) -> tuple[FrameInfo, ...]:
         try:
             return self._frames_by_scene[scene_token]
@@ -104,4 +109,5 @@ class DemoAdapter(DatasetAdapter):
             )))
         points = np.ascontiguousarray(np.concatenate(clouds), dtype=np.float32)
         intensity = rng.uniform(20, 220, len(points)).astype(np.float32)
-        return FrameData(info=info, points=points, boxes=boxes, intensity=intensity)
+        return FrameData(info=info, points=points, boxes=boxes, intensity=intensity,
+                         reference_sensor_to_world=np.eye(4))

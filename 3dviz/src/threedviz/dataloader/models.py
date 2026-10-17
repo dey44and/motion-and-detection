@@ -49,6 +49,11 @@ class FrameData:
     point order. Each raw point is expressed in its own acquisition-time sensor
     frame; boxes remain in the sweep reference frame. RGB arrays have shape
     (N, 3) in [0, 1], with a boolean (N,) validity mask for camera coverage.
+
+    ``reference_sensor_to_world`` maps sweep-reference sensor coordinates into
+    the dataset's world frame. Adapters without a world frame may leave it
+    unset. The transform remains tied to the compensated reference even when
+    optional acquisition-time points are displayed.
     """
 
     info: FrameInfo
@@ -61,3 +66,4 @@ class FrameData:
     raw_points: np.ndarray | None = None
     rgb_colors: np.ndarray | None = None
     rgb_valid_mask: np.ndarray | None = None
+    reference_sensor_to_world: np.ndarray | None = None

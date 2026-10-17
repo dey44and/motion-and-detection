@@ -2,6 +2,8 @@
 
 A standalone desktop viewer for autonomous driving point clouds and 3D ground truth boxes. The left panel selects the dataset, scene and frame and controls appearance; the right panel displays the scene on a white background. Drag with the mouse to rotate and use the scroll wheel to zoom.
 
+For comparing prediction files against ground truth, use the companion [3ddetviz](../3ddetviz/README.md). It shares this viewer's dataset loading, point controls, geometry and camera navigation, with independent ground-truth and detection layers. The `3dviz` launcher retains its existing class colors and controls.
+
 ## Install and launch
 
 Use Python 3.10–3.12 and a desktop session with an OpenGL-capable display. From the `motion-and-detection` directory:
@@ -63,6 +65,8 @@ The viewer displays ground truth from individual LiDAR keyframes and uses camera
 - Drag to rotate the scene and scroll to zoom.
 
 Dataset and frame loading run on a single background worker. The window stays responsive, and outdated requests do not replace the latest selection. Rendering uses Open3D's [SceneWidget](https://www.open3d.org/docs/release/python_api/open3d.visualization.gui.SceneWidget.html).
+
+Coordinate axes are a fixed 3-metre reference at the sensor origin: X red, Y green, Z blue. Toggling them preserves their size and the current camera; they do not affect camera fitting. The same axes are used in `3ddetviz`.
 
 ## Camera RGB and point timing
 

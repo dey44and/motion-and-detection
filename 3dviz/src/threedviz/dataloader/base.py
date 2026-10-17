@@ -18,6 +18,16 @@ class DatasetAdapter(ABC):
     def list_scenes(self) -> tuple[SceneInfo, ...]:
         """Return scenes in a stable order; loading points is deferred."""
 
+    def list_scenes_for_split(self, split: str = "all") -> tuple[SceneInfo, ...]:
+        """Return scenes belonging to a dataset-defined split.
+
+        Existing adapters need no changes: ``all`` preserves their ordinary
+        scene list. Other split names require an adapter implementation.
+        """
+        if isinstance(split, str) and split.strip().lower() == "all":
+            return self.list_scenes()
+        raise DatasetError(f"This dataset does not support split {split!r}.")
+
     @abstractmethod
     def list_frames(self, scene_token: str) -> tuple[FrameInfo, ...]:
         """Return chronologically ordered frames with zero-based indices."""
