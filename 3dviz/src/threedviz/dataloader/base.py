@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+from dataset_utils.errors import DatasetError
+
 from .models import FrameData, FrameInfo, SceneInfo
-
-
-class DatasetError(RuntimeError):
-    """A dataset cannot be read or has inconsistent metadata."""
 
 
 class DatasetAdapter(ABC):
@@ -17,6 +15,10 @@ class DatasetAdapter(ABC):
     @abstractmethod
     def list_scenes(self) -> tuple[SceneInfo, ...]:
         """Return scenes in a stable order; loading points is deferred."""
+
+    @property
+    def available_splits(self) -> tuple[str, ...]:
+        return ("all",)
 
     def list_scenes_for_split(self, split: str = "all") -> tuple[SceneInfo, ...]:
         """Return scenes belonging to a dataset-defined split.
@@ -50,6 +52,17 @@ class DatasetAdapter(ABC):
     def supports_point_timing(self) -> bool:
         """Whether acquisition times and uncompensated points can be prepared."""
         return False
+
+    @property
+    def supports_acquisition_geometry(self) -> bool:
+        """Whether a full scan can be shown without ego compensation.
+
+        Legacy adapters historically supplied raw geometry with point timing.
+        """
+        return self.supports_point_timing
+
+    def close(self) -> None:
+        """Release an adapter after its caller finishes all pending reads."""
 
     def prepare_frame(
         self, frame: FrameData, *, camera_rgb: bool = False, point_timing: bool = False

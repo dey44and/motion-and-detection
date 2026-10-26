@@ -136,7 +136,7 @@ def test_no_camera_metadata_does_not_advertise_rgb(rgb_nuscenes_root):
     adapter = create_dataset("nuscenes", root=rgb_nuscenes_root)
     assert adapter.supports_point_timing
     assert not adapter.supports_camera_rgb
-    with pytest.raises(DatasetError, match="No camera images near this lidar scan"):
+    with pytest.raises(DatasetError, match="does not offer rgb_coloring"):
         adapter.prepare_frame(adapter.load_frame("sample"), camera_rgb=True)
 
 
@@ -196,8 +196,10 @@ def test_scene_trajectory_uses_all_sensor_poses_and_rejects_missing_timing_on_re
     adapter = create_dataset("nuscenes", root=rgb_nuscenes_root)
     assert not adapter.supports_point_timing
     frame = adapter.load_frame("sample")
-    assert frame.lidar_timestamp_us == frame.info.timestamp_us
-    with pytest.raises(DatasetError, match="valid LIDAR_TOP sample_data timestamp"):
+    # The reference ego pose still has its own timestamp; it is not the
+    # nominal sample timestamp and does not establish a scan interval.
+    assert frame.lidar_timestamp_us == 1_000_000
+    with pytest.raises(DatasetError, match="acquisition-time geometry is unavailable"):
         adapter.prepare_frame(frame, point_timing=True)
 
 

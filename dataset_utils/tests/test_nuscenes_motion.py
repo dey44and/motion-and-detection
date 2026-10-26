@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from threedviz.processing.motion import (
+from dataset_utils.nuscenes.motion import (
     HDL32E_COLUMNS,
     PoseTrajectory,
     compensated_points_to_world,

@@ -43,6 +43,15 @@ def test_native_loading_navigation_styles_and_error_recovery(tmp_path, monkeypat
         def supports_point_timing(self):
             return True
 
+        @property
+        def available_splits(self):
+            return ("all", "val")
+
+        def list_scenes_for_split(self, split="all"):
+            if split == "val":
+                return self.list_scenes()[1:]
+            return super().list_scenes_for_split(split)
+
         def prepare_frame(self, frame, *, camera_rgb=False, point_timing=False):
             self.prepare_calls.append((frame.info.token, camera_rgb, point_timing, threading.get_ident()))
             if camera_rgb and self.fail_rgb:
@@ -63,6 +72,40 @@ def test_native_loading_navigation_styles_and_error_recovery(tmp_path, monkeypat
 
     monkeypatch.setattr(factory, "_REGISTRY", factory._REGISTRY.copy())
     factory.register_dataset("rgb-ui-fixture", RGBUIFixture)
+    from dataset_utils import DatasetLoader, register_loader
+    from dataset_utils.contracts.models import (
+        AcquisitionGeometry, Capability, DatasetMetadata, FrameInfo as SharedFrameInfo,
+        Modality, PointCloudFrame, ProcessingProvenance, SceneInfo as SharedSceneInfo,
+    )
+
+    class GeometryLoader(DatasetLoader):
+        coverage = "partial"
+
+        @property
+        def metadata(self):
+            return DatasetMetadata("native-geometry-ui", "Geometry UI", frozenset((
+                Capability.POINT_CLOUD, Capability.ACQUISITION_GEOMETRY)),
+                feature_coverage={Capability.ACQUISITION_GEOMETRY: self.coverage})
+
+        def list_scenes(self, *, split="all"):
+            return (SharedSceneInfo("scene", "Geometry"),)
+
+        def list_frames(self, scene_id, *, modality):
+            return (SharedFrameInfo("frame", scene_id, 0, None, frozenset((Modality.POINT_CLOUD,))),)
+
+        def load_point_cloud(self, frame_id):
+            return PointCloudFrame(self.list_frames("scene", modality=Modality.POINT_CLOUD)[0],
+                "native", "vehicle", np.array([[0., 0, 0], [1., 1, 1], [1., -1, 0]]))
+
+        def prepare_point_cloud(self, frame, *, request):
+            return replace(frame, acquisition=AcquisitionGeometry(frame.points - [1., 0, 0],
+                np.ones(len(frame.points), dtype=bool), "vehicle@acquisition", ProcessingProvenance("pixel-poses")))
+
+    class FullGeometryLoader(GeometryLoader):
+        coverage = "full"
+
+    register_loader("native-geometry-partial-ui", GeometryLoader)
+    register_loader("native-geometry-full-ui", FullGeometryLoader)
     application = gui.Application.instance
     application.initialize()
     viewer = ViewerWindow(dataset="demo", autoload=True)
@@ -142,6 +185,7 @@ def test_native_loading_navigation_styles_and_error_recovery(tmp_path, monkeypat
         assert viewer.next_button.enabled is True
 
         viewer.dataset_choice.selected_text = "rgb-ui-fixture"
+        viewer._on_dataset_choice("rgb-ui-fixture", 0)
         viewer.load_dataset()
         wait_for_idle()
         fixture = viewer._adapter
@@ -255,9 +299,49 @@ def test_native_loading_navigation_styles_and_error_recovery(tmp_path, monkeypat
         wait_for_idle()
         assert viewer.renderer.settings.use_raw_points
 
-        viewer.dataset_choice.selected_text = "demo"
-        viewer.load_dataset()
+        # Split navigation must prepare the active point modes on its worker.
+        viewer.dataset_split_choice.selected_text = "val"
+        viewer._on_dataset_split("val", 1)
         wait_for_idle()
+        assert viewer._dataset_split == "val"
+        assert len(viewer._scenes) == 1
+        assert viewer.renderer.frame.info.scene_token == "demo-highway"
+        assert viewer.renderer.settings.color_scheme == "camera_rgb"
+        assert viewer.renderer.settings.use_raw_points
+        assert fixture.prepare_calls[-1][1:3] == (True, True)
+        old_frame = viewer.renderer.frame
+        viewer._on_dataset_split("missing", 2)
+        wait_for_idle()
+        assert "Loading failed" in viewer.status.text
+        assert viewer.renderer.frame is old_frame
+        assert viewer._dataset_split == "val"
+        assert viewer.dataset_split_choice.selected_text == "val"
+        viewer.window.close_dialog()
+
+        # A failed replacement keeps the committed split and previous frame.
+        viewer.dataset_choice.selected_text = "nuscenes"
+        viewer._on_dataset_choice("nuscenes", 0)
+        viewer.root_edit.text_value = str(tmp_path / "missing-replacement")
+        viewer.load_dataset()
+        assert not viewer.dataset_choice.enabled
+        assert not viewer.root_edit.enabled and not viewer.browse_button.enabled
+        assert not viewer.version_edit.enabled
+        wait_for_idle()
+        assert "Loading failed" in viewer.status.text
+        assert viewer.renderer.frame is old_frame
+        assert viewer._dataset_split == viewer._active_dataset_split == "val"
+        assert viewer.dataset_split_choice.selected_text == "val"
+        viewer.window.close_dialog()
+
+        viewer.dataset_choice.selected_text = "demo"
+        viewer._on_dataset_choice("demo", 0)
+        assert viewer._dataset_split == "all"
+        # Changing split on the pending source loads that source, rather than
+        # filtering the previous fixture adapter that is still displayed.
+        viewer._on_dataset_split("all", 0)
+        wait_for_idle()
+        assert type(viewer._adapter) is DemoAdapter
+        assert len(viewer._scenes) == 2
         assert viewer.renderer.settings.color_scheme == "gray"
         assert viewer.color_choice.selected_text == "gray"
         assert not viewer.renderer.settings.use_raw_points
@@ -309,6 +393,30 @@ def test_native_loading_navigation_styles_and_error_recovery(tmp_path, monkeypat
             import subprocess
 
             subprocess.run(["import", "-window", "root", screenshot], check=True)
+
+        # Shared providers appear without a frontend registration. Partial TOP
+        # coverage must not enable a control implying a fully raw scan.
+        viewer.dataset_choice.selected_text = "native-geometry-partial-ui"
+        viewer._on_dataset_choice("native-geometry-partial-ui", 0)
+        viewer.load_dataset()
+        wait_for_idle()
+        assert not viewer.raw_checkbox.enabled
+        assert not viewer._adapter.supports_point_timing
+        assert "time unknown" in viewer.frame_label.text
+        assert "Annotations not provided" in viewer.status.text
+        previous_loader = viewer._adapter.loader
+
+        viewer.dataset_choice.selected_text = "native-geometry-full-ui"
+        viewer._on_dataset_choice("native-geometry-full-ui", 0)
+        viewer.load_dataset()
+        wait_for_idle()
+        assert previous_loader._closed
+        assert viewer.raw_checkbox.enabled and not viewer._adapter.supports_point_timing
+        viewer._on_raw_points(True)
+        wait_for_idle()
+        assert viewer.renderer.settings.use_raw_points
+        assert viewer.renderer.frame.point_timestamps_us is None
+        np.testing.assert_array_equal(viewer.renderer._cloud.points, viewer.renderer.frame.raw_points)
     finally:
         viewer.window.close()
         while application.run_one_tick():

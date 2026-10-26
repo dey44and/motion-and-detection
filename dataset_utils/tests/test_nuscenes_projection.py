@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from threedviz.processing.projection import CameraObservation, project_camera_rgb
+from dataset_utils.nuscenes.projection import CameraObservation, project_camera_rgb
 
 
 def camera(

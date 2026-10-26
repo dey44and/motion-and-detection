@@ -265,8 +265,12 @@ class DetectionWindow(ViewerWindow):
         path, split, config = self._load_options
         base = create_dataset(name, root=root, version=version)
         # Validate split before indexing a potentially large prediction file.
-        base.list_scenes_for_split(split)
-        source = None if name == "demo" else self._open_source(path)
+        try:
+            base.list_scenes_for_split(split)
+            source = None if name == "demo" else self._open_source(path)
+        except Exception:
+            base.close()
+            raise
         if source is not None:
             self._sources.append(source)
         return ReviewDatasetAdapter(base, split=split, source=source, config=config, demo=name == "demo")

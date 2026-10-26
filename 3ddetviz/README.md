@@ -9,7 +9,7 @@ Use Python 3.10–3.12 with a desktop session and an OpenGL-capable display. Fro
 ```bash
 python3 -m venv 3ddetviz/.venv
 source 3ddetviz/.venv/bin/activate
-python -m pip install -e './3dviz' -e './3ddetviz[dev]'
+python -m pip install -e './dataset_utils' -e './3dviz' -e './3ddetviz[dev]'
 3ddetviz --demo
 ```
 
@@ -25,7 +25,9 @@ The demo generates clouds, ground truth, overlapping detection proposals and con
 
 Replace the root with your extracted nuScenes location. The parent dataset root and the metadata version directory are both accepted, following 3dviz's dataset-layout rules. Native nuScenes JSON tables and `samples/LIDAR_TOP` files are sufficient; loading predictions does not require Torch, OpenPCDet or the nuScenes SDK.
 
-Full nuScenes metadata currently uses 3dviz's in-memory indexes. In the local full trainval check, opening the dataset took about one minute and the complete GUI process peaked around 8.4 GiB of memory. Prediction-file streaming is bounded independently; its low memory use does not include the dataset metadata or renderer. Mini is suitable for a quick first launch.
+Dataset reading and sensor processing come from the GUI-independent [`dataset-utils`](../dataset_utils/README.md) package (`dataset_utils` in Python). The shared nuScenes backend owns table indexing, calibration, nominal timing, camera RGB projection and splits. `3ddetviz` uses those values through the 3dviz dataset adapter while retaining its own prediction import and filtering. Its renderer/window dependency on `3dviz` is why the local installation command includes that package as well.
+
+Full nuScenes metadata currently uses the shared reader's in-memory indexes. In a previous local full trainval check, opening the dataset took about one minute and the complete GUI process peaked around 8.4 GiB of memory. Moving this implementation into `dataset_utils` does not make its indexes disk-backed. Prediction-file streaming is bounded independently; its low memory use does not include the dataset metadata or renderer. Mini is suitable for a quick first launch.
 
 ```bash
 3ddetviz --root /path/to/nuscenes --version v1.0-mini --split val \
@@ -40,7 +42,7 @@ The default split is `val`. On `v1.0-mini`, `val` and `train` select the officia
 
 ## Review controls
 
-The left panel selects the scene and frame, controls point appearance, and configures detection filtering. The white 3D viewport supports mouse rotation and scroll-wheel zoom. Existing 3dviz controls remain available: point size, gray/jet/turbo distance coloring, optional camera RGB, estimated acquisition-time points, axes, and camera reset. See [3dviz's camera and timing requirements](../3dviz/README.md#camera-rgb-and-point-timing) for the optional image files and limitations.
+The left panel selects the scene and frame, controls point appearance, and configures detection filtering. The white 3D viewport supports mouse rotation and scroll-wheel zoom. Existing 3dviz controls remain available: point size, gray/jet/turbo distance coloring, optional camera RGB, acquisition-time points, axes, and camera reset. See [3dviz's camera and timing requirements](../3dviz/README.md#camera-rgb-and-point-timing) for the optional image files and limitations.
 
 - **Ground truth and detections:** show or hide each layer independently and change either layer's color. Each layer uses one color across all classes.
 - **Classes:** shared checkboxes control which classes appear in both layers. Each row reports ground-truth and filtered-detection counts. One line-width slider applies to both layers.
@@ -136,7 +138,59 @@ src/detviz/
 └── cli.py             # launch options with lazy graphical imports
 ```
 
-Dataset support uses `threedviz.dataloader.DatasetAdapter` and its registry; adapters can implement `list_scenes_for_split` and expose `FrameData.reference_sensor_to_world` for world-coordinate detections. Existing point-cloud adapters remain usable with `all` and LiDAR-coordinate predictions. Prediction support is separate: implement `PredictionSource` and register an opener with `register_prediction_format`. Rendered `BoxLayer` objects are independent of import formats.
+Dataset extensions implement `dataset_utils.DatasetLoader` and register their
+constructor once with `dataset_utils.register_loader`. The implemented
+[version-1 loader contract](../dataset_utils/docs/loader_contract.md), available
+in `dataset-utils` 0.2, defines shared metadata, splits, modality-specific frame
+lists, observations, capabilities, preparation, and errors. The generic 3dviz
+bridge makes point-cloud providers available to this review window. Both viewers
+use the same registry; a new backend does not need another application adapter
+or a second registration.
+
+Metadata supplies native classes, their display groups/names, sensor roles/order,
+and configured capabilities. RGB, scalar point timestamps, and acquisition
+geometry are independent features. World-coordinate predictions require a known
+reference-to-world transform. Point-only datasets can still be reviewed with
+predictions in their cloud reference frame, provided the importer supports the
+prediction file's IDs, classes, and coordinate declaration.
+
+Register before invoking `main(argv)` in the same process. This launcher uses a
+working alias for the existing nuScenes backend; replace `NuScenesLoader` with
+your own loader class for a new dataset:
+
+```python
+from dataset_utils import register_loader
+from dataset_utils.nuscenes.loader import NuScenesLoader
+from detviz.cli import main
+
+register_loader("local_nuscenes", NuScenesLoader)
+raise SystemExit(main([
+    "--dataset", "local_nuscenes", "--root", "/path/to/nuscenes",
+    "--version", "v1.0-mini", "--split", "val",
+    "--predictions", "/path/to/results_nusc.json",
+]))
+```
+
+Programmatic dataset access accepts the common configuration through
+`threedviz.dataloader.create_dataset(..., config=DatasetConfig(...))`. For
+example, `DatasetConfig(storage_format="openpcdet", source_paths={"processed":
+"/data/waymo/processed", "native": "/data/waymo/tfrecords"})` selects separately
+stored Waymo sources. See the [3dviz extension examples](../3dviz/README.md#package-structure-and-adding-datasets)
+for construction and cleanup. This Python configuration API is separate from
+the launcher's root/version form.
+
+Normalized records are exported from `dataset_utils` and defined in
+`dataset_utils.contracts.models`. `dataset_utils.models` and the
+`threedviz.dataloader.FrameData` alias remain legacy compatibility records; the
+generic bridge converts normalized observations for the existing renderer and
+review controller. New providers use the normalized contract types.
+
+The old frontend `DatasetAdapter`/`register_dataset` API remains available for
+legacy integrations, demo data, and fixtures. Prediction extensions are separate:
+implement `PredictionSource` and register an opener with
+`register_prediction_format`. Existing file-format, frame-ID matching, class,
+and coordinate requirements continue to apply. Rendered `BoxLayer` objects are
+independent of either import format.
 
 Run the CPU tests after installing the development dependencies:
 

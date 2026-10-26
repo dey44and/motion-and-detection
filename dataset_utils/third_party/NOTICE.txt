@@ -1,0 +1,16 @@
+Waymo Open Dataset references and adaptations
+
+The minimal protobuf descriptors in dataset_utils/waymo/proto.py follow the
+Waymo Open Dataset v1.6.1 dataset.proto and label.proto definitions. The NumPy
+range equations in range_image.py follow the v1.6.1 range-image utilities.
+Copyright 2019 The Waymo Open Dataset Authors; Copyright 2023 Waymo LLC.
+These upstream definitions and utilities use Apache License 2.0.
+
+The NumPy camera model in dataset_utils/waymo/camera.py follows the v1.6.1
+wdl_limited/camera/camera_model.cc equations, adapted for batched projection.
+Copyright (c) 2019 Waymo LLC. The upstream camera implementation uses the
+BSD terms reproduced in WAYMO_LICENSE.txt.
+
+Upstream: https://github.com/waymo-research/waymo-open-dataset/tree/v1.6.1
+This package uses a private descriptor subset and independent NumPy readers;
+it does not bundle the Waymo Python SDK or TensorFlow.

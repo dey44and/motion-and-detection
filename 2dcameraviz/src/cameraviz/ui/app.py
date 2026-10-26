@@ -1,10 +1,10 @@
-"""The native six-camera viewer. Dataset reads run off the Tk event thread."""
+"""The native camera viewer. Dataset reads run off the Tk event thread."""
 
 from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Empty, Queue
 import tkinter as tk
@@ -32,6 +32,8 @@ class _LoadedDataset:
     adapter: DatasetAdapter
     scenes: tuple[SceneInfo, ...]
     loaded: _LoadedFrame
+    split: str = "all"
+    source: tuple[str, str, str] | None = None
 
 
 def _read_frame(adapter: DatasetAdapter, scene_index: int, frames: tuple[FrameInfo, ...], index: int) -> _LoadedFrame:
@@ -43,9 +45,23 @@ def _read_frame(adapter: DatasetAdapter, scene_index: int, frames: tuple[FrameIn
     return _LoadedFrame(scene_index, frames, index, frame, project_boxes(frame))
 
 
-def _read_dataset(dataset: str, root: str, version: str, scene: str | None, index: int) -> _LoadedDataset:
-    adapter = create_dataset(dataset, root=Path(root).expanduser() if root.strip() else None, version=version)
-    scenes = adapter.list_scenes()
+def _source_key(dataset: str, root: str, version: str) -> tuple[str, str, str]:
+    normalized_root = str(Path(root.strip()).expanduser().resolve()) if root.strip() else ""
+    return dataset, normalized_root, version.strip()
+
+
+def _read_dataset(dataset: str, root: str, version: str, scene: str | None, index: int, split: str = "all") -> _LoadedDataset:
+    source = _source_key(dataset, root, version)
+    adapter = create_dataset(source[0], root=Path(source[1]) if source[1] else None, version=source[2])
+    try:
+        return replace(_read_split(adapter, split, scene, index), source=source)
+    except Exception:
+        adapter.close()
+        raise
+
+
+def _read_split(adapter: DatasetAdapter, split: str, scene: str | None, index: int) -> _LoadedDataset:
+    scenes = adapter.list_scenes() if split == "all" else adapter.list_scenes_for_split(split)
     if not scenes:
         raise DatasetError("This dataset has no scenes.")
     scene_index = next((i for i, item in enumerate(scenes) if scene in (item.name, item.token)), None)
@@ -53,13 +69,13 @@ def _read_dataset(dataset: str, root: str, version: str, scene: str | None, inde
         raise DatasetError(f"Unknown scene {scene!r}. Choose a scene name or token from this release.")
     if scene_index is None:
         scene_index = next((i for i, item in enumerate(scenes) if item.frame_count), 0)
-    return _LoadedDataset(adapter, scenes, _read_frame(adapter, scene_index, adapter.list_frames(scenes[scene_index].token), index))
+    return _LoadedDataset(adapter, scenes, _read_frame(adapter, scene_index, adapter.list_frames(scenes[scene_index].token), index), split)
 
 
 class CameraViewer:
     def __init__(
         self, root: tk.Tk, *, dataset: str = "nuscenes", root_path: str | Path | None = None,
-        version: str = "v1.0-mini", scene: str | None = None, frame: int = 0, autoload: bool = False,
+        version: str = "v1.0-mini", scene: str | None = None, frame: int = 0, autoload: bool = False, split: str = "all",
     ):
         self.root = root
         self.adapter: DatasetAdapter | None = None
@@ -68,6 +84,9 @@ class CameraViewer:
         self.scene_index = 0
         self.frame_index = 0
         self.frame_data: FrameData | None = None
+        self._active_split = split
+        self._active_source: tuple[str, str, str] | None = None
+        self._ui_dataset_name = dataset
         self.panels: dict[str, CameraPanel] = {}
         self.class_vars: dict[str, tk.BooleanVar] = {}
         self.class_colors: dict[str, str] = {}
@@ -85,6 +104,7 @@ class CameraViewer:
         self.dataset_var = tk.StringVar(root, dataset)
         self.root_var = tk.StringVar(root, "" if root_path is None else str(root_path))
         self.version_var = tk.StringVar(root, version)
+        self.split_var = tk.StringVar(root, split)
         self.frame_var = tk.DoubleVar(root, 0)
         self.width_var = tk.DoubleVar(root, 2)
         self.mode_var = tk.StringVar(root, "Projected 3D")
@@ -142,17 +162,23 @@ class CameraViewer:
         self._heading(menu, "Dataset")
         self.dataset_combo = ttk.Combobox(menu, textvariable=self.dataset_var, values=available_datasets(), state="readonly")
         self.dataset_combo.pack(fill="x", pady=(4, 7))
+        self.dataset_combo.bind("<<ComboboxSelected>>", self._dataset_changed)
         ttk.Label(menu, text="Dataset root").pack(anchor="w")
         self.root_entry = ttk.Entry(menu, textvariable=self.root_var)
         self.root_entry.pack(fill="x", pady=(4, 5))
         self.browse_button = ttk.Button(menu, text="Browse…", command=self._browse)
         self.browse_button.pack(anchor="w", pady=(0, 7))
-        ttk.Label(menu, text="Version").pack(anchor="w")
+        self.version_label = ttk.Label(menu, text="Version")
+        self.version_label.pack(anchor="w")
         self.version_entry = ttk.Entry(menu, textvariable=self.version_var)
         self.version_entry.pack(fill="x", pady=(4, 7))
         self.load_button = ttk.Button(menu, text="Load dataset", command=self.load_dataset)
         self.load_button.pack(fill="x")
         self._heading(menu, "Scene and frame")
+        ttk.Label(menu, text="Split").pack(anchor="w")
+        self.split_combo = ttk.Combobox(menu, textvariable=self.split_var, values=tuple(dict.fromkeys((self._active_split, "all", "train", "val", "test"))), state="readonly")
+        self.split_combo.pack(fill="x", pady=(4, 7))
+        self.split_combo.bind("<<ComboboxSelected>>", self._split_changed)
         self.scene_combo = ttk.Combobox(menu, state="disabled")
         self.scene_combo.pack(fill="x", pady=(5, 7))
         self.scene_combo.bind("<<ComboboxSelected>>", self._select_scene)
@@ -198,6 +224,7 @@ class CameraViewer:
             CameraInfo("CAM_BACK", "Rear", 1, 1), CameraInfo("CAM_BACK_LEFT", "Rear left", 1, 2),
         ))
         self._sync_navigation()
+        self._dataset_changed()
 
     @staticmethod
     def _heading(parent: tk.Misc, text: str) -> None:
@@ -216,6 +243,32 @@ class CameraViewer:
         selected = filedialog.askdirectory(parent=self.root, initialdir=self.root_var.get() or str(Path.cwd()))
         if selected:
             self.root_var.set(selected)
+
+    def _dataset_changed(self, _event=None):
+        name = self.dataset_var.get()
+        if name != self._ui_dataset_name:
+            self._ui_dataset_name = name
+            self.split_var.set("all")
+        choices = ("all", "train", "val", "test") if name == "waymo" else ("all",)
+        self.split_combo.configure(values=tuple(dict.fromkeys((self.split_var.get(), *choices))))
+        if name == "waymo":
+            self.version_label.pack_forget()
+            self.version_entry.pack_forget()
+        else:
+            self.version_label.pack(anchor="w", before=self.load_button)
+            self.version_entry.pack(fill="x", pady=(4, 7), before=self.load_button)
+
+    def _split_changed(self, _event=None):
+        split = self.split_var.get()
+        if self.busy or self._closed or self.adapter is None:
+            return
+        if _source_key(self.dataset_var.get(), self.root_var.get(), self.version_var.get()) != self._active_source:
+            self.load_dataset()
+            return
+        if split == self._active_split:
+            return
+        adapter = self.adapter
+        self._submit("dataset", lambda: _read_split(adapter, split, None, 0))
 
     def _set_layout(self, layout: tuple[CameraInfo, ...]) -> None:
         if not layout:
@@ -261,8 +314,8 @@ class CameraViewer:
     def load_dataset(self, *, scene: str | None = None, frame: int = 0) -> None:
         if self.busy or self._closed:
             return
-        dataset, root, version = self.dataset_var.get(), self.root_var.get(), self.version_var.get()
-        self._submit("dataset", lambda: _read_dataset(dataset, root, version, scene, frame))
+        dataset, root, version, split = self.dataset_var.get(), self.root_var.get(), self.version_var.get(), self.split_var.get()
+        self._submit("dataset", lambda: _read_dataset(dataset, root, version, scene, frame, split))
 
     def _poll_results(self) -> None:
         self._poll_job = None
@@ -272,22 +325,34 @@ class CameraViewer:
             while True:
                 request_id, kind, result, error = self._results.get_nowait()
                 if request_id != self._request_id:
+                    if isinstance(result, _LoadedDataset) and result.adapter is not self.adapter:
+                        result.adapter.close()
                     continue
                 self.busy = False
                 if error is None:
                     try:
                         if kind == "dataset":
+                            previous_adapter = self.adapter
                             layout = tuple(result.adapter.camera_layout) or tuple(camera.info for camera in result.loaded.frame.cameras)
                             self._set_layout(layout)
                             self.adapter, self.scenes = result.adapter, result.scenes
+                            self._active_split = result.split
+                            self.split_var.set(result.split)
+                            self.split_combo.configure(values=tuple(dict.fromkeys((result.split, *self.adapter.available_splits))))
                             self.scene_combo.configure(values=[scene.name for scene in self.scenes])
                             self._set_classes(self.adapter.class_names, result.loaded.frame)
                             self._accept_frame(result.loaded)
+                            if result.source is not None:
+                                self._active_source = result.source
+                            if previous_adapter is not None and previous_adapter is not self.adapter:
+                                previous_adapter.close()
                         else:
                             self._accept_frame(result)
                     except Exception as display_error:
                         error = display_error
                 if error is not None:
+                    if self.adapter is not None:
+                        self.split_var.set(self._active_split)
                     self.last_error = str(error)
                     self.status_label.configure(text=f"Unable to load: {error}", foreground="#ff9b9b")
                 for control in (self.load_button, self.browse_button, self.root_entry, self.version_entry):
@@ -330,18 +395,22 @@ class CameraViewer:
         if any(name not in self.class_vars for name in names):
             self._set_classes(names, loaded.frame)
         counts = Counter(box.class_name for box in loaded.frame.boxes)
+        annotation_text = {"withheld": "Ground truth withheld", "not_provided": "Annotations not provided"}.get(loaded.frame.annotation_status)
         for name, label in self.class_labels.items():
-            label.configure(text=f"{name}  ({counts[name]})")
+            count = "—" if annotation_text is not None else counts[name]
+            label.configure(text=f"{name}  ({count})")
         cameras = {camera.info.channel: camera for camera in loaded.frame.cameras}
         self._apply_style(redraw=False)
         for channel, panel in self.panels.items():
             panel.set_frame(cameras.get(channel), loaded.projected.get(channel, ()))
-        self.status_label.configure(text=f"{len(cameras)} cameras · {len(loaded.frame.boxes)} annotated objects\nLeft / right arrows step through frames.", foreground="#b5c7d9")
+        annotation_text = annotation_text or f"{len(loaded.frame.boxes)} annotated objects"
+        self.status_label.configure(text=f"{len(cameras)} cameras · {annotation_text}\nLeft / right arrows step through frames.", foreground="#b5c7d9")
 
     def _sync_navigation(self) -> None:
         self._updating = True
         try:
             self.scene_combo.configure(state="readonly" if self.scenes and not self.busy else "disabled")
+            self.split_combo.configure(state="readonly" if not self.busy else "disabled")
             if self.scenes:
                 self.scene_combo.current(self.scene_index)
                 self.scene_description.configure(text=self.scenes[self.scene_index].description)
@@ -350,8 +419,9 @@ class CameraViewer:
             self.previous_button.configure(state="normal" if self.frames and self.frame_index > 0 and not self.busy else "disabled")
             self.next_button.configure(state="normal" if self.frames and self.frame_index < len(self.frames) - 1 and not self.busy else "disabled")
             if self.frame_data is not None:
-                elapsed = (self.frame_data.info.timestamp_us - self.frames[0].timestamp_us) / 1e6
-                self.frame_label.configure(text=f"Frame {self.frame_index + 1} / {len(self.frames)} · {elapsed:.2f} s")
+                current, first = self.frame_data.info.timestamp_us, self.frames[0].timestamp_us
+                elapsed = "time unknown" if current is None or first is None else f"{(current - first) / 1e6:.2f} s"
+                self.frame_label.configure(text=f"Frame {self.frame_index + 1} / {len(self.frames)} · {elapsed}")
         finally:
             self._updating = False
 
@@ -428,16 +498,29 @@ class CameraViewer:
         for job in (self._poll_job, self._slider_job):
             if job is not None:
                 self.root.after_cancel(job)
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        results, active_adapter = self._results, self.adapter
+        def release_sources():
+            # This barrier runs after all reads, without touching Tk objects.
+            try:
+                while True:
+                    _, _, result, _ = results.get_nowait()
+                    if isinstance(result, _LoadedDataset) and result.adapter is not active_adapter:
+                        result.adapter.close()
+            except Empty:
+                pass
+            if active_adapter is not None:
+                active_adapter.close()
+        self._executor.submit(release_sources)
+        self._executor.shutdown(wait=False, cancel_futures=False)
         self.root.destroy()
 
 
 def run_app(
     *, dataset: str = "nuscenes", root: str | Path | None = None, version: str = "v1.0-mini",
-    scene: str | None = None, frame: int = 0, autoload: bool = False,
+    scene: str | None = None, frame: int = 0, autoload: bool = False, split: str = "all",
 ) -> int:
     window = tk.Tk()
-    viewer = CameraViewer(window, dataset=dataset, root_path=root, version=version, scene=scene, frame=frame, autoload=autoload)
+    viewer = CameraViewer(window, dataset=dataset, root_path=root, version=version, scene=scene, frame=frame, autoload=autoload, split=split)
     try:
         window.mainloop()
     finally:

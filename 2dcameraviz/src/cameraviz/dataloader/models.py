@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
+
+
+class CameraProjection(Protocol):
+    """Dataset camera model for original images with nonlinear projection."""
+
+    def project_world(self, points_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return native image XY and forward depth for world points."""
 
 
 def _text(value: str, name: str) -> None:
@@ -50,13 +58,14 @@ class FrameInfo:
     token: str
     scene_token: str
     index: int
-    timestamp_us: int
+    timestamp_us: int | None
 
     def __post_init__(self) -> None:
         _text(self.token, "Frame token")
         _text(self.scene_token, "Scene token")
         _integer(self.index, "Frame index")
-        _integer(self.timestamp_us, "Frame timestamp")
+        if self.timestamp_us is not None:
+            _integer(self.timestamp_us, "Frame timestamp")
 
 
 @dataclass(frozen=True)
@@ -103,13 +112,20 @@ class CameraFrame:
 
     Optical coordinates are x right, y down and z forward. ``sensor_to_world``
     maps those coordinates into the same world frame as the annotations.
+    ``projection_model`` optionally handles a native image's lens distortion
+    and rolling shutter instead of the default pinhole projection. ``boxes``
+    can override world boxes when native camera-synchronized labels exist.
     """
 
     info: CameraInfo
     image: np.ndarray
-    intrinsics: np.ndarray
-    sensor_to_world: np.ndarray
-    timestamp_us: int
+    intrinsics: np.ndarray | None
+    sensor_to_world: np.ndarray | None
+    timestamp_us: int | None
+    projection_model: CameraProjection | None = None
+    boxes: tuple[BoundingBox3D, ...] | None = None
+    allow_pinhole: bool = True
+    annotation_status: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.info, CameraInfo):
@@ -123,16 +139,26 @@ class CameraFrame:
             image = np.array(image, copy=True, order="C")
         image.setflags(write=False)
         object.__setattr__(self, "image", image)
-        intrinsics = _array(self.intrinsics, (3, 3), "Camera intrinsics")
-        if intrinsics[0, 0] <= 0 or intrinsics[1, 1] <= 0 or not np.allclose(intrinsics[2], [0, 0, 1], atol=1e-9):
-            raise ValueError("Camera intrinsics must have positive focal lengths and last row [0, 0, 1].")
-        object.__setattr__(self, "intrinsics", intrinsics)
-        transform = _array(self.sensor_to_world, (4, 4), "Camera pose")
-        if not np.allclose(transform[3], [0, 0, 0, 1], atol=1e-9):
-            raise ValueError("Camera pose must have homogeneous last row [0, 0, 0, 1].")
-        _rotation(transform[:3, :3], "Camera pose rotation")
-        object.__setattr__(self, "sensor_to_world", transform)
-        _integer(self.timestamp_us, "Camera timestamp")
+        if self.intrinsics is not None:
+            intrinsics = _array(self.intrinsics, (3, 3), "Camera intrinsics")
+            if intrinsics[0, 0] <= 0 or intrinsics[1, 1] <= 0 or not np.allclose(intrinsics[2], [0, 0, 1], atol=1e-9):
+                raise ValueError("Camera intrinsics must have positive focal lengths and last row [0, 0, 1].")
+            object.__setattr__(self, "intrinsics", intrinsics)
+        if self.sensor_to_world is not None:
+            transform = _array(self.sensor_to_world, (4, 4), "Camera pose")
+            if not np.allclose(transform[3], [0, 0, 0, 1], atol=1e-9):
+                raise ValueError("Camera pose must have homogeneous last row [0, 0, 0, 1].")
+            _rotation(transform[:3, :3], "Camera pose rotation")
+            object.__setattr__(self, "sensor_to_world", transform)
+        if self.timestamp_us is not None:
+            _integer(self.timestamp_us, "Camera timestamp")
+        if self.projection_model is not None and not callable(getattr(self.projection_model, "project_world", None)):
+            raise ValueError("Camera projection_model must implement project_world(points).")
+        if self.boxes is not None:
+            boxes = tuple(self.boxes)
+            if any(not isinstance(box, BoundingBox3D) for box in boxes):
+                raise ValueError("Camera box overrides must contain world BoundingBox3D objects.")
+            object.__setattr__(self, "boxes", boxes)
 
 
 @dataclass(frozen=True)
@@ -140,6 +166,7 @@ class FrameData:
     info: FrameInfo
     cameras: tuple[CameraFrame, ...]
     boxes: tuple[BoundingBox3D, ...]
+    annotation_status: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.info, FrameInfo):

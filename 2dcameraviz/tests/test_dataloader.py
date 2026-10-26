@@ -101,18 +101,54 @@ def test_native_scene_and_frame_indices_and_partial_camera_grid(nuscenes_root):
     adapter = create_dataset("nuscenes", root=nuscenes_root)
     assert isinstance(adapter, DatasetAdapter)
     scenes = adapter.list_scenes()
-    assert [(scene.token, scene.frame_count) for scene in scenes] == [("scene-1", 2), ("scene-empty", 0)]
+    assert [(scene.token, scene.frame_count) for scene in scenes] == [("scene-1", 2)]
     assert scenes[0].description == "A camera fixture"
     assert [(frame.token, frame.index, frame.timestamp_us) for frame in adapter.list_frames("scene-1")] == [
         ("sample-1", 0, 1_000_000), ("sample-2", 1, 2_000_000),
     ]
     assert adapter.list_frames("scene-empty") == ()
     assert [info.channel for info in adapter.camera_layout] == [
-        "CAM_FRONT_LEFT", "CAM_FRONT", "CAM_FRONT_RIGHT", "CAM_BACK_LEFT", "CAM_BACK", "CAM_BACK_RIGHT",
+        "CAM_FRONT_LEFT", "CAM_FRONT", "CAM_FRONT_RIGHT", "CAM_BACK_RIGHT", "CAM_BACK", "CAM_BACK_LEFT",
     ]
     assert [(info.row, info.column) for info in adapter.camera_layout] == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
     assert [camera.info.channel for camera in adapter.load_frame("sample-1").cameras] == ["CAM_FRONT_LEFT", "CAM_FRONT"]
     assert [camera.info.channel for camera in adapter.load_frame("sample-2").cameras] == ["CAM_FRONT", "CAM_BACK_RIGHT"]
+
+
+def test_nuscenes_uses_shared_reader_and_preserves_frontend_models(nuscenes_root, monkeypatch):
+    from dataset_utils.errors import DatasetError as SharedDatasetError
+    from dataset_utils.nuscenes.loader import NuScenesLoader
+    from cameraviz.dataloader import FrameData, FrameInfo, NuScenesAdapter, SceneInfo
+    from cameraviz.dataloader.shared import SharedCameraAdapter
+
+    assert DatasetError is SharedDatasetError
+    assert issubclass(NuScenesAdapter, SharedCameraAdapter)
+    real_load = NuScenesLoader.load_cameras
+    reads = []
+
+    def recording_load(reader, token):
+        frame = real_load(reader, token)
+        reads.append((token, frame))
+        return frame
+
+    monkeypatch.setattr(NuScenesLoader, "load_cameras", recording_load)
+    adapter = create_dataset("nuscenes", root=nuscenes_root)
+    assert all(isinstance(scene, SceneInfo) for scene in adapter.list_scenes())
+    assert all(isinstance(info, FrameInfo) for info in adapter.list_frames("scene-1"))
+    frame = adapter.load_frame("sample-1")
+    assert isinstance(frame, FrameData)
+    assert isinstance(frame.info, FrameInfo)
+    assert [token for token, _ in reads] == ["sample-1"]
+    native = reads[0][1]
+    native_cameras = {camera.sensor_id: camera for camera in native.cameras}
+    for camera in frame.cameras:
+        assert isinstance(camera, CameraFrame)
+        assert camera.info in CAMERA_LAYOUT
+        assert camera.image is native_cameras[camera.info.channel].image
+        assert not camera.image.flags.writeable
+    assert all(isinstance(box, BoundingBox3D) for box in frame.boxes)
+    np.testing.assert_array_equal(frame.boxes[0].center, native.annotations.boxes[0].center)
+    np.testing.assert_array_equal(frame.boxes[0].rotation, native.annotations.boxes[0].rotation)
 
 
 def test_actual_camera_exposure_pose_and_global_annotation_transform(nuscenes_root):

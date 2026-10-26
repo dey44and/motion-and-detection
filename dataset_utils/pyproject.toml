@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dataset-utils"
+version = "0.2.0"
+description = "GUI-independent nuScenes and Waymo readers, calibration, timing and projection"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "numpy>=1.24,<3",
+    "Pillow>=10,<13",
+    "protobuf>=4.25,<7",
+    "google-crc32c>=1.5,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7,<9"]
+
+[tool.setuptools]
+license-files = ["third_party/*.txt"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["dataset_utils*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

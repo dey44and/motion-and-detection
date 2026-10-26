@@ -32,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="dataset root containing the release metadata and sensor files",
     )
     parser.add_argument("--version", default="v1.0-mini", help="nuScenes release (default: v1.0-mini)")
+    parser.add_argument("--split", help="dataset split, such as val, train or train_1of16 (default: all)")
     parser.add_argument("--scene", help="initial scene name or token")
     parser.add_argument("--frame", type=_nonnegative_int, default=0, help="initial frame index (default: 0)")
     parser.add_argument("--demo", action="store_true", help="open a synthetic example without dataset files")
@@ -54,6 +55,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             scene=args.scene,
             frame=args.frame,
             autoload=dataset == "demo" or args.root is not None,
+            **({"split": args.split} if args.split is not None else {}),
         )
     except ModuleNotFoundError as exc:
         if exc.name != "open3d":

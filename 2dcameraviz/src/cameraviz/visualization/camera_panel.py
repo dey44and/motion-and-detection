@@ -82,7 +82,9 @@ class CameraPanel(ttk.Frame):
         scale_x, scale_y = target[0] / self._image.width, target[1] / self._image.height
         selected = [box for box in self.boxes if box.class_name in self.visible_classes]
         count = len(selected)
-        self.header.configure(text=f"{self.info.label}   ·   {count} {'box' if count == 1 else 'boxes'}")
+        annotation_text = {"withheld": "Ground truth withheld", "not_provided": "Annotations not provided"}.get(self.camera.annotation_status)
+        box_text = f"{count} {'box' if count == 1 else 'boxes'}"
+        self.header.configure(text=f"{self.info.label}   ·   {annotation_text or box_text}")
         for box in selected:
             color = self.class_colors.get(box.class_name, "#00aaff")
             if self.box_mode == "2D rectangles":

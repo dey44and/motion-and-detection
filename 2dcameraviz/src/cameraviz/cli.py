@@ -25,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="2dcameraviz",
-        description="Explore six autonomous driving camera views and projected ground truth boxes.",
+        description="Explore calibrated autonomous driving camera views and ground truth boxes.",
     )
     parser.add_argument("--dataset", choices=available_datasets(), default="nuscenes")
     parser.add_argument(
@@ -33,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="dataset root containing release metadata and camera images",
     )
     parser.add_argument("--version", default="v1.0-mini", help="nuScenes release (default: v1.0-mini)")
+    parser.add_argument("--split", help="dataset split, such as val or train (default: all)")
     parser.add_argument("--scene", help="initial scene name or token")
     parser.add_argument("--frame", type=_nonnegative_int, default=0, help="initial zero-based frame index (default: 0)")
     parser.add_argument("--demo", action="store_true", help="open a synthetic example without dataset files")
@@ -56,6 +57,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             scene=args.scene,
             frame=args.frame,
             autoload=dataset == "demo" or args.root is not None,
+            **({"split": args.split} if args.split is not None else {}),
         )
     except ModuleNotFoundError as exc:
         if exc.name not in {"tkinter", "_tkinter"}:

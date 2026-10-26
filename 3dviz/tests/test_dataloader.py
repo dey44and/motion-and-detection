@@ -88,7 +88,7 @@ def test_native_tables_scene_and_frame_indices(nuscenes_root):
     adapter = create_dataset("nuscenes", root=nuscenes_root)
     assert isinstance(adapter, DatasetAdapter)
     scenes = adapter.list_scenes()
-    assert [(scene.token, scene.frame_count) for scene in scenes] == [("scene-1", 2), ("scene-empty", 0)]
+    assert [(scene.token, scene.frame_count) for scene in scenes] == [("scene-1", 2)]
     assert scenes[0].description == "A tiny fixture"
     frames = adapter.list_frames("scene-1")
     assert [(frame.token, frame.index, frame.timestamp_us) for frame in frames] == [

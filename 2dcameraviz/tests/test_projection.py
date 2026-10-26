@@ -204,3 +204,38 @@ def test_unknown_class_color_is_deterministic_and_valid_hex():
     assert color != class_color("vehicle.emergency.police")
     with pytest.raises(ValueError, match="nonempty string"):
         class_color("")
+
+
+@pytest.mark.parametrize("undefined_depth", [False, True])
+def test_undefined_projection_interval_cannot_invent_a_viewport_filling_face(undefined_depth):
+    class Model:
+        def project_world(self, points):
+            pixels = points[:, :2] * 10 + 50
+            depth = np.full(len(points), 10.)
+            undefined = np.abs(points[:, 0]) < 6
+            pixels[undefined] = np.nan
+            if undefined_depth:
+                depth[undefined] = np.nan
+            return pixels, depth
+
+    view = camera()
+    view.projection_model = Model()
+    # Valid edge endpoints lie outside opposite sides of the viewport; the
+    # interval that could cross the image has no defined projection.
+    assert project_box(box(size=(20, 20, 2)), view) is None
+
+
+def test_undefined_projection_gap_retains_only_independently_valid_edge_parts():
+    class Model:
+        def project_world(self, points):
+            pixels = points[:, :2] * 10 + 50
+            depth = np.full(len(points), 10.)
+            pixels[np.abs(points[:, 0]) < .3] = np.nan
+            return pixels, depth
+
+    view = camera()
+    view.projection_model = Model()
+    projected = project_box(box(size=(4, 2, 2)), view)
+    assert projected is not None and len(projected.segments)
+    for segment in projected.segments:
+        assert segment[:, 0].max() <= 47 or segment[:, 0].min() >= 53

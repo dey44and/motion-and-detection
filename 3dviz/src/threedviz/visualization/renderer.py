@@ -42,6 +42,13 @@ _COORDINATE_AXES = "coordinate_axes"
 _AXES_LENGTH_METRES = 3.0
 
 
+def _vector3d(values):
+    # Open3D's Eigen binding requests a writable float64 buffer even though
+    # it copies the values. Shared loader arrays remain immutable.
+    array = np.asarray(values, dtype=np.float64, order="C")
+    return o3d.utility.Vector3dVector(array if array.flags.writeable else array.copy())
+
+
 class SceneRenderer:
     """Bridge between an Open3D viewport and the common dataset models.
 
@@ -86,8 +93,8 @@ class SceneRenderer:
         points = self._display_points(frame)
         colors = self._point_colors(frame, points)
         cloud = o3d.geometry.PointCloud()
-        cloud.points = o3d.utility.Vector3dVector(points)
-        cloud.colors = o3d.utility.Vector3dVector(colors)
+        cloud.points = _vector3d(points)
+        cloud.colors = _vector3d(colors)
         boxes = self._box_geometries(frame, layers)
         scene = self.widget.scene
         if scene.has_geometry("points"):
@@ -165,7 +172,7 @@ class SceneRenderer:
         scene = self.widget.scene
         if recolor:
             colors = self._point_colors(self.frame, self._display_points(self.frame))
-            self._cloud.colors = o3d.utility.Vector3dVector(colors)
+            self._cloud.colors = _vector3d(colors)
             if scene.has_geometry("points"):
                 scene.remove_geometry("points")
             if len(self.frame.points):

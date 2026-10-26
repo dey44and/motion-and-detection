@@ -1,4 +1,4 @@
-"""Project world-space cuboids into undistorted pinhole camera images.
+"""Project world-space cuboids through pinhole or native camera models.
 
 Camera optical coordinates have x right, y down and z forward. Clipping takes
 place before perspective division at the near plane and afterwards in image
@@ -138,6 +138,140 @@ def _clip_segment_image(segment: np.ndarray, xmax: float, ymax: float) -> np.nda
     return np.clip(clipped, [0.0, 0.0], [xmax, ymax])
 
 
+def _model_project(model, points):
+    pixels, depth = model.project_world(np.asarray(points, dtype=np.float64))
+    pixels, depth = np.asarray(pixels, dtype=np.float64), np.asarray(depth, dtype=np.float64)
+    if pixels.shape != (len(points), 2) or depth.shape != (len(points),):
+        raise ValueError("Camera projection_model must return (N, 2) pixels and (N,) depth.")
+    return pixels, depth
+
+
+def _nonlinear_near_intersections(model, first, second, near):
+    count = len(first)
+    pixels, depth = _model_project(model, np.concatenate((first, second)))
+    inside = np.isfinite(depth) & (depth >= near)
+    front = np.where(inside[:count, None], first, second).copy()
+    back = np.where(inside[:count, None], second, first).copy()
+    front_pixel = np.where(inside[:count, None], pixels[:count], pixels[count:]).copy()
+    usable = (np.isfinite(depth[:count]) & np.isfinite(depth[count:])
+              & (inside[:count] != inside[count:]) & np.isfinite(front_pixel).all(axis=1))
+    for _ in range(28):
+        middle = (front + back) / 2
+        uv, z = _model_project(model, middle)
+        valid = np.isfinite(z) & (z >= near)
+        usable &= np.isfinite(z) & (~valid | np.isfinite(uv).all(axis=1))
+        valid &= usable
+        front[valid], front_pixel[valid] = middle[valid], uv[valid]
+        back[usable & ~valid] = middle[usable & ~valid]
+    front_pixel[~usable] = np.nan
+    return front_pixel
+
+
+def _project_nonlinear_box(box, camera, world, near, xmax, ymax):
+    """Sample curved edges and faces before viewport clipping.
+
+    Sixteen pieces per cuboid edge retain distortion/shutter curvature. Face
+    boundaries also supply rectangle visibility when every original edge lies
+    outside the image. Near intersections are refined in world coordinates
+    against the camera model's returned forward depth.
+    """
+
+    model = camera.projection_model
+    fractions = np.linspace(0., 1., 17)
+    samples_by_edge = np.asarray([
+        world[first] + fractions[:, None] * (world[second] - world[first])
+        for first, second in _EDGES
+    ])
+    all_pixels, all_depth = _model_project(model, samples_by_edge.reshape(-1, 3))
+    pixels_by_edge = all_pixels.reshape(12, 17, 2)
+    depth_by_edge = all_depth.reshape(12, 17)
+    if not np.any(np.isfinite(all_pixels).all(axis=1) & np.isfinite(all_depth) & (all_depth >= near)):
+        return None
+    edge_lookup = {edge: index for index, edge in enumerate(_EDGES)}
+    valid_by_edge = (np.isfinite(pixels_by_edge).all(axis=2)
+                     & np.isfinite(depth_by_edge) & (depth_by_edge >= near))
+    depth_inside = depth_by_edge >= near
+    crossings = np.argwhere(
+        np.isfinite(depth_by_edge[:, :-1]) & np.isfinite(depth_by_edge[:, 1:])
+        & (depth_inside[:, :-1] != depth_inside[:, 1:])
+        & (valid_by_edge[:, :-1] | valid_by_edge[:, 1:]))
+    near_pixels, near_by_points = {}, {}
+    if len(crossings):
+        starts = np.asarray([samples_by_edge[edge, index] for edge, index in crossings])
+        ends = np.asarray([samples_by_edge[edge, index + 1] for edge, index in crossings])
+        intersections = _nonlinear_near_intersections(model, starts, ends, near)
+        for (edge, index), first, second, pixel in zip(crossings, starts, ends, intersections):
+            if not np.isfinite(pixel).all():
+                continue
+            near_pixels[(edge, index)] = pixel
+            near_by_points[tuple(sorted((tuple(first), tuple(second))))] = pixel
+    segments = []
+    for edge_index, (first, second) in enumerate(_EDGES):
+        samples = samples_by_edge[edge_index]
+        pixels, depth = pixels_by_edge[edge_index], depth_by_edge[edge_index]
+        valid = valid_by_edge[edge_index]
+        for index in range(16):
+            if not valid[index] and not valid[index + 1]:
+                continue
+            ends = pixels[index:index + 2].copy()
+            if valid[index] != valid[index + 1]:
+                intersection = near_pixels.get((edge_index, index))
+                if intersection is None:
+                    continue
+                ends[0 if not valid[index] else 1] = intersection
+            clipped = _clip_segment_image(ends, xmax, ymax)
+            if clipped is not None:
+                segments.append(clipped)
+    visible = []
+    for face in _FACES:
+        face_samples, face_pixels, face_depth = [], [], []
+        for first, second in zip(face, (*face[1:], face[0])):
+            direct = (first, second) in edge_lookup
+            index = edge_lookup[(first, second) if direct else (second, first)]
+            order = slice(None) if direct else slice(None, None, -1)
+            face_samples.append(samples_by_edge[index][order][:-1])
+            face_pixels.append(pixels_by_edge[index][order][:-1])
+            face_depth.append(depth_by_edge[index][order][:-1])
+        samples = np.concatenate(face_samples)
+        pixels, depth = np.concatenate(face_pixels), np.concatenate(face_depth)
+        # Undefined projection intervals are not a geometric clipping plane.
+        # A face boundary crossing one cannot safely define a closed polygon;
+        # retain its independently valid wireframe segments instead.
+        undefined = ~np.isfinite(depth) | ((depth >= near) & ~np.isfinite(pixels).all(axis=1))
+        if np.any(undefined):
+            continue
+        valid = np.isfinite(pixels).all(axis=1) & np.isfinite(depth) & (depth >= near)
+        polygon = []
+        complete = True
+        previous = len(samples) - 1
+        for index in range(len(samples)):
+            if valid[index] != valid[previous]:
+                key = tuple(sorted((tuple(samples[previous]), tuple(samples[index]))))
+                intersection = near_by_points.get(key)
+                if intersection is None:
+                    complete = False
+                    break
+                polygon.append(intersection)
+            if valid[index]:
+                polygon.append(pixels[index])
+            previous = index
+        if not complete:
+            continue
+        polygon = np.asarray(polygon, dtype=np.float64).reshape(-1, 2)
+        for axis, boundary, keep_greater in ((0, 0., True), (0, xmax, False), (1, 0., True), (1, ymax, False)):
+            polygon = _clip_polygon(polygon, axis, boundary, keep_greater=keep_greater)
+        if len(polygon):
+            visible.append(polygon)
+    if not visible and not segments:
+        return None
+    pixels = np.concatenate(visible) if visible else np.asarray(segments).reshape(-1, 2)
+    minimum, maximum = pixels.min(axis=0), pixels.max(axis=0)
+    return ProjectedBox(
+        box.class_name, box.token, np.asarray(segments, dtype=np.float64).reshape(-1, 2, 2),
+        (minimum[0], minimum[1], maximum[0], maximum[1]),
+    )
+
+
 def project_box(box: BoundingBox3D, camera: CameraFrame, *, near_plane: float = 0.1) -> ProjectedBox | None:
     """Return a clipped cuboid projection, or None if it misses the camera view.
 
@@ -146,7 +280,8 @@ def project_box(box: BoundingBox3D, camera: CameraFrame, *, near_plane: float = 
     optical coordinates into world coordinates and is inverted as a full rigid
     transform, including pitch and roll. No assumption about vehicle yaw is
     made. Image bounds use pixel centers from zero through width/height minus
-    one. The model assumes an undistorted pinhole image.
+    one. Native camera models can supply distortion/shutter-aware projection;
+    the default path assumes an undistorted pinhole image.
     """
 
     try:
@@ -160,6 +295,15 @@ def project_box(box: BoundingBox3D, camera: CameraFrame, *, near_plane: float = 
     if np.any(size <= 0):
         raise ValueError("Box size must be positive.")
     box_rotation = _rotation(box.rotation, "Box rotation")
+    image = np.asarray(camera.image)
+    if image.ndim != 3 or image.shape[2] != 3 or min(image.shape[:2]) < 1 or image.dtype != np.uint8:
+        raise ValueError("Camera image must be uint8 RGB with shape (H, W, 3).")
+    ymax, xmax = float(image.shape[0] - 1), float(image.shape[1] - 1)
+    world = (_CORNER_SIGNS * (size / 2)) @ box_rotation.T + center
+    if getattr(camera, "projection_model", None) is not None:
+        return _project_nonlinear_box(box, camera, world, near, xmax, ymax)
+    if not getattr(camera, "allow_pinhole", True) or camera.sensor_to_world is None or camera.intrinsics is None:
+        return None
     pose = _array(camera.sensor_to_world, (4, 4), "Camera sensor_to_world")
     if not np.allclose(pose[3], [0, 0, 0, 1], rtol=0, atol=1e-9):
         raise ValueError("Camera sensor_to_world must have last row [0, 0, 0, 1].")
@@ -168,12 +312,6 @@ def project_box(box: BoundingBox3D, camera: CameraFrame, *, near_plane: float = 
     if (intrinsics[0, 0] <= 0 or intrinsics[1, 1] <= 0
             or not np.allclose(intrinsics[2], [0, 0, 1], rtol=0, atol=1e-9)):
         raise ValueError("Camera intrinsics must be a pinhole matrix with positive focal lengths.")
-    image = np.asarray(camera.image)
-    if image.ndim != 3 or image.shape[2] != 3 or min(image.shape[:2]) < 1 or image.dtype != np.uint8:
-        raise ValueError("Camera image must be uint8 RGB with shape (H, W, 3).")
-    ymax, xmax = float(image.shape[0] - 1), float(image.shape[1] - 1)
-
-    world = (_CORNER_SIGNS * (size / 2)) @ box_rotation.T + center
     optical = (world - pose[:3, 3]) @ camera_rotation
     if not np.isfinite(optical).all():
         raise ValueError("Box transform produced nonfinite camera coordinates.")
@@ -221,7 +359,8 @@ def project_boxes(frame: FrameData, *, near_plane: float = 0.1) -> dict[str, tup
         if channel in result:
             raise ValueError(f"Duplicate camera channel {channel!r}.")
         boxes = []
-        for box in frame.boxes:
+        overrides = getattr(camera, "boxes", None)
+        for box in frame.boxes if overrides is None else overrides:
             projected = project_box(box, camera, near_plane=near_plane)
             if projected is not None:
                 boxes.append(projected)

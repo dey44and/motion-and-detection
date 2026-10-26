@@ -41,6 +41,21 @@ def test_nuscenes_arguments_are_forwarded(root_option, launches, tmp_path):
     }]
 
 
+def test_waymo_and_explicit_split_are_forwarded(launches, tmp_path):
+    assert cli.main(["--dataset", "waymo", "--root", str(tmp_path), "--split", "val", "--frame", "5"]) == 0
+    assert launches == [{
+        "dataset": "waymo", "root": tmp_path, "version": "v1.0-mini", "split": "val",
+        "scene": None, "frame": 5, "autoload": True,
+    }]
+
+
+def test_explicit_all_split_is_forwarded_and_omitted_split_keeps_legacy_launch_contract(launches):
+    assert cli.main(["--demo", "--split", "all"]) == 0
+    assert launches[0]["split"] == "all"
+    assert cli.main(["--demo"]) == 0
+    assert "split" not in launches[1]
+
+
 @pytest.mark.parametrize("demo_args", [["--demo"], ["--dataset", "demo"]])
 def test_demo_autoloads_without_dataset_files(demo_args, launches):
     assert cli.main(demo_args) == 0
@@ -61,7 +76,7 @@ def test_help_does_not_import_graphical_dependencies(monkeypatch, capsys):
     original_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
-        if name.startswith("open3d") or name in {"ui.app", "threedviz.ui.app"}:
+        if name.startswith(("open3d", "tensorflow", "waymo_open_dataset")) or name in {"ui.app", "threedviz.ui.app"}:
             raise AssertionError(f"help imported graphical module {name}")
         return original_import(name, *args, **kwargs)
 
@@ -69,7 +84,8 @@ def test_help_does_not_import_graphical_dependencies(monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc:
         cli.main(["--help"])
     assert exc.value.code == 0
-    assert "--dataroot" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "--dataroot" in output and "--split" in output and "waymo" in output
 
 
 @pytest.mark.parametrize("missing", ["open3d", "unrelated_dependency"])

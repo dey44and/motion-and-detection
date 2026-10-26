@@ -2,14 +2,24 @@
 
 from abc import ABC, abstractmethod
 
+from dataset_utils.errors import DatasetError
+
 from .models import CameraInfo, FrameData, FrameInfo, SceneInfo
 
 
-class DatasetError(RuntimeError):
-    """A dataset could not be read or has inconsistent metadata."""
-
-
 class DatasetAdapter(ABC):
+    def close(self) -> None:
+        """Release an adapter after its caller finishes all pending reads."""
+
+    @property
+    def available_splits(self) -> tuple[str, ...]:
+        return ("all",)
+
+    def list_scenes_for_split(self, split: str = "all") -> tuple[SceneInfo, ...]:
+        if split == "all":
+            return self.list_scenes()
+        raise DatasetError(f"This dataset does not support split {split!r}.")
+
     @abstractmethod
     def list_scenes(self) -> tuple[SceneInfo, ...]:
         """Return scenes without decoding their camera images."""

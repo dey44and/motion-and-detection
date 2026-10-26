@@ -47,6 +47,10 @@ class ReviewDatasetAdapter(DatasetAdapter):
     def supports_point_timing(self):
         return self.base.supports_point_timing
 
+    @property
+    def supports_acquisition_geometry(self):
+        return self.base.supports_acquisition_geometry
+
     def list_scenes(self):
         return self.base.list_scenes_for_split(self.split)
 
@@ -83,3 +87,7 @@ class ReviewDatasetAdapter(DatasetAdapter):
         if not isinstance(prepared, ReviewFrame):
             prepared = self.compose(prepared)
         return prepared
+
+    def close(self):
+        self._frame_cache.clear()
+        self.base.close()

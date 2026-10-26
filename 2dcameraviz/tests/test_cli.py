@@ -46,6 +46,21 @@ def test_dataset_arguments_are_forwarded(root_option, launches, tmp_path):
     }]
 
 
+def test_waymo_and_explicit_split_are_forwarded(launches, tmp_path):
+    assert cli.main(["--dataset", "waymo", "--root", str(tmp_path), "--split", "val", "--frame", "5"]) == 0
+    assert launches == [{
+        "dataset": "waymo", "root": tmp_path, "version": "v1.0-mini", "split": "val",
+        "scene": None, "frame": 5, "autoload": True,
+    }]
+
+
+def test_explicit_all_split_forwarded_without_changing_default_call_contract(launches):
+    assert cli.main(["--demo", "--split", "all"]) == 0
+    assert launches[0]["split"] == "all"
+    assert cli.main(["--demo"]) == 0
+    assert "split" not in launches[1]
+
+
 @pytest.mark.parametrize("demo_args", [["--demo"], ["--dataset", "demo"]])
 def test_demo_autoloads_without_files(demo_args, launches):
     assert cli.main(demo_args) == 0
@@ -68,7 +83,7 @@ def test_help_and_version_do_not_import_gui(args, monkeypatch, capsys):
     original_import = builtins.__import__
 
     def guarded_import(name, *positional, **kwargs):
-        if name.startswith(("tkinter", "_tkinter", "open3d")) or name in {"ui.app", "cameraviz.ui.app"}:
+        if name.startswith(("tkinter", "_tkinter", "open3d", "tensorflow", "waymo_open_dataset")) or name in {"ui.app", "cameraviz.ui.app"}:
             raise AssertionError(f"CLI information imported GUI dependency {name}")
         return original_import(name, *positional, **kwargs)
 
@@ -79,6 +94,8 @@ def test_help_and_version_do_not_import_gui(args, monkeypatch, capsys):
     output = capsys.readouterr().out
     expected = "--dataroot" if args == ["--help"] else f"2dcameraviz {__version__}"
     assert expected in output
+    if args == ["--help"]:
+        assert "--split" in output and "waymo" in output
 
 
 @pytest.mark.parametrize("missing", ["tkinter", "_tkinter", "unrelated_dependency"])
