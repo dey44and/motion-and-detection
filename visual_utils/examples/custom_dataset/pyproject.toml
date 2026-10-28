@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "research-dataset-example"
+version = "0.1.0"
+description = "File-backed example of the visual-utils extension contract"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = ["visual-utils>=0.3,<0.4"]
+
+[project.entry-points."visual_utils.loaders"]
+research = "research_dataset:ResearchDatasetLoader"
+
+[tool.setuptools.packages.find]
+where = ["src"]

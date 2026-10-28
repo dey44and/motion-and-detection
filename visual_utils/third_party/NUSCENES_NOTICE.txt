@@ -1,0 +1,12 @@
+nuScenes scene membership data
+
+The official scene-name memberships in src/visual_utils/nuscenes/splits.py
+are reproduced from the nuScenes devkit's nuscenes/utils/splits.py.
+Attribution: Holger Caesar and the nuScenes devkit contributors.
+Upstream: https://github.com/nutonomy/nuscenes-devkit
+The devkit is distributed under Apache License 2.0; its license terms are
+reproduced in APACHE_LICENSE.txt. No nuScenes SDK code is imported at runtime.
+
+The nominal HDL-32E timing model follows conventions documented by NVIDIA
+NCore's nuScenes converter and is an independent NumPy implementation.
+Reference: https://nvidia.github.io/ncore/conversions/nuscenes/nuscenes.html
