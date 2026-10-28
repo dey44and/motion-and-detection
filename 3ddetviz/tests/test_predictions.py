@@ -10,15 +10,19 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from threedviz.dataloader import DemoAdapter
-from threedviz.dataloader.models import BoundingBox3D, FrameData, FrameInfo
+from threedviz.dataloader import DemoLoader
+from dataset_utils import Box3D, DatasetValidationError, FrameInfo, Modality, PointCloudFrame
 
 from detviz.predictions import (
-    DemoPredictionSource, Detection, PredictionCancelled, PredictionError,
+    DemoPredictionSource, Detection, InMemoryPredictionSource, PredictionCancelled, PredictionError,
     PredictionFrame, PredictionInfo, available_prediction_formats,
     make_demo_predictions, normalize_frame, open_predictions,
     register_prediction_format,
 )
+
+
+def make_box(center, size, rotation, class_id, annotation_id="box"):
+    return Box3D(annotation_id, class_id, center, size, rotation)
 
 
 def annotation(token="sample-a", **changes):
@@ -162,6 +166,20 @@ def test_cache_reused_without_parsing_again_and_invalidated_by_input(json_path, 
     assert changed.get_frame("sample-a").detections[0].score == 0.95
 
 
+def test_cache_hit_does_not_open_the_export_payload(json_path, tmp_path, monkeypatch):
+    from pathlib import Path
+    with open_json(json_path, tmp_path):
+        pass
+    original = Path.open
+    def guarded_open(path, *args, **kwargs):
+        if path == json_path:
+            raise AssertionError("Cached export payload must not be reread.")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "open", guarded_open)
+    with open_json(json_path, tmp_path) as cached:
+        assert cached.get_frame("sample-a").detections[0].score == .8
+
+
 def test_cancelled_import_leaves_no_published_or_partial_cache(json_path, tmp_path):
     state = {"cancelled": False}
 
@@ -203,7 +221,7 @@ def test_numeric_labels_require_explicit_mapping_and_are_one_based(tmp_path):
     sidecar = type(path)(str(path) + ".detviz.json")
     sidecar.write_text(json.dumps({"class_names": ["truck", "car"], "stage": "pre_nms"}))
     source = open_json(path, tmp_path)
-    assert source.get_frame("sample-a").detections[0].box.class_name == "car"
+    assert source.get_frame("sample-a").detections[0].box.class_id == "car"
     assert source.info.stage == "pre_nms"
     bad = pcdet_entry(names=False)
     bad["pred_labels"][0] = 0
@@ -258,39 +276,40 @@ def test_normalization_preserves_full_rotation_and_rotates_velocity():
     local_center, local_velocity = np.array([1, 2, 3]), np.array([2, -1, 4])
     local_rotation = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
     rotation = sensor_to_world[:3, :3]
-    box = BoundingBox3D(rotation @ local_center + sensor_to_world[:3, 3], np.array([4, 2, 1]), rotation @ local_rotation, "car")
+    box = make_box(rotation @ local_center + sensor_to_world[:3, 3], np.array([4, 2, 1]), rotation @ local_rotation, "car")
     predictions = PredictionFrame("frame", (Detection(box, 0.5, "frame:0", rotation @ local_velocity),))
-    frame = FrameData(FrameInfo("frame", "scene", 0, 0), np.empty((0, 3)), (), reference_sensor_to_world=sensor_to_world)
+    frame = PointCloudFrame(FrameInfo("frame", "scene", 0, 0, {Modality.POINT_CLOUD}), "test", "reference", np.empty((0, 3)), world_frame_id="world", T_world_from_reference=sensor_to_world)
     normalized = normalize_frame(predictions, frame, coordinate_frame="world")
     result = normalized.detections[0]
     np.testing.assert_allclose(result.box.center, local_center)
     np.testing.assert_allclose(result.box.rotation, local_rotation)
     np.testing.assert_allclose(result.velocity, local_velocity)
     assert result.identifier == "frame:0" and result.score == 0.5
-    assert not np.shares_memory(result.box.size, box.size)
-    with pytest.raises(PredictionError, match="no reference_sensor_to_world"):
-        normalize_frame(predictions, replace(frame, reference_sensor_to_world=None), coordinate_frame="world")
-    with pytest.raises(PredictionError, match="tokens"):
-        normalize_frame(predictions, replace(frame, info=replace(frame.info, token="other")))
+    np.testing.assert_array_equal(result.box.size, box.size)
+    assert not result.box.size.flags.writeable
+    with pytest.raises(PredictionError, match="no T_world_from_reference"):
+        normalize_frame(predictions, replace(frame, world_frame_id=None, T_world_from_reference=None), coordinate_frame="world")
+    with pytest.raises(PredictionError, match="frame IDs"):
+        normalize_frame(predictions, replace(frame, info=replace(frame.info, frame_id="other")))
 
 
 def test_detection_payloads_are_copied_and_immutable():
     center = np.array([1., 2., 3.])
-    detection = Detection(BoundingBox3D(center, np.ones(3), np.eye(3), "car"), 0.5, "sample:0")
+    detection = Detection(make_box(center, np.ones(3), np.eye(3), "car"), 0.5, "sample:0")
     center[:] = 999
     np.testing.assert_array_equal(detection.box.center, [1, 2, 3])
     with pytest.raises(ValueError):
         detection.box.center[0] = 0
-    with pytest.raises(PredictionError, match="orthonormal"):
-        Detection(BoundingBox3D(center, np.ones(3), np.diag([1, 1, -1]), "car"), 0.5, "sample:0")
+    with pytest.raises(DatasetValidationError, match="rotation"):
+        Detection(make_box(center, np.ones(3), np.diag([1, 1, -1]), "car"), 0.5, "sample:0")
 
 
 def test_demo_predictions_are_deterministic_with_overlap_and_scores():
-    dataset = DemoAdapter()
-    token = dataset.list_frames(dataset.list_scenes()[0].token)[0].token
-    frame = dataset.load_frame(token)
+    dataset = DemoLoader()
+    token = dataset.list_frames(dataset.list_scenes()[0].scene_id, modality=Modality.POINT_CLOUD)[0].frame_id
+    frame = dataset.load_point_cloud(token)
     predictions = make_demo_predictions(frame)
-    assert len(predictions.detections) > len(frame.boxes)
+    assert len(predictions.detections) > len(frame.annotations.boxes)
     assert len({detection.score for detection in predictions.detections}) > 1
     repeated = make_demo_predictions(frame)
     np.testing.assert_array_equal(predictions.detections[0].box.center, repeated.detections[0].box.center)
@@ -304,7 +323,7 @@ def test_registry_supports_additional_prediction_sources(tmp_path, monkeypatch):
     from detviz.predictions import factory
 
     monkeypatch.setattr(factory, "_REGISTRY", dict(factory._REGISTRY))
-    source = DemoPredictionSource(DemoAdapter())
+    source = DemoPredictionSource(DemoLoader())
     path = tmp_path / "custom.format"
     path.touch()
     register_prediction_format("custom", lambda *args, **kwargs: source)
@@ -324,3 +343,35 @@ def test_incompatible_coordinate_declaration_and_invalid_stage_rejected(json_pat
     sidecar.write_text(json.dumps({"stage": "guessed"}))
     with pytest.raises(PredictionError, match="stage"):
         open_json(json_path, tmp_path)
+
+
+@pytest.mark.parametrize("name", ["auto", "json", "nuscenes", "pickle", "pcdet", " JSON "])
+def test_prediction_aliases_cannot_hide_registered_openers(name):
+    with pytest.raises(ValueError, match="reserved"):
+        register_prediction_format(name, lambda *args, **kwargs: None)
+
+
+def test_memory_source_preserves_empty_coverage_identity_and_stable_classes():
+    frame = PredictionFrame("custom/frame", (
+        Detection(make_box(np.zeros(3), np.ones(3), np.eye(3), "cone"), .8, "one"),
+        Detection(make_box(np.zeros(3), np.ones(3), np.eye(3), "car"), .4, "two"),
+    ))
+    empty = PredictionFrame("custom/empty", ())
+    info = PredictionInfo("In-process detector", "memory", "lidar", "pre_nms")
+    with InMemoryPredictionSource(iter([frame, empty]), info=info) as source:
+        assert source.info is info
+        assert source.class_names == ("cone", "car")
+        assert source.frame_tokens == {"custom/frame", "custom/empty"}
+        assert source.get_frame("custom/frame") is frame
+        assert source.get_frame("custom/empty") is empty
+        assert source.get_frame("absent") is None
+    source.close()
+    assert source.frame_tokens == {"custom/frame", "custom/empty"}
+    with pytest.raises(PredictionError, match="closed"):
+        source.get_frame("custom/frame")
+
+
+def test_memory_source_rejects_duplicate_frame_ids():
+    frame = PredictionFrame("duplicate", ())
+    with pytest.raises(PredictionError, match="Duplicate"):
+        InMemoryPredictionSource([frame, frame], info=PredictionInfo("test", "memory", "lidar"))

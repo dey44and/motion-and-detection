@@ -6,6 +6,13 @@ from .models import PredictionFrame, PredictionInfo
 
 
 class PredictionSource(ABC):
+    """Read canonical predictions independently of dataset storage and GUI.
+
+    The historical term ``token`` means the exact normalized dataset frame ID;
+    it need not be a nuScenes token. All boxes in a source share the declared
+    coordinate system. Sources used by the desktop application must support
+    sequential reads on its loading worker and metadata access on the UI thread.
+    """
     @property
     @abstractmethod
     def info(self) -> PredictionInfo:
@@ -14,7 +21,7 @@ class PredictionSource(ABC):
     @property
     @abstractmethod
     def frame_tokens(self) -> frozenset[str]:
-        """All covered sample tokens, including explicitly empty frames."""
+        """All covered dataset frame IDs, including explicitly empty frames."""
 
     @property
     @abstractmethod

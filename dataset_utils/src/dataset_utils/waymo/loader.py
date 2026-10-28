@@ -8,13 +8,13 @@ from pathlib import Path
 
 import numpy as np
 
-from ..contracts.config import DatasetConfig
-from ..contracts.loader import DatasetLoader
-from ..contracts.models import (
+from ..config import DatasetConfig
+from ..dataset import DatasetLoader
+from ..models import (
     AcquisitionGeometry, AnnotationAlignment, AnnotationSet, AnnotationStatus,
     AnnotationTiming, Box3D, CameraFrameSet, CameraObservation, Capability,
     ClassInfo, DatasetMetadata, FrameInfo, Modality, PointCloudFrame,
-    PointCloudPreparation, PointColors, ProcessingProvenance, ProjectionResult,
+    PointColors, ProcessingProvenance, ProjectionResult,
     SceneInfo, SensorInfo,
 )
 from ..errors import (
@@ -22,12 +22,11 @@ from ..errors import (
     DatasetIOError, DatasetValidationError, UnknownIdentifierError,
 )
 from .camera import OPTICAL_TO_WAYMO, WaymoCameraProjection
-from .processed import WAYMO_CLASSES, NativeWaymoAdapter, WaymoAdapter, open_waymo
+from .processed import WAYMO_CLASSES, ProcessedWaymoReader, has_processed_layout
 from .range_image import colorize_points, decode_lidar
-from .reader import NativeWaymoReader
+from .reader import NativeWaymoReader, find_native_root
 
 _NATIVE_SOURCE = "waymo:native:all-lidars-both-returns"
-_PROCESSED_SOURCE = "waymo:openpcdet:xyz-intensity-elongation-nlz"
 _CAMERAS = (
     (2, "CAM_FRONT_LEFT", "Front left", "front_left"),
     (1, "CAM_FRONT", "Front", "front"),
@@ -41,14 +40,14 @@ _SPLIT_ALIASES = {"training": "train", "validation": "val", "testing": "test"}
 
 
 def _call(function, *args, **kwargs):
-    """Translate the legacy/native parsers' errors into the public taxonomy."""
+    """Translate storage parser failures into the shared dataset errors."""
     try:
         return function(*args, **kwargs)
     except (DatasetConfigurationError, DatasetIOError, DatasetValidationError,
             UnknownIdentifierError, DataUnavailableError):
         raise
     except (DatasetError, OSError, ValueError, TypeError, KeyError, OverflowError) as error:
-        if function in (NativeWaymoReader, WaymoAdapter, open_waymo) and any(fragment in str(error) for fragment in (
+        if function in (NativeWaymoReader, ProcessedWaymoReader) and any(fragment in str(error) for fragment in (
             "TFRecords not found", "preprocessing not found", "Requested Waymo processed directory does not exist",
             "Several Waymo processed directories",
         )):
@@ -67,9 +66,8 @@ def _directory(path, name):
     return Path(path)
 
 
-def _reference(frame_id, *, source_id=None):
-    profile = "" if source_id is None else f":{source_id}"
-    return frame_id + profile + ":vehicle-reference"
+def _reference(frame_id):
+    return f"{frame_id}:vehicle-reference"
 
 
 def _world(context):
@@ -126,7 +124,7 @@ class WaymoLoader(DatasetLoader):
         ) or len(set(additional)) != len(additional):
             raise DatasetConfigurationError("additional_classes must be a sequence of distinct nonempty names.")
         self._class_names = tuple(dict.fromkeys((*WAYMO_CLASSES, *additional)))
-        self._processed_adapter = None
+        self._processed = None
         self._reader = None
         root = config.root
         processed_path = config.source_paths.get("processed")
@@ -138,42 +136,38 @@ class WaymoLoader(DatasetLoader):
         if root is None and processed_path is None and native_path is None:
             raise DatasetConfigurationError("Waymo needs root or an explicit processed/native source path.")
 
-        if config.storage_format == "openpcdet" or (config.storage_format == "auto" and processed_path is not None):
-            self._processed_adapter = _call(WaymoAdapter, root=_directory(processed_path or root, "processed"), version=tag or "v1.0-mini")
-        elif config.storage_format == "native":
-            if tag is not None:
-                raise DatasetConfigurationError("processed_tag is not used by native storage.")
-            self._reader = _call(NativeWaymoReader, _directory(native_path or root, "native"))
-        elif root is not None:
-            opened = _call(open_waymo, root=_directory(root, "root"), version=tag or "v1.0-mini")
-            if isinstance(opened, WaymoAdapter):
-                self._processed_adapter = opened
-            elif isinstance(opened, NativeWaymoAdapter):
-                self._reader = opened._reader
-        else:
-            self._reader = _call(NativeWaymoReader, native_path)
+        use_processed = (config.storage_format == "openpcdet"
+                         or config.storage_format == "auto" and (
+                             processed_path is not None or tag is not None
+                             or root is not None and _call(has_processed_layout, _directory(root, "root"))))
+        if use_processed:
+            self._processed = _call(
+                ProcessedWaymoReader, _directory(processed_path or root, "processed"),
+                processed_tag=tag, classes=self._class_names,
+            )
+        elif config.storage_format == "native" and tag is not None:
+            raise DatasetConfigurationError("processed_tag is not used by native storage.")
 
         if native_path is not None:
             self._reader = _call(NativeWaymoReader, native_path)
-        elif self._reader is None and self._processed_adapter is not None and self._processed_adapter._native_root is not None:
-            self._reader = _call(NativeWaymoReader, self._processed_adapter._native_root)
+        elif self._processed is None:
+            self._reader = _call(NativeWaymoReader, _directory(root, "native"))
+        else:
+            paired = _call(find_native_root, self._processed.root)
+            if paired is not None:
+                self._reader = _call(NativeWaymoReader, paired)
         self._native_sequences = {} if self._reader is None else {
             sequence.context_name: sequence for sequence in self._reader.list_sequences()
         }
-        if tag is not None and self._processed_adapter is None:
+        if tag is not None and self._processed is None:
             raise DatasetConfigurationError("processed_tag requires an OpenPCDet point source.")
         if self._reader is not None and not self._native_sequences:
             raise DatasetConfigurationError("Waymo native source contains no TFRecord sequences.")
-        self._processed_scenes = {} if self._processed_adapter is None else {
-            scene.name: scene for scene in self._processed_adapter.list_scenes()
-        }
-        self._point_source_id = (_NATIVE_SOURCE if self._processed_adapter is None else
-                                 f"{_PROCESSED_SOURCE}:{self._processed_adapter.processed_root.name}")
+        self._processed_scenes = frozenset() if self._processed is None else frozenset(self._processed.scene_ids)
         self._scene_ids = tuple(sorted(set(self._processed_scenes) | set(self._native_sequences)))
         if not self._scene_ids:
             raise DatasetConfigurationError("No Waymo sequences are installed.")
         self._native_points = OrderedDict()
-        self._legacy_frames = OrderedDict()
         self._frames = {Modality.POINT_CLOUD: {}, Modality.CAMERAS: {}}
         self._by_id = {Modality.POINT_CLOUD: {}, Modality.CAMERAS: {}}
         self._native_indices = {}
@@ -201,14 +195,10 @@ class WaymoLoader(DatasetLoader):
     def reader(self):
         return self._reader
 
-    @property
-    def processed_adapter(self):
-        return self._processed_adapter
-
     def _split_catalog(self):
         native = {short: {context for context, seq in self._native_sequences.items() if seq.split == full}
                   for full, short in _SPLIT_ALIASES.items()}
-        declared = {} if self._processed_adapter is None else self._processed_adapter._split_members
+        declared = {} if self._processed is None else self._processed.split_members
         result = {"all": frozenset(self._scene_ids)}
         for name in ("train", "val", "test"):
             members = set(native[name])
@@ -230,9 +220,9 @@ class WaymoLoader(DatasetLoader):
         return result
 
     def _has_points(self, context):
-        return context in (self._processed_scenes if self._processed_adapter is not None else self._native_sequences)
+        return context in (self._processed_scenes if self._processed is not None else self._native_sequences)
 
-    def list_scenes(self, *, split="all"):
+    def _list_scenes(self, *, split="all"):
         selected = self._splits[split]
         result = []
         for context in self._scene_ids:
@@ -242,29 +232,31 @@ class WaymoLoader(DatasetLoader):
             for mode, present in ((Modality.POINT_CLOUD, self._has_points(context)), (Modality.CAMERAS, context in self._native_sequences)):
                 counts[mode] = len(self._frames[mode][context]) if context in self._frames[mode] else None if present else 0
             result.append(SceneInfo(scene_id=context, display_name=context,
-                                    description="Waymo OpenPCDet points" if self._processed_adapter else "Waymo native TFRecord",
+                                    description="Waymo OpenPCDet points" if self._processed else "Waymo native TFRecord",
                                     frame_counts=counts))
         return tuple(result)
 
-    def list_frames(self, scene_id, *, modality):
+    def _list_frames(self, scene_id, *, modality):
         if scene_id not in self._scene_ids:
             raise UnknownIdentifierError(f"Unknown Waymo scene {scene_id!r}.")
         if scene_id in self._frames[modality]:
             return self._frames[modality][scene_id]
         observations = []
-        if modality == Modality.POINT_CLOUD and self._processed_adapter is not None:
-            scene = self._processed_scenes.get(scene_id)
-            legacy = () if scene is None else _call(self._processed_adapter.list_frames, scene.token)
-            observations = [(frame.token, frame.timestamp_us, frame.index) for frame in legacy]
-        elif scene_id in self._native_sequences:
+        if modality == Modality.POINT_CLOUD and self._processed is not None:
+            frames = (() if scene_id not in self._processed_scenes else
+                      _call(self._processed.list_frames, scene_id))
+            self._frames[modality][scene_id] = frames
+            self._by_id[modality].update((frame.frame_id, frame) for frame in frames)
+            return frames
+        if scene_id in self._native_sequences:
             headers = _call(self._reader.list_frame_headers, scene_id)
             for header in headers:
                 token = f"waymo:{scene_id}:{header.timestamp_us}"
-                observations.append((token, header.timestamp_us, header.frame_index))
+                observations.append((token, header.timestamp_us))
                 self._native_indices[token] = header.frame_index
         frames = tuple(FrameInfo(frame_id=token, scene_id=scene_id, index=index, timestamp_us=timestamp,
                                  modalities=frozenset({modality}))
-                       for index, (token, timestamp, original) in enumerate(observations))
+                       for index, (token, timestamp) in enumerate(observations))
         if any(right.timestamp_us <= left.timestamp_us for left, right in zip(frames, frames[1:])):
             raise DatasetValidationError(f"Waymo timestamps do not increase in scene {scene_id}.")
         self._frames[modality][scene_id] = frames
@@ -307,12 +299,12 @@ class WaymoLoader(DatasetLoader):
         self._native_points.move_to_end(info.frame_id)
         return self._native_points[info.frame_id]
 
-    def _status(self, context, *, provided, has_boxes=False, native=False):
-        if provided or has_boxes:
+    def _status(self, context, *, has_boxes):
+        if has_boxes:
             return AnnotationStatus.AVAILABLE
         if context in self._splits.get("test", ()):
             return AnnotationStatus.WITHHELD
-        if native and context in self._native_sequences and self._native_sequences[context].split in {"training", "validation"}:
+        if self._native_sequences[context].split in {"training", "validation"}:
             return AnnotationStatus.AVAILABLE
         return AnnotationStatus.NOT_PROVIDED
 
@@ -340,37 +332,14 @@ class WaymoLoader(DatasetLoader):
             center=selected.center, size=selected.size, rotation=_rotation(selected.heading),
             timing_override=AnnotationTiming(alignment=alignment) if mixed else None,
         ) for index, box, selected, alignment in source_boxes)
-        status = self._status(info.scene_id, provided=False, has_boxes=bool(boxes), native=True)
+        status = self._status(info.scene_id, has_boxes=bool(boxes))
         return AnnotationSet(reference_frame_id=reference, status=status, boxes=boxes, timing=timing)
 
-    def load_point_cloud(self, frame_id):
+    def _load_point_cloud(self, frame_id):
         info = self._resolve(frame_id, Modality.POINT_CLOUD)
-        reference = _reference(frame_id, source_id=self._point_source_id if self._processed_adapter is not None else None)
-        if self._processed_adapter is not None:
-            if frame_id not in self._legacy_frames:
-                legacy, attributes = _call(self._processed_adapter._load_frame_data, frame_id, include_attributes=True)
-                self._legacy_frames[frame_id] = legacy, attributes
-                if len(self._legacy_frames) > 2:
-                    self._legacy_frames.popitem(last=False)
-            self._legacy_frames.move_to_end(frame_id)
-            legacy, attributes = self._legacy_frames[frame_id]
-            sequence, original = self._processed_adapter._frame_locations[frame_id]
-            record = next(frame.record for frame in self._processed_adapter._load_sequence(sequence) if frame.sample_idx == original)
-            identifiers = (record.get("annos") or {}).get("obj_ids")
-            boxes = []
-            for index, box in enumerate(legacy.boxes):
-                if box.class_name not in self._class_names:
-                    raise DatasetValidationError(f"Undeclared Waymo class {box.class_name!r}; declare it in additional_classes.")
-                instance_id = None if identifiers is None else str(identifiers[index]) or None
-                boxes.append(Box3D(annotation_id=box.token or f"box:{index}", instance_id=instance_id,
-                                   class_id=box.class_name, center=box.center, size=box.size, rotation=box.rotation))
-            annotations = AnnotationSet(reference_frame_id=reference,
-                status=self._status(info.scene_id, provided=record.get("annos") is not None), boxes=tuple(boxes),
-                timing=AnnotationTiming(alignment=AnnotationAlignment.REFERENCE_TIME))
-            return PointCloudFrame(info=info, source_id=self._point_source_id, reference_frame_id=reference,
-                points=legacy.points, attributes=attributes, annotations=annotations,
-                world_frame_id=_world(info.scene_id), T_world_from_reference=legacy.reference_sensor_to_world,
-                scan_start_us=info.timestamp_us)
+        if self._processed is not None:
+            return _call(self._processed.load_point_cloud, frame_id)
+        reference = _reference(frame_id)
         native = self._native(info, include_cameras=False)
         points = self._pointset(info)
         attributes = {name: getattr(points, name) for name in ("intensity", "elongation", "nlz", "return_id", "lidar_id")}
@@ -381,7 +350,7 @@ class WaymoLoader(DatasetLoader):
             world_frame_id=_world(info.scene_id), T_world_from_reference=native.vehicle_to_world,
             scan_start_us=info.timestamp_us)
 
-    def load_cameras(self, frame_id):
+    def _load_cameras(self, frame_id):
         info = self._resolve(frame_id, Modality.CAMERAS)
         native = self._native(info, include_points=False)
         if not native.cameras:
@@ -410,7 +379,7 @@ class WaymoLoader(DatasetLoader):
                               cameras=tuple(cameras), annotations=self._native_annotations(info, native),
                               world_frame_id=_world(info.scene_id), T_world_from_reference=native.vehicle_to_world)
 
-    def prepare_point_cloud(self, frame, *, request):
+    def _prepare_point_cloud(self, frame, *, request):
         if request.timestamps:
             # The base capability guard normally handles this before entry.
             raise DataUnavailableError("Waymo does not supply scalar point acquisition timestamps.")
@@ -451,10 +420,7 @@ class WaymoLoader(DatasetLoader):
 
     def _close(self):
         self._native_points.clear()
-        self._legacy_frames.clear()
         if self._reader is not None:
-            self._reader._frames.clear()
-            self._reader._headers.clear()
-            self._reader._offsets.clear()
-        if self._processed_adapter is not None:
-            self._processed_adapter._sequence_cache.clear()
+            self._reader.close()
+        if self._processed is not None:
+            self._processed.close()

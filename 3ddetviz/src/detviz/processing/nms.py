@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from numbers import Real
-from typing import TYPE_CHECKING, Protocol, Sequence
+from typing import TYPE_CHECKING, Sequence
+
+from dataset_utils import Box3D
 
 import numpy as np
 
@@ -33,11 +35,6 @@ _SIGNS = np.array([
     [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
 ], dtype=np.float64)
 
-
-class _Box(Protocol):
-    center: np.ndarray
-    size: np.ndarray
-    rotation: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -116,22 +113,8 @@ def _area(polygon: np.ndarray) -> float:
     return abs(float(np.sum(relative[:, 0] * following[:, 1] - relative[:, 1] * following[:, 0]))) / 2
 
 
-def _footprint(box: _Box) -> tuple[np.ndarray, float, np.ndarray, np.ndarray]:
-    try:
-        center = np.asarray(box.center, dtype=np.float64)
-        size = np.asarray(box.size, dtype=np.float64)
-        rotation = np.asarray(box.rotation, dtype=np.float64)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("Box geometry must contain finite numeric arrays.") from exc
-    if center.shape != (3,) or size.shape != (3,) or rotation.shape != (3, 3):
-        raise ValueError("Box center/size/rotation must have shapes (3,), (3,), (3, 3).")
-    if not all(np.isfinite(value).all() for value in (center, size, rotation)):
-        raise ValueError("Box geometry must contain finite values.")
-    if np.any(size <= 0):
-        raise ValueError("Box dimensions must be positive.")
-    if (not np.allclose(rotation.T @ rotation, np.eye(3), rtol=0, atol=1e-5)
-            or not np.isclose(np.linalg.det(rotation), 1, rtol=0, atol=1e-5)):
-        raise ValueError("Box rotation must be a proper orthonormal rotation.")
+def _footprint(box: Box3D) -> tuple[np.ndarray, float, np.ndarray, np.ndarray]:
+    center, size, rotation = box.center, box.size, box.rotation
     corners = (_SIGNS * (size / 2)) @ rotation.T + center
     if not np.isfinite(corners).all():
         raise ValueError("Box geometry produced a nonfinite BEV footprint.")
@@ -178,7 +161,7 @@ def _footprint_iou(first, second) -> float:
     return float(intersection / (first_area + second_area - intersection))
 
 
-def bev_iou(first: _Box, second: _Box) -> float:
+def bev_iou(first: Box3D, second: Box3D) -> float:
     """Return IoU between full-rotation cuboid footprints in reference LiDAR XY."""
 
     return _footprint_iou(_footprint(first), _footprint(second))
@@ -197,19 +180,13 @@ def non_maximum_suppression(
     """
 
     mode, threshold, groups = _validate_nms_options(mode, iou_threshold, groups)
-    scores = []
-    for detection in detections:
-        score = detection.score
-        if isinstance(score, (bool, np.bool_)) or not isinstance(score, Real) or not np.isfinite(score) or not 0 <= score <= 1:
-            raise ValueError("Detection scores must be finite numbers in [0, 1].")
-        scores.append(float(score))
-    order = sorted(range(len(detections)), key=lambda index: -scores[index])
+    order = sorted(range(len(detections)), key=lambda index: -detections[index].score)
     if mode == "off" or not order:
         return NMSResult(tuple(order), {})
 
     group_by_class = {name: index for index, group in enumerate(groups) for name in group}
     def group_key(index):
-        name = detections[index].box.class_name
+        name = detections[index].box.class_id
         if mode == "agnostic":
             return ("all",)
         if mode == "groups" and name in group_by_class:

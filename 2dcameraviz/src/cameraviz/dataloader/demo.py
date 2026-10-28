@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 from PIL import Image, ImageDraw
 
-from .base import DatasetAdapter, DatasetError
-from .models import BoundingBox3D, CameraFrame, FrameData, FrameInfo, SceneInfo
-from .nuscenes import CAMERA_LAYOUT, DETECTION_CLASSES
+from dataset_utils import (
+    AnnotationSet, AnnotationStatus, Box3D, CameraFrameSet, CameraObservation,
+    Capability, ClassInfo, DatasetConfig, DatasetLoader, DatasetMetadata,
+    FrameInfo, Modality, PinholeProjection, SceneInfo, SensorInfo, UnknownIdentifierError,
+)
+
+_CLASSES = ("car", "truck", "construction_vehicle", "bus", "trailer", "barrier",
+            "motorcycle", "bicycle", "pedestrian", "traffic_cone")
+_CAMERAS = (
+    ("CAM_FRONT_LEFT", "Front left", "front_left"),
+    ("CAM_FRONT", "Front", "front"),
+    ("CAM_FRONT_RIGHT", "Front right", "front_right"),
+    ("CAM_BACK_RIGHT", "Back right", "rear_right"),
+    ("CAM_BACK", "Back", "rear"),
+    ("CAM_BACK_LEFT", "Back left", "rear_left"),
+)
 
 _WIDTH, _HEIGHT = 960, 540
 _FOCAL = 600.0
@@ -43,7 +54,7 @@ def _project(points: np.ndarray, pose: np.ndarray) -> tuple[np.ndarray, np.ndarr
     return pixels, optical[:, 2]
 
 
-def _view(pose: np.ndarray, boxes: tuple[BoundingBox3D, ...], camera_index: int) -> np.ndarray:
+def _view(pose: np.ndarray, boxes: tuple[Box3D, ...], camera_index: int) -> np.ndarray:
     rows = np.arange(_HEIGHT, dtype=float)[:, None, None]
     top = np.array([190, 212, 227], dtype=float)
     horizon = np.array([226, 233, 234], dtype=float)
@@ -81,57 +92,69 @@ def _view(pose: np.ndarray, boxes: tuple[BoundingBox3D, ...], camera_index: int)
     return array
 
 
-class DemoAdapter(DatasetAdapter):
-    def __init__(self, *, root: str | Path | None = None, version: str = "demo"):
+class DemoDataset(DatasetLoader):
+    """Generate canonical observations; no native dataset or GUI is involved."""
+
+    def __init__(self):
+        super().__init__(DatasetConfig())
+        self._metadata = DatasetMetadata(
+            "camera-demo", "Generated camera example",
+            frozenset((Capability.CAMERAS, Capability.BOXES_3D)),
+            classes=tuple(ClassInfo(name, name, name) for name in _CLASSES),
+            sensors=tuple(SensorInfo(name, Modality.CAMERAS, label, role) for name, label, role in _CAMERAS),
+            clock_domain="synthetic scene microseconds",
+        )
         self._scenes = (
-            SceneInfo("demo-intersection", "Demo intersection", "Generated street views with traffic in all six directions.", 24),
-            SceneInfo("demo-roundabout", "Demo roundabout", "Generated camera images and moving annotations; no dataset files required.", 24),
+            SceneInfo("demo-intersection", "Demo intersection", "Generated street views with traffic in all six directions.", {Modality.CAMERAS: 24}),
+            SceneInfo("demo-roundabout", "Demo roundabout", "Generated camera images and moving annotations; no dataset files required.", {Modality.CAMERAS: 24}),
         )
         self._frames_by_scene = {
-            scene.token: tuple(FrameInfo(f"{scene.token}-{index:03d}", scene.token, index, 1_000_000 + index * 500_000)
-                               for index in range(scene.frame_count))
+            scene.scene_id: tuple(FrameInfo(f"{scene.scene_id}-{index:03d}", scene.scene_id, index,
+                                           1_000_000 + index * 500_000, frozenset((Modality.CAMERAS,)))
+                                  for index in range(scene.frame_counts[Modality.CAMERAS]))
             for scene in self._scenes
         }
-        self._frames = {frame.token: frame for frames in self._frames_by_scene.values() for frame in frames}
+        self._frames = {frame.frame_id: frame for frames in self._frames_by_scene.values() for frame in frames}
 
     @property
-    def class_names(self) -> tuple[str, ...]:
-        return DETECTION_CLASSES
+    def metadata(self) -> DatasetMetadata:
+        return self._metadata
 
-    @property
-    def camera_layout(self):
-        return CAMERA_LAYOUT
-
-    def list_scenes(self) -> tuple[SceneInfo, ...]:
+    def _list_scenes(self, *, split="all") -> tuple[SceneInfo, ...]:
         return self._scenes
 
-    def list_frames(self, scene_token: str) -> tuple[FrameInfo, ...]:
+    def _list_frames(self, scene_id: str, *, modality: Modality) -> tuple[FrameInfo, ...]:
         try:
-            return self._frames_by_scene[scene_token]
+            return self._frames_by_scene[scene_id]
         except KeyError:
-            raise DatasetError(f"Unknown demo scene {scene_token!r}.") from None
+            raise UnknownIdentifierError(f"Unknown demo scene {scene_id!r}.") from None
 
-    def load_frame(self, frame_token: str) -> FrameData:
+    def _load_cameras(self, frame_id: str) -> CameraFrameSet:
         try:
-            info = self._frames[frame_token]
+            info = self._frames[frame_id]
         except KeyError:
-            raise DatasetError(f"Unknown demo frame {frame_token!r}.") from None
-        scene_phase = .24 if info.scene_token == "demo-roundabout" else 0.0
+            raise UnknownIdentifierError(f"Unknown demo frame {frame_id!r}.") from None
+        scene_phase = .24 if info.scene_id == "demo-roundabout" else 0.0
         boxes = []
-        for index, class_name in enumerate(DETECTION_CLASSES):
-            angle = index * 2 * np.pi / len(DETECTION_CLASSES) + scene_phase
+        for index, class_id in enumerate(_CLASSES):
+            angle = index * 2 * np.pi / len(_CLASSES) + scene_phase
             distance = 12.0 + index % 3 * 2.5 + np.sin(info.index * .12 + index) * .8
             size = np.array(_SIZES[index])
             center = np.array([np.cos(angle) * distance, np.sin(angle) * distance, size[2] / 2])
-            boxes.append(BoundingBox3D(center, size, _rotation_z(angle + .25), class_name, f"demo-box-{index}"))
+            boxes.append(Box3D(f"demo-box-{index}", class_id, center, size, _rotation_z(angle + .25)))
         boxes_tuple = tuple(boxes)
         cameras = []
-        for index, (camera_info, yaw_degrees) in enumerate(zip(CAMERA_LAYOUT, _YAW_DEGREES)):
+        for index, ((sensor_id, _, _), yaw_degrees) in enumerate(zip(_CAMERAS, _YAW_DEGREES)):
             angle = np.deg2rad(yaw_degrees)
             forward = np.array([np.cos(angle), np.sin(angle), 0])
             right = np.array([np.sin(angle), -np.cos(angle), 0])
             pose = np.eye(4)
             pose[:3, :3] = np.column_stack([right, [0, 0, -1], forward])
             pose[:3, 3] = [forward[0] * .3, forward[1] * .3, 1.6]
-            cameras.append(CameraFrame(camera_info, _view(pose, boxes_tuple, index), _INTRINSICS, pose, info.timestamp_us + index * 1000))
-        return FrameData(info, tuple(cameras), boxes_tuple)
+            cameras.append(CameraObservation(
+                sensor_id, _view(pose, boxes_tuple, index), info.timestamp_us + index * 1000,
+                timestamp_kind="synthetic exposure", intrinsics=_INTRINSICS,
+                T_reference_from_camera=pose, projection_model=PinholeProjection(_INTRINSICS, pose),
+            ))
+        return CameraFrameSet(info, "generated", info.scene_id, tuple(cameras),
+                              AnnotationSet(info.scene_id, AnnotationStatus.AVAILABLE, boxes_tuple))

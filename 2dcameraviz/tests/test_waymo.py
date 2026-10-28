@@ -1,16 +1,17 @@
 """Native Waymo camera calibration, shutter geometry and adapter contracts."""
 
 from dataclasses import replace
-from pathlib import Path
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 
 from dataset_utils.waymo.camera import OPTICAL_TO_WAYMO, WaymoCameraProjection
 from dataset_utils.waymo.models import NativeBox, NativeCamera, NativeFrame, NativeFrameHeader, NativeSequence
-from cameraviz.dataloader import BoundingBox3D, CameraFrame, CameraInfo, FrameData, FrameInfo, create_dataset
-from cameraviz.dataloader.waymo import CAMERA_LAYOUT, WaymoAdapter
+from dataset_utils import (
+    AnnotationSet, AnnotationStatus, Box3D, CameraFrameSet, CameraObservation,
+    DatasetError, FrameInfo, Modality, ProjectionResult,
+)
+from cameraviz.dataloader import create_dataset
+from cameraviz.visualization.layout import camera_layout
 from cameraviz.processing import project_box, project_boxes
 
 
@@ -27,17 +28,17 @@ def native_camera(*, name=1, width=100, height=100, intrinsic=None, direction=5,
 
 
 def camera_frame(native, *, boxes=None):
-    fu, fv, cu, cv = native.intrinsic[:4]
-    return CameraFrame(
-        CameraInfo("CAM_FRONT", "Front", 0, 0), native.image_rgb,
-        np.array([[fu, 0, cu], [0, fv, cv], [0, 0, 1.]]),
-        native.vehicle_to_world @ native.extrinsic @ OPTICAL_TO_WAYMO,
-        round(native.pose_timestamp_s * 1e6), WaymoCameraProjection(native), boxes,
-    )
+    class NativeProjection:
+        def project_reference(self, points):
+            uv, depth = WaymoCameraProjection(native).project_world(points)
+            return ProjectionResult(uv, depth, np.isfinite(uv).all(axis=1) & (depth > 0))
+
+    annotations = None if boxes is None else AnnotationSet("world", AnnotationStatus.AVAILABLE, boxes)
+    return CameraObservation("CAM_FRONT", native.image_rgb, projection_model=NativeProjection(), annotations=annotations)
 
 
 def world_box(center=(10, 0, 0), size=(4, 2, 2)):
-    return BoundingBox3D(np.asarray(center, dtype=float), np.asarray(size, dtype=float), np.eye(3), "Vehicle", "box")
+    return Box3D("box", "Vehicle", np.asarray(center, dtype=float), np.asarray(size, dtype=float), np.eye(3))
 
 
 def test_native_forward_x_is_mapped_to_optical_forward_z_and_behind_is_rejected():
@@ -143,16 +144,17 @@ def test_nonlinear_clipping_handles_near_plane_outside_and_viewport_filling_face
 def test_camera_world_box_overrides_are_independent_of_reference_frame_boxes():
     native = native_camera()
     camera = camera_frame(native, boxes=(world_box(),))
-    frame = FrameData(FrameInfo("sample", "context", 0, 1), (camera,), (world_box(center=(-10, 0, 0)),))
+    frame = CameraFrameSet(FrameInfo("sample", "context", 0, 1, frozenset((Modality.CAMERAS,))),
+        "source", "world", (camera,), AnnotationSet("world", AnnotationStatus.AVAILABLE, (world_box(center=(-10, 0, 0)),)))
     assert len(project_boxes(frame)["CAM_FRONT"]) == 1
-    empty_camera = replace(camera, boxes=())
+    empty_camera = replace(camera, annotations=AnnotationSet("world", AnnotationStatus.AVAILABLE))
     assert project_boxes(replace(frame, cameras=(empty_camera,)))["CAM_FRONT"] == ()
-    assert project_boxes(replace(frame, cameras=(replace(camera, boxes=None),)))["CAM_FRONT"] == ()
+    assert project_boxes(replace(frame, cameras=(replace(camera, annotations=None),)))["CAM_FRONT"] == ()
 
 
 @pytest.fixture
 def native_reader(monkeypatch, tmp_path):
-    import dataset_utils.waymo as backend
+    import dataset_utils.waymo.loader as backend
     pose = np.eye(4)
     pose[:3, :3] = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]
     pose[:3, 3] = [100, 200, 3]
@@ -186,62 +188,61 @@ def native_reader(monkeypatch, tmp_path):
 def test_native_adapter_indexes_only_selected_sequence_and_preserves_true_timestamps(native_reader):
     reader, native, root = native_reader
     adapter = create_dataset("waymo", root=root)
-    assert adapter.available_splits == ("all", "train", "val")
+    assert adapter.metadata.splits == ("all", "train", "val")
     assert len(adapter.list_scenes()) == 2
     assert reader.header_calls == reader.frame_calls == []
-    assert [scene.token for scene in adapter.list_scenes_for_split("val")] == ["validation-context"]
-    frames = adapter.list_frames("validation-context")
+    assert [scene.scene_id for scene in adapter.list_scenes(split="val")] == ["validation-context"]
+    frames = adapter.list_frames("validation-context", modality=Modality.CAMERAS)
     assert [frame.timestamp_us for frame in frames] == [1_000_003, 1_104_525]
     assert reader.header_calls == ["validation-context"]
     assert not reader.frame_calls
-    assert adapter.list_frames("validation-context") is frames
-    loaded = adapter.load_frame(frames[0].token)
+    assert adapter.list_frames("validation-context", modality=Modality.CAMERAS) is frames
+    loaded = adapter.load_cameras(frames[0].frame_id)
     assert reader.frame_calls == [("validation-context", 0, 1_000_003)]
-    assert [camera.info for camera in loaded.cameras] == list(CAMERA_LAYOUT)
-    assert "Sign" in adapter.class_names
-    assert [(info.row, info.column) for info in adapter.camera_layout] == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 2)]
-    np.testing.assert_allclose(loaded.boxes[0].center, native.vehicle_to_world[:3, :3] @ native.boxes[0].center + native.vehicle_to_world[:3, 3])
-    front = next(camera for camera in loaded.cameras if camera.info.channel == "CAM_FRONT")
-    left = next(camera for camera in loaded.cameras if camera.info.channel == "CAM_FRONT_LEFT")
+    assert [camera.sensor_id for camera in loaded.cameras] == [slot.sensor_id for slot in camera_layout(adapter.metadata.sensors)]
+    assert "Sign" in [item.class_id for item in adapter.metadata.classes]
+    assert [(slot.row, slot.column) for slot in camera_layout(adapter.metadata.sensors)] == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 2)]
+    np.testing.assert_allclose(loaded.annotations.boxes[0].center, native.boxes[0].center)
+    front = next(camera for camera in loaded.cameras if camera.sensor_id == "CAM_FRONT")
+    left = next(camera for camera in loaded.cameras if camera.sensor_id == "CAM_FRONT_LEFT")
     native_front = next(camera for camera in native.cameras if camera.name == 1)
-    np.testing.assert_allclose(front.sensor_to_world, native_front.vehicle_to_world @ native_front.extrinsic @ OPTICAL_TO_WAYMO)
-    np.testing.assert_allclose(front.boxes[0].center, native.vehicle_to_world[:3, :3] @ native.boxes[0].camera_synced_box.center + native.vehicle_to_world[:3, 3])
-    assert left.boxes is None  # No override: use the frame's reference-time boxes.
+    np.testing.assert_allclose(front.T_reference_from_camera, np.linalg.inv(native.vehicle_to_world) @ native_front.vehicle_to_world @ native_front.extrinsic @ OPTICAL_TO_WAYMO)
+    np.testing.assert_allclose(front.annotations.boxes[0].center, native.boxes[0].camera_synced_box.center)
+    assert left.annotations is None  # No override: use the frame's reference-time boxes.
     assert front.image.dtype == np.uint8 and not front.image.flags.writeable
-    # The generic bridge converts world points into the loader reference
-    # before invoking the native distortion/shutter-aware projection.
+    # Native model consumes exactly the camera set reference used by boxes.
     world_points = np.array([[101., 210, 4.]])
     expected_uv, expected_depth = WaymoCameraProjection(native_front).project_world(world_points)
-    actual_uv, actual_depth = front.projection_model.project_world(world_points)
-    np.testing.assert_allclose(actual_uv, expected_uv, equal_nan=True)
-    np.testing.assert_allclose(actual_depth, expected_depth)
+    reference_points = (world_points - native.vehicle_to_world[:3, 3]) @ native.vehicle_to_world[:3, :3]
+    actual = front.projection_model.project_reference(reference_points)
+    np.testing.assert_allclose(actual.uv, expected_uv, equal_nan=True)
+    np.testing.assert_allclose(actual.depth, expected_depth)
 
 
 def test_waymo_adapter_errors_are_contextual(native_reader):
-    from cameraviz.dataloader import DatasetError
     reader, _, root = native_reader
-    adapter = WaymoAdapter(root=root)
+    adapter = create_dataset("waymo", root=root)
     with pytest.raises(DatasetError, match="needs root"):
-        WaymoAdapter(root=None)
+        create_dataset("waymo", root=None)
     with pytest.raises(DatasetError, match="split"):
-        adapter.list_scenes_for_split("mini_val")
+        adapter.list_scenes(split="mini_val")
     with pytest.raises(DatasetError, match="Unknown Waymo scene"):
-        adapter.list_frames("missing")
+        adapter.list_frames("missing", modality=Modality.CAMERAS)
     with pytest.raises(DatasetError, match="Unknown Waymo frame"):
-        adapter.load_frame("missing")
+        adapter.load_cameras("missing")
     reader.list_frame_headers = lambda context: (NativeFrameHeader(0, 5), NativeFrameHeader(1, 4))
     with pytest.raises(DatasetError, match="increase"):
-        adapter.list_frames("validation-context")
+        adapter.list_frames("validation-context", modality=Modality.CAMERAS)
 
 
 def test_sparse_reader_indices_are_distinct_from_display_frame_positions(native_reader):
     reader, _, root = native_reader
     reader.list_frame_headers = lambda context: (NativeFrameHeader(2, 1_000_003), NativeFrameHeader(5, 1_104_525))
-    adapter = WaymoAdapter(root=root)
-    frames = adapter.list_frames("validation-context")
+    adapter = create_dataset("waymo", root=root)
+    frames = adapter.list_frames("validation-context", modality=Modality.CAMERAS)
     assert [frame.index for frame in frames] == [0, 1]
-    assert frames[1].token == "waymo:validation-context:1104525"
-    adapter.load_frame(frames[1].token)
+    assert frames[1].frame_id == "waymo:validation-context:1104525"
+    adapter.load_cameras(frames[1].frame_id)
     assert reader.frame_calls == [("validation-context", 5, 1_104_525)]
 
 

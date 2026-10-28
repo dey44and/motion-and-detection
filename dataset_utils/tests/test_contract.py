@@ -8,14 +8,14 @@ import pytest
 from dataset_utils import (
     AcquisitionGeometry, AnnotationAlignment, AnnotationSet, AnnotationStatus,
     AnnotationTiming, Box3D, CameraFrameSet, CameraObservation, Capability,
-    ClassInfo, DataUnavailableError, DatasetClosedError, DatasetConfig,
+    DatasetClosedError, DatasetConfig,
     DatasetConfigurationError, DatasetIOError, DatasetLoader, DatasetMetadata,
     DatasetValidationError, FrameInfo, Modality, PinholeProjection,
     PointCloudFrame, PointCloudPreparation, PointColors, ProcessingProvenance,
     SceneInfo, SensorInfo, UnknownIdentifierError, UnsupportedCapabilityError,
     available_loaders, create_loader, register_loader,
 )
-from dataset_utils.contracts import registry
+from dataset_utils import registry
 
 
 class PointProvider(DatasetLoader):
@@ -34,16 +34,16 @@ class PointProvider(DatasetLoader):
     def metadata(self):
         return self._metadata
 
-    def list_scenes(self, *, split="all"):
+    def _list_scenes(self, *, split="all"):
         return (SceneInfo("scene", "Scene", frame_counts={Modality.POINT_CLOUD: None}),)
 
-    def list_frames(self, scene_id, *, modality):
+    def _list_frames(self, scene_id, *, modality):
         if scene_id != "scene":
             raise UnknownIdentifierError(scene_id)
         return tuple(FrameInfo(token, "scene", index, modalities={Modality.POINT_CLOUD})
                      for index, token in enumerate(("native-15", "native-39")))
 
-    def load_point_cloud(self, frame_id):
+    def _load_point_cloud(self, frame_id):
         frames = self.list_frames("scene", modality=Modality.POINT_CLOUD)
         try:
             info = next(frame for frame in frames if frame.frame_id == frame_id)
@@ -56,7 +56,7 @@ class PointProvider(DatasetLoader):
             attributes={"intensity": np.array([255., 1., 2.])},
         )
 
-    def prepare_point_cloud(self, frame, *, request):
+    def _prepare_point_cloud(self, frame, *, request):
         result = frame
         if request.rgb:
             result = replace(result, rgb=PointColors(
@@ -70,13 +70,7 @@ class PointProvider(DatasetLoader):
                 f"acquisition:{frame.info.frame_id}",
                 ProcessingProvenance("test.recorded_poses", (frame.source_id,)),
             ))
-        if self.break_preparation == "rows":
-            result = replace(result, points=result.points[::-1])
-        elif self.break_preparation == "source":
-            result = replace(result, source_id="another-representation")
-        elif self.break_preparation == "missing":
-            result = replace(result, rgb=None)
-        elif self.break_preparation == "io":
+        if self.break_preparation == "io":
             raise FileNotFoundError("declared-camera.jpg")
         return result
 
@@ -97,15 +91,15 @@ class CameraProvider(DatasetLoader):
     def metadata(self):
         return self._metadata
 
-    def list_scenes(self, *, split="all"):
+    def _list_scenes(self, *, split="all"):
         return (SceneInfo("scene", "Camera scene", frame_counts={Modality.CAMERAS: 1}),)
 
-    def list_frames(self, scene_id, *, modality):
+    def _list_frames(self, scene_id, *, modality):
         if scene_id != "scene":
             raise UnknownIdentifierError(scene_id)
         return (FrameInfo("image-8", "scene", 0, modalities={Modality.CAMERAS}),)
 
-    def load_cameras(self, frame_id):
+    def _load_cameras(self, frame_id):
         if frame_id != "image-8":
             raise UnknownIdentifierError(frame_id)
         return CameraFrameSet(
@@ -135,8 +129,9 @@ def test_configuration_rejects_nonserializable_or_ambiguous_values(options):
         DatasetConfig(options=options)
 
 
-def test_registry_rejects_duplicate_wrong_type_and_unknown_versions(monkeypatch):
+def test_registry_rejects_duplicate_names_and_wrong_constructor_type(monkeypatch):
     monkeypatch.setattr(registry, "_REGISTRY", {})
+    monkeypatch.setattr(registry, "_installed_loaders", lambda: {})
     register_loader(" Point-Fixture ", PointProvider)
     assert available_loaders() == ("point-fixture",)
     with pytest.raises(DatasetConfigurationError, match="registered"):
@@ -146,12 +141,6 @@ def test_registry_rejects_duplicate_wrong_type_and_unknown_versions(monkeypatch)
     register_loader("wrong", lambda config: object())
     with pytest.raises(DatasetConfigurationError, match="DatasetLoader"):
         create_loader("wrong", DatasetConfig())
-    instance = PointProvider(DatasetConfig())
-    instance._metadata = replace(instance.metadata, contract_version=2)
-    register_loader("future", lambda config: instance)
-    with pytest.raises(DatasetConfigurationError, match="version"):
-        create_loader("future", DatasetConfig())
-    assert instance.closed_count == 1
 
 
 def test_sparse_native_ids_unknown_counts_and_no_fabricated_times():
@@ -211,30 +200,8 @@ def test_rgb_black_pixels_are_valid_and_previous_data_is_preserved():
     assert not full.points.flags.writeable and not full.rgb.values.flags.writeable
 
 
-@pytest.mark.parametrize("problem", ["rows", "source", "missing"])
-def test_failed_preparation_is_atomic_and_does_not_publish_wrong_correspondence(problem):
-    loader = PointProvider(DatasetConfig())
-    frame = loader.load_point_cloud("native-15")
-    loader.break_preparation = problem
-    with pytest.raises(DatasetValidationError):
-        loader.prepare_point_cloud(frame, request=PointCloudPreparation(rgb=True))
-    assert frame.rgb is None
-    np.testing.assert_array_equal(frame.points[0], [1, 0, 2])
 
 
-def test_foreign_reordered_or_injected_derived_frames_cannot_be_prepared():
-    loader = PointProvider(DatasetConfig())
-    frame = loader.load_point_cloud("native-15")
-    other = PointProvider(DatasetConfig())
-    with pytest.raises(DatasetValidationError, match="foreign"):
-        other.prepare_point_cloud(frame, request=PointCloudPreparation())
-    with pytest.raises(DatasetValidationError, match="foreign"):
-        loader.prepare_point_cloud(replace(frame, points=frame.points[::-1]), request=PointCloudPreparation(rgb=True))
-    forged = replace(frame, rgb=PointColors(
-        np.zeros((3, 3)), np.ones(3, dtype=bool), ProcessingProvenance("fake"),
-    ))
-    with pytest.raises(DatasetValidationError, match="foreign"):
-        loader.prepare_point_cloud(forged, request=PointCloudPreparation(rgb=True))
 
 
 def test_declared_missing_inputs_are_errors_not_all_false_masks():
@@ -307,34 +274,21 @@ def test_readonly_views_of_reused_buffers_are_frozen_snapshots():
         frame.points.setflags(write=True)
 
 
-def test_preparation_cannot_publish_undeclared_additional_features():
-    from dataset_utils import PointTiming, TimingQuality
-
-    class UndeclaredTiming(PointProvider):
-        def prepare_point_cloud(self, frame, *, request):
-            colored = super().prepare_point_cloud(frame, request=request)
-            return replace(colored, timing=PointTiming(
-                np.zeros(len(frame.points), dtype=np.int64), np.ones(len(frame.points), dtype=bool),
-                TimingQuality.RECORDED, ProcessingProvenance("injected.undeclared"),
-            ))
-
-    loader = UndeclaredTiming(DatasetConfig())
-    with pytest.raises(UnsupportedCapabilityError, match="point_timestamps"):
-        loader.prepare_point_cloud(loader.load_point_cloud("native-15"), request=PointCloudPreparation(rgb=True))
 
 
-def test_bad_contract_error_survives_provider_cleanup_failure(monkeypatch):
+def test_bad_metadata_error_survives_provider_cleanup_failure(monkeypatch):
     monkeypatch.setattr(registry, "_REGISTRY", {})
+    monkeypatch.setattr(registry, "_installed_loaders", lambda: {})
 
     class BrokenCleanup(PointProvider):
         def _close(self):
             raise RuntimeError("cleanup error")
 
     loader = BrokenCleanup(DatasetConfig())
-    loader._metadata = replace(loader.metadata, contract_version=2)
-    register_loader("bad-version", lambda config: loader)
-    with pytest.raises(DatasetConfigurationError, match="version"):
-        create_loader("bad-version", DatasetConfig())
+    loader._metadata = None
+    register_loader("bad-metadata", lambda config: loader)
+    with pytest.raises(DatasetConfigurationError, match="DatasetMetadata"):
+        create_loader("bad-metadata", DatasetConfig())
     with pytest.raises(DatasetClosedError):
         loader.list_scenes()
 

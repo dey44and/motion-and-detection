@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .models import ProjectionResult, _array, _transform
-from ..errors import DatasetValidationError
+from .errors import DatasetValidationError
 
 
 @dataclass(frozen=True, eq=False)

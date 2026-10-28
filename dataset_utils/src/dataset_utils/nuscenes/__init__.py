@@ -1,7 +1,6 @@
-"""Shared native nuScenes metadata, sensor readers, and geometry utilities."""
+"""Native nuScenes loading, calibration, timing and RGB preparation."""
 
-from .models import NuScenesCamera, NuScenesCameraFrame
-from .reader import DETECTION_CLASSES, NuScenesReader
+from .reader import NuScenesReader
 from .loader import NuScenesLoader
 
-__all__ = ["DETECTION_CLASSES", "NuScenesCamera", "NuScenesCameraFrame", "NuScenesReader", "NuScenesLoader"]
+__all__ = ["NuScenesReader", "NuScenesLoader"]

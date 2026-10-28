@@ -4,16 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "threedviz"
-version = "0.2.0"
+version = "0.3.0"
 description = "Desktop point cloud and 3D bounding box viewer for autonomous driving datasets"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "dataset-utils>=0.2,<0.3",
+    "dataset-utils>=0.3,<0.4",
     "numpy>=1.24,<3",
     "matplotlib>=3.6,<4",
     "open3d>=0.19,<0.20",
-    "Pillow>=10,<13",
+    # Open3D imports pandas; older pandas wheels are incompatible with NumPy 2.
+    "pandas>=2.2.2,<3",
 ]
 
 [project.optional-dependencies]

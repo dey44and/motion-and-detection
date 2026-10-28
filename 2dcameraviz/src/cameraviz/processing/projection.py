@@ -1,4 +1,4 @@
-"""Project world-space cuboids through pinhole or native camera models.
+"""Project reference-frame cuboids through pinhole or native camera models.
 
 Camera optical coordinates have x right, y down and z forward. Clipping takes
 place before perspective division at the near plane and afterwards in image
@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from cameraviz.dataloader.models import BoundingBox3D, CameraFrame, FrameData
+from dataset_utils import Box3D, CameraFrameSet, CameraObservation, PinholeProjection
 
 
 _CORNER_SIGNS = np.array([
@@ -40,42 +40,10 @@ class ProjectedBox:
     ``(xmin, ymin, xmax, ymax)`` in the same native image pixel coordinates.
     """
 
-    class_name: str
-    token: str
+    class_id: str
+    annotation_id: str
     segments: np.ndarray
     rectangle: tuple[float, float, float, float]
-
-    def __post_init__(self) -> None:
-        segments = np.array(self.segments, dtype=np.float64, copy=True)
-        if segments.ndim != 3 or segments.shape[1:] != (2, 2) or not np.isfinite(segments).all():
-            raise ValueError("segments must be finite with shape (N, 2, 2).")
-        rectangle = np.asarray(self.rectangle, dtype=np.float64)
-        if rectangle.shape != (4,) or not np.isfinite(rectangle).all():
-            raise ValueError("rectangle must contain four finite coordinates.")
-        if rectangle[0] > rectangle[2] or rectangle[1] > rectangle[3]:
-            raise ValueError("rectangle coordinates must be ordered xmin, ymin, xmax, ymax.")
-        segments.setflags(write=False)
-        object.__setattr__(self, "segments", segments)
-        object.__setattr__(self, "rectangle", tuple(float(value) for value in rectangle))
-
-
-def _array(value: object, shape: tuple[int, ...], name: str) -> np.ndarray:
-    try:
-        array = np.asarray(value, dtype=np.float64)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must be finite with shape {shape}.") from exc
-    if array.shape != shape or not np.isfinite(array).all():
-        raise ValueError(f"{name} must be finite with shape {shape}.")
-    return array
-
-
-def _rotation(value: object, name: str) -> np.ndarray:
-    rotation = _array(value, (3, 3), name)
-    if not np.allclose(rotation.T @ rotation, np.eye(3), rtol=0, atol=1e-6):
-        raise ValueError(f"{name} must be an orthonormal rotation.")
-    if not np.isclose(np.linalg.det(rotation), 1, rtol=0, atol=1e-6):
-        raise ValueError(f"{name} must be a proper rotation.")
-    return rotation
 
 
 def _clip_polygon(polygon: np.ndarray, axis: int, boundary: float, *, keep_greater: bool) -> np.ndarray:
@@ -139,11 +107,9 @@ def _clip_segment_image(segment: np.ndarray, xmax: float, ymax: float) -> np.nda
 
 
 def _model_project(model, points):
-    pixels, depth = model.project_world(np.asarray(points, dtype=np.float64))
-    pixels, depth = np.asarray(pixels, dtype=np.float64), np.asarray(depth, dtype=np.float64)
-    if pixels.shape != (len(points), 2) or depth.shape != (len(points),):
-        raise ValueError("Camera projection_model must return (N, 2) pixels and (N,) depth.")
-    return pixels, depth
+    result = model.project_reference(np.asarray(points, dtype=np.float64))
+    pixels = np.where(result.valid_mask[:, None], result.uv, np.nan)
+    return pixels, result.depth
 
 
 def _nonlinear_near_intersections(model, first, second, near):
@@ -167,19 +133,19 @@ def _nonlinear_near_intersections(model, first, second, near):
     return front_pixel
 
 
-def _project_nonlinear_box(box, camera, world, near, xmax, ymax):
+def _project_nonlinear_box(box, camera, reference, near, xmax, ymax):
     """Sample curved edges and faces before viewport clipping.
 
     Sixteen pieces per cuboid edge retain distortion/shutter curvature. Face
     boundaries also supply rectangle visibility when every original edge lies
-    outside the image. Near intersections are refined in world coordinates
+    outside the image. Near intersections are refined in reference coordinates
     against the camera model's returned forward depth.
     """
 
     model = camera.projection_model
     fractions = np.linspace(0., 1., 17)
     samples_by_edge = np.asarray([
-        world[first] + fractions[:, None] * (world[second] - world[first])
+        reference[first] + fractions[:, None] * (reference[second] - reference[first])
         for first, second in _EDGES
     ])
     all_pixels, all_depth = _model_project(model, samples_by_edge.reshape(-1, 3))
@@ -206,9 +172,8 @@ def _project_nonlinear_box(box, camera, world, near, xmax, ymax):
             near_pixels[(edge, index)] = pixel
             near_by_points[tuple(sorted((tuple(first), tuple(second))))] = pixel
     segments = []
-    for edge_index, (first, second) in enumerate(_EDGES):
-        samples = samples_by_edge[edge_index]
-        pixels, depth = pixels_by_edge[edge_index], depth_by_edge[edge_index]
+    for edge_index in range(len(_EDGES)):
+        pixels = pixels_by_edge[edge_index]
         valid = valid_by_edge[edge_index]
         for index in range(16):
             if not valid[index] and not valid[index + 1]:
@@ -267,54 +232,34 @@ def _project_nonlinear_box(box, camera, world, near, xmax, ymax):
     pixels = np.concatenate(visible) if visible else np.asarray(segments).reshape(-1, 2)
     minimum, maximum = pixels.min(axis=0), pixels.max(axis=0)
     return ProjectedBox(
-        box.class_name, box.token, np.asarray(segments, dtype=np.float64).reshape(-1, 2, 2),
+        box.class_id, box.annotation_id, np.asarray(segments, dtype=np.float64).reshape(-1, 2, 2),
         (minimum[0], minimum[1], maximum[0], maximum[1]),
     )
 
 
-def project_box(box: BoundingBox3D, camera: CameraFrame, *, near_plane: float = 0.1) -> ProjectedBox | None:
-    """Return a clipped cuboid projection, or None if it misses the camera view.
+def project_box(box: Box3D, camera: CameraObservation, *, near_plane: float = 0.1) -> ProjectedBox | None:
+    """Project one box in the camera model's declared reference coordinates.
 
-    Box dimensions are (length, width, height); its rotation maps box-local
-    coordinates into world coordinates. ``camera.sensor_to_world`` maps
-    optical coordinates into world coordinates and is inverted as a full rigid
-    transform, including pitch and roll. No assumption about vehicle yaw is
-    made. Image bounds use pixel centers from zero through width/height minus
-    one. Native camera models can supply distortion/shutter-aware projection;
-    the default path assumes an undistorted pinhole image.
+    Explicit pinhole models use exact near-plane and image clipping. Other
+    models retain sampled curved edges and native distortion/shutter behavior.
+    Images without a projection model remain viewable without an overlay.
     """
-
     try:
         near = float(near_plane)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("near_plane must be positive and finite.") from exc
     if isinstance(near_plane, bool) or not np.isfinite(near) or near <= 0:
         raise ValueError("near_plane must be positive and finite.")
-    center = _array(box.center, (3,), "Box center")
-    size = _array(box.size, (3,), "Box size")
-    if np.any(size <= 0):
-        raise ValueError("Box size must be positive.")
-    box_rotation = _rotation(box.rotation, "Box rotation")
-    image = np.asarray(camera.image)
-    if image.ndim != 3 or image.shape[2] != 3 or min(image.shape[:2]) < 1 or image.dtype != np.uint8:
-        raise ValueError("Camera image must be uint8 RGB with shape (H, W, 3).")
-    ymax, xmax = float(image.shape[0] - 1), float(image.shape[1] - 1)
-    world = (_CORNER_SIGNS * (size / 2)) @ box_rotation.T + center
-    if getattr(camera, "projection_model", None) is not None:
-        return _project_nonlinear_box(box, camera, world, near, xmax, ymax)
-    if not getattr(camera, "allow_pinhole", True) or camera.sensor_to_world is None or camera.intrinsics is None:
+    model = camera.projection_model
+    if model is None:
         return None
-    pose = _array(camera.sensor_to_world, (4, 4), "Camera sensor_to_world")
-    if not np.allclose(pose[3], [0, 0, 0, 1], rtol=0, atol=1e-9):
-        raise ValueError("Camera sensor_to_world must have last row [0, 0, 0, 1].")
-    camera_rotation = _rotation(pose[:3, :3], "Camera sensor_to_world rotation")
-    intrinsics = _array(camera.intrinsics, (3, 3), "Camera intrinsics")
-    if (intrinsics[0, 0] <= 0 or intrinsics[1, 1] <= 0
-            or not np.allclose(intrinsics[2], [0, 0, 1], rtol=0, atol=1e-9)):
-        raise ValueError("Camera intrinsics must be a pinhole matrix with positive focal lengths.")
-    optical = (world - pose[:3, 3]) @ camera_rotation
-    if not np.isfinite(optical).all():
-        raise ValueError("Box transform produced nonfinite camera coordinates.")
+    ymax, xmax = float(camera.image.shape[0] - 1), float(camera.image.shape[1] - 1)
+    reference = (_CORNER_SIGNS * (box.size / 2)) @ box.rotation.T + box.center
+    if not isinstance(model, PinholeProjection):
+        return _project_nonlinear_box(box, camera, reference, near, xmax, ymax)
+    pose = model.T_reference_from_camera
+    intrinsics = model.intrinsics
+    optical = (reference - pose[:3, 3]) @ pose[:3, :3]
     if np.all(optical[:, 2] < near):
         return None
 
@@ -343,26 +288,18 @@ def project_box(box: BoundingBox3D, camera: CameraFrame, *, near_plane: float = 
         if segment is not None:
             segments.append(segment)
     return ProjectedBox(
-        class_name=box.class_name,
-        token=box.token,
+        class_id=box.class_id,
+        annotation_id=box.annotation_id,
         segments=np.asarray(segments, dtype=np.float64).reshape(-1, 2, 2),
         rectangle=rectangle,
     )
 
 
-def project_boxes(frame: FrameData, *, near_plane: float = 0.1) -> dict[str, tuple[ProjectedBox, ...]]:
-    """Project a frame's boxes independently into every available camera."""
-
+def project_boxes(frame: CameraFrameSet, *, near_plane: float = 0.1) -> dict[str, tuple[ProjectedBox, ...]]:
+    """Project default or camera-specific annotations without changing records."""
     result = {}
     for camera in frame.cameras:
-        channel = camera.info.channel
-        if channel in result:
-            raise ValueError(f"Duplicate camera channel {channel!r}.")
-        boxes = []
-        overrides = getattr(camera, "boxes", None)
-        for box in frame.boxes if overrides is None else overrides:
-            projected = project_box(box, camera, near_plane=near_plane)
-            if projected is not None:
-                boxes.append(projected)
-        result[channel] = tuple(boxes)
+        annotations = frame.annotations if camera.annotations is None else camera.annotations
+        projected = (project_box(box, camera, near_plane=near_plane) for box in annotations.boxes)
+        result[camera.sensor_id] = tuple(box for box in projected if box is not None)
     return result

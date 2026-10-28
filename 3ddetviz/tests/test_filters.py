@@ -7,7 +7,7 @@ import sys
 import numpy as np
 import pytest
 
-from threedviz.dataloader.models import BoundingBox3D
+from dataset_utils import Box3D
 from detviz.predictions.models import Detection, PredictionFrame
 from detviz.processing import (
     DEFAULT_NMS_GROUPS, FilterConfig, bev_iou, filter_predictions,
@@ -16,9 +16,9 @@ from detviz.processing import (
 
 
 def box(center=(0, 0, 0), size=(2, 2, 2), rotation=None, class_name="car"):
-    return BoundingBox3D(
+    return Box3D("box", class_name,
         np.array(center, dtype=float), np.array(size, dtype=float),
-        np.eye(3) if rotation is None else rotation, class_name,
+        np.eye(3) if rotation is None else rotation,
     )
 
 
@@ -268,7 +268,7 @@ def test_empty_frame_has_zero_stage_counts_in_every_nms_mode():
         assert (result.loaded_count, result.score_count, result.spatial_count, result.pre_nms_count, result.nms_count, result.output_count) == (0, 0, 0, 0, 0, 0)
 
 
-def test_configuration_defensively_copies_mutable_settings_and_has_stable_cache_key():
+def test_configuration_preserves_immutable_independent_settings():
     scores = {"truck": .3, "car": .5}
     groups = [["car", "truck"]]
     config = FilterConfig(per_class_scores=scores, nms_groups=groups)
@@ -278,8 +278,6 @@ def test_configuration_defensively_copies_mutable_settings_and_has_stable_cache_
     assert config.nms_groups == (("car", "truck"),)
     equivalent = FilterConfig(per_class_scores={"car": .5, "truck": .3}, nms_groups=(("car", "truck"),))
     assert config == equivalent
-    assert config.cache_key() == equivalent.cache_key()
-    assert hash(config) == hash(equivalent)
     with pytest.raises(TypeError):
         config.per_class_scores["car"] = .8
     with pytest.raises(FrozenInstanceError):
@@ -331,10 +329,10 @@ class NoDetectorFrameworks(importlib.abc.MetaPathFinder):
             raise AssertionError('Unexpected framework import: ' + fullname)
 sys.meta_path.insert(0, NoDetectorFrameworks())
 import numpy as np
-from threedviz.dataloader.models import BoundingBox3D
+from dataset_utils import Box3D
 from detviz.predictions.models import Detection, PredictionFrame
 from detviz.processing import FilterConfig, filter_predictions
-box = BoundingBox3D(np.zeros(3), np.ones(3), np.eye(3), 'car')
+box = Box3D('box', 'car', np.zeros(3), np.ones(3), np.eye(3))
 frame = PredictionFrame('sample', (Detection(box, .9, 'a'), Detection(box, .8, 'b')))
 result = filter_predictions(frame, FilterConfig(nms_mode='class'))
 assert result.output_count == 1

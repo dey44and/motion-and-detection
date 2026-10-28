@@ -8,8 +8,8 @@ import pytest
 from PIL import Image
 
 from dataset_utils.errors import DatasetError
-from dataset_utils.models import PointCloudFrame
-from dataset_utils.nuscenes import NuScenesCameraFrame, NuScenesReader
+from dataset_utils import CameraFrameSet, DataUnavailableError, Modality, PointCloudFrame
+from dataset_utils.nuscenes import NuScenesReader
 
 
 @pytest.fixture
@@ -86,9 +86,9 @@ def test_mode_selects_keyframe_index_without_loading_payloads(native_root, monke
     monkeypatch.setattr(Image, "open", forbidden)
     monkeypatch.setattr(np, "fromfile", forbidden)
     reader = NuScenesReader(root=native_root, sensor=sensor)
-    assert reader.list_scenes()[0].frame_count == 2
+    assert reader.list_scenes()[0].frame_counts[Modality.POINT_CLOUD if sensor == "lidar" else Modality.CAMERAS] == 2
     frames = reader.list_frames("scene")
-    assert [frame.token for frame in frames] == tokens
+    assert [frame.frame_id for frame in frames] == tokens
     assert [frame.index for frame in frames] == [0, 1]
     assert reader._image_cache == {}
 
@@ -106,31 +106,31 @@ def test_both_modalities_share_tables_and_keep_their_coordinate_frames(native_ro
     cloud = reader.load_frame("both")
     camera_frame = reader.load_camera_frame("both")
     assert isinstance(cloud, PointCloudFrame)
-    assert isinstance(camera_frame, NuScenesCameraFrame)
+    assert isinstance(camera_frame, CameraFrameSet)
     assert all(count == 1 for count in read_counts.values())
     assert read_counts["sample_data"] == 1
-    np.testing.assert_array_equal(cloud.boxes[0].center, [2, 2, 5])
-    np.testing.assert_array_equal(camera_frame.boxes[0].center, [13, 4, 8])
-    np.testing.assert_array_equal(cloud.boxes[0].size, [4, 2, 1])
+    np.testing.assert_array_equal(cloud.annotations.boxes[0].center, [2, 2, 5])
+    np.testing.assert_array_equal(camera_frame.annotations.boxes[0].center, [13, 4, 8])
+    np.testing.assert_array_equal(cloud.annotations.boxes[0].size, [4, 2, 1])
     camera = camera_frame.cameras[0]
     assert camera.timestamp_us == 975_000
-    np.testing.assert_array_equal(camera.sensor_to_world[:3, 3], [12, 0, 0])
+    np.testing.assert_array_equal(camera.T_reference_from_camera[:3, 3], [12, 0, 0])
     assert camera.image is reader.load_camera_frame("both").cameras[0].image
     assert not camera.image.flags.writeable
     assert len(reader._cameras_by_scene["scene"]["CAM_FRONT"]) == 3
     timed = reader.prepare_frame(cloud, point_timing=True)
-    assert timed.raw_points.shape == cloud.points.shape
-    assert timed.point_timestamps_us.shape == (len(cloud.points),)
-    assert timed.rgb_colors is None
+    assert timed.acquisition.points.shape == cloud.points.shape
+    assert timed.timing.timestamps_us.shape == (len(cloud.points),)
+    assert timed.rgb is None
     assert reader._image_cache  # Timing does not clear camera payload cache.
 
 
 @pytest.mark.parametrize("sensor", ["camera", "lidar"])
 def test_wrong_modality_and_unknown_tokens_raise_shared_error(native_root, sensor):
     reader = NuScenesReader(root=native_root, sensor=sensor)
-    with pytest.raises(DatasetError, match="Unknown nuScenes frame"):
+    with pytest.raises(DataUnavailableError, match="has no point_cloud observation"):
         reader.load_frame("camera-only")
-    with pytest.raises(DatasetError, match="Unknown nuScenes frame"):
+    with pytest.raises(DataUnavailableError, match="has no cameras observation"):
         reader.load_camera_frame("lidar-only")
     with pytest.raises(DatasetError, match="Unknown nuScenes frame"):
         reader.load_camera_frame("missing")
@@ -182,10 +182,10 @@ def test_inactive_modality_timestamp_error_is_deferred_to_cross_read(
     next(sample for sample in records if sample["token"] == bad_token)["timestamp"] = bad_timestamp
     path.write_text(json.dumps(records))
     reader = NuScenesReader(root=native_root, sensor=active)
-    assert reader.list_scenes()[0].frame_count == 2
+    assert reader.list_scenes()[0].frame_counts[Modality.POINT_CLOUD if active == "lidar" else Modality.CAMERAS] == 2
     assert len(reader.list_frames("scene")) == 2
     active_load = reader.load_frame if active == "lidar" else reader.load_camera_frame
-    assert active_load("both").info.token == "both"
+    assert active_load("both").info.frame_id == "both"
     inactive_load = reader.load_frame if inactive == "lidar" else reader.load_camera_frame
     with pytest.raises(DatasetError, match=f"Invalid {inactive} sample timestamps.*{bad_token}"):
         inactive_load(bad_token)
@@ -235,12 +235,12 @@ def test_camera_view_retains_keyframes_and_prepares_full_sweeps_only_on_request(
     assert reader._calibrations is original_calibrations
     assert reader._annotations is original_annotations
     assert reader.sensor == "camera"
-    assert [frame.token for frame in reader.list_frames("scene")] == ["both", "camera-only"]
+    assert [frame.frame_id for frame in reader.list_frames("scene")] == ["both", "camera-only"]
     assert reader.load_camera_frame("both").cameras[0].image is camera.image
-    np.testing.assert_array_equal(timed.point_timestamps_us, reader.prepare_frame(cloud, point_timing=True).point_timestamps_us)
+    np.testing.assert_array_equal(timed.timing.timestamps_us, reader.prepare_frame(cloud, point_timing=True).timing.timestamps_us)
     assert read_counts["sample_data"] == 1  # Reuse the deferred full index.
     assert set(read_counts) == {"sample_data"}  # No second pose/annotation load.
     colors = reader.prepare_frame(timed, camera_rgb=True)
-    assert colors.rgb_colors.shape == (len(cloud.points), 3)
-    assert colors.rgb_valid_mask.all()
-    np.testing.assert_allclose(colors.rgb_colors, [[30 / 255, 60 / 255, 90 / 255]] * len(cloud.points))
+    assert colors.rgb.values.shape == (len(cloud.points), 3)
+    assert colors.rgb.valid_mask.all()
+    np.testing.assert_allclose(colors.rgb.values, [[30 / 255, 60 / 255, 90 / 255]] * len(cloud.points))

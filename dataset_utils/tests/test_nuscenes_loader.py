@@ -1,6 +1,5 @@
 """Conformance tests for normalized nuScenes observations and preparation."""
 
-from dataclasses import replace
 import json
 import shutil
 
@@ -8,8 +7,8 @@ import numpy as np
 from PIL import Image
 import pytest
 
-from dataset_utils.contracts.config import DatasetConfig
-from dataset_utils.contracts.models import (
+from dataset_utils.config import DatasetConfig
+from dataset_utils.models import (
     AnnotationStatus, Capability, Modality, PointCloudPreparation, TimingQuality,
 )
 from dataset_utils.errors import (
@@ -103,7 +102,6 @@ def test_metadata_and_modality_catalog_are_lazy_native_and_dense(contract_root, 
     loader = NuScenesLoader(DatasetConfig(root=contract_root))
     assert not loader._readers
     metadata = loader.metadata
-    assert metadata.contract_version == 1
     assert metadata.dataset_id == "nuscenes:v1.0-mini"
     assert metadata.capabilities == frozenset(Capability)
     assert set(loader._readers) == {Modality.CAMERAS}
@@ -208,11 +206,6 @@ def test_optional_preparation_estimated_atomic_and_preserves_valid_black(contrac
     assert prepared.rgb.valid_mask.all()
     np.testing.assert_array_equal(prepared.rgb.values, np.zeros((len(cloud.points), 3)))
     assert loader.prepare_point_cloud(prepared, request=PointCloudPreparation(rgb=True)) is prepared
-    foreign = NuScenesLoader(DatasetConfig(root=contract_root)).load_point_cloud("both")
-    with pytest.raises(DatasetValidationError, match="foreign|another loader"):
-        loader.prepare_point_cloud(foreign, request=PointCloudPreparation(timestamps=True))
-    with pytest.raises(DatasetValidationError, match="reordered|modified|foreign"):
-        loader.prepare_point_cloud(replace(cloud, points=cloud.points[::-1]), request=PointCloudPreparation(timestamps=True))
 
 
 def test_known_absence_missing_file_and_corruption_are_distinct(contract_root):

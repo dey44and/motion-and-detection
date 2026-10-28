@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from threedviz.dataloader.models import BoundingBox3D
+from dataset_utils import Box3D
 
 
 class PredictionError(RuntimeError):
@@ -30,39 +30,16 @@ def immutable_array(value: object, shape: tuple[int, ...], name: str) -> np.ndar
     return array
 
 
-def rigid_matrix(value: object, name: str) -> np.ndarray:
-    matrix = immutable_array(value, (4, 4), name)
-    if (
-        not np.allclose(matrix[3], [0, 0, 0, 1], rtol=0, atol=1e-7)
-        or not np.allclose(matrix[:3, :3].T @ matrix[:3, :3], np.eye(3), rtol=0, atol=1e-6)
-        or not np.isclose(np.linalg.det(matrix[:3, :3]), 1, rtol=0, atol=1e-6)
-    ):
-        raise PredictionError(f"{name} must be a proper rigid 4×4 transform.")
-    return matrix
-
-
 @dataclass(frozen=True)
 class Detection:
-    box: BoundingBox3D
+    box: Box3D
     score: float
     identifier: str
     velocity: np.ndarray | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.box, BoundingBox3D):
-            raise PredictionError("Detection box must be a BoundingBox3D.")
-        center = immutable_array(self.box.center, (3,), "Detection center")
-        size = immutable_array(self.box.size, (3,), "Detection size")
-        rotation = immutable_array(self.box.rotation, (3, 3), "Detection rotation")
-        if np.any(size <= 0):
-            raise PredictionError("Detection dimensions must be positive length, width, height.")
-        if (
-            not np.allclose(rotation.T @ rotation, np.eye(3), rtol=0, atol=1e-6)
-            or not np.isclose(np.linalg.det(rotation), 1, rtol=0, atol=1e-6)
-        ):
-            raise PredictionError("Detection rotation must be a proper orthonormal rotation.")
-        if not isinstance(self.box.class_name, str) or not self.box.class_name.strip():
-            raise PredictionError("Detection class name must be a nonempty string.")
+        if not isinstance(self.box, Box3D):
+            raise PredictionError("Detection box must be a Box3D.")
         try:
             score = float(self.score)
         except (TypeError, ValueError, OverflowError) as exc:
@@ -72,7 +49,6 @@ class Detection:
         if not isinstance(self.identifier, str) or not self.identifier:
             raise PredictionError("Detection identifier must be a nonempty string.")
         object.__setattr__(self, "score", score)
-        object.__setattr__(self, "box", BoundingBox3D(center, size, rotation, self.box.class_name, self.box.token))
         if self.velocity is not None:
             object.__setattr__(self, "velocity", immutable_array(self.velocity, (3,), "Detection velocity"))
 

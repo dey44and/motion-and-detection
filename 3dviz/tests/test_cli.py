@@ -106,3 +106,30 @@ def test_only_missing_open3d_gets_install_guidance(missing, monkeypatch, capsys)
     else:
         with pytest.raises(ModuleNotFoundError, match=missing):
             cli.main([])
+
+
+def test_dataset_config_is_resolved_and_forwarded_before_graphics_launch(launches, tmp_path):
+    config_file = tmp_path / "sources.json"
+    config_file.write_text('{"root": "dataset", "storage_format": "native"}', encoding="utf-8")
+    assert cli.main(["--dataset", "waymo", "--dataset-config", str(config_file), "--split", "val"]) == 0
+    options = launches[0]
+    assert options["config"].root == tmp_path / "dataset"
+    assert options["config"].storage_format == "native"
+    assert options["root"] is None and options["split"] == "val" and options["autoload"]
+
+
+@pytest.mark.parametrize("conflicting", [["--root", "/data"], ["--version", "v1.0-mini"], ["--demo"]])
+def test_dataset_config_rejects_ambiguous_or_demo_launches(conflicting, launches, tmp_path, capsys):
+    with pytest.raises(SystemExit) as error:
+        cli.main(["--dataset-config", str(tmp_path / "sources.json"), *conflicting])
+    assert error.value.code == 2 and "--dataset-config" in capsys.readouterr().err
+    assert not launches
+
+
+def test_invalid_dataset_config_reports_cli_error_before_graphics_import(launches, tmp_path, capsys):
+    config_file = tmp_path / "sources.json"
+    config_file.write_text("{invalid}", encoding="utf-8")
+    with pytest.raises(SystemExit) as error:
+        cli.main(["--dataset-config", str(config_file)])
+    assert error.value.code == 2 and "error:" in capsys.readouterr().err
+    assert not launches

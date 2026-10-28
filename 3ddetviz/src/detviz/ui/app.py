@@ -14,11 +14,10 @@ import tempfile
 
 from open3d.visualization import gui
 
-from threedviz.dataloader import create_dataset
 from threedviz.ui.app import ViewerWindow
 from threedviz.visualization.renderer import BoxLayer
 
-from ..controller import ReviewDatasetAdapter, refilter
+from ..controller import compose_review, refilter
 from ..predictions import open_predictions
 from ..processing.filters import FilterConfig
 
@@ -30,10 +29,10 @@ class DetectionWindow(ViewerWindow):
     window_title = "3ddetviz · Detection review"
     viewer_title = "3ddetviz"
 
-    def __init__(self, *, predictions=None, cache_dir=None, split="val", **kwargs):
+    def __init__(self, *, predictions=None, cache_dir=None, split="val", prediction_format="auto", **kwargs):
         self._prediction_path = "" if predictions is None else str(predictions)
         self._cache_dir = cache_dir
-        self._split = split
+        self._prediction_format = prediction_format
         self._filter_config = FilterConfig()
         self._syncing_filters = False
         self._filter_deadline = None
@@ -42,18 +41,22 @@ class DetectionWindow(ViewerWindow):
         self._show_gt = True
         self._show_detections = True
         self._progress = None
-        self._sources = []
+        self._dataset_sources = {}
+        self._pending_source = None
+        self._demo_datasets = set()
+        self._pending_review = None
+        self._review_frame = None
         self._load_options = None
-        self._last_connection_adapter = None
+        self._last_connection_loader = None
         self.last_error = None
-        super().__init__(**kwargs)
+        super().__init__(split=split, **kwargs)
         self.window.set_on_tick_event(self._on_review_tick)
 
     def _extend_dataset_controls(self, connection, em):
         connection.add_child(gui.Label("Predictions file"))
         self.prediction_path = gui.TextEdit()
         self.prediction_path.text_value = self._prediction_path
-        self.prediction_path.tooltip = "results_nusc.json or OpenPCDet result.pkl; boxes are joined by sample token"
+        self.prediction_path.tooltip = "results_nusc.json or OpenPCDet result.pkl; boxes are joined by dataset frame ID"
         connection.add_child(self.prediction_path)
         row = gui.Horiz(.3 * em)
         self.prediction_browse = gui.Button("Browse predictions")
@@ -68,11 +71,11 @@ class DetectionWindow(ViewerWindow):
 
     def _extend_navigation_controls(self, navigation, em):
         navigation.add_child(gui.Label("Split"))
-        self.split_choice = gui.Combobox()
-        for name in ("val", "train", "all", "mini_val", "mini_train", "test"):
+        self.split_choice = self.dataset_split_choice = gui.Combobox()
+        for name in dict.fromkeys((self._dataset_split, "all")):
             self.split_choice.add_item(name)
-        self.split_choice.selected_text = self._split
-        self.split_choice.tooltip = "On nuScenes mini, val/train select mini_val/mini_train."
+        self.split_choice.selected_text = self._dataset_split
+        self.split_choice.tooltip = "Available split names come from the connected dataset."
         self.split_choice.set_on_selection_changed(self._on_split)
         navigation.add_child(self.split_choice)
         self.coverage_label = gui.Label("")
@@ -221,17 +224,25 @@ class DetectionWindow(ViewerWindow):
     def _set_busy(self, busy):
         super()._set_busy(busy)
         if hasattr(self, "prediction_load"):
-            for widget in (self.prediction_load, self.prediction_browse, self.prediction_path, self.split_choice, self.dataset_choice, self.root_edit, self.version_edit, self.browse_button):
+            for widget in (self.prediction_load, self.prediction_browse, self.prediction_path, self.split_choice):
                 widget.enabled = not busy
             if not busy:
                 self._on_dataset_choice(self.dataset_choice.selected_text, 0)
 
+    @property
+    def _source(self):
+        return self._dataset_sources.get(id(self._adapter))
+
     def _prune_sources(self):
-        active = None if self._adapter is None else self._adapter.source
-        for source in self._sources:
-            if source is not active:
-                source.close()
-        self._sources = [] if active is None else [active]
+        if self._pending_source is not None:
+            self._pending_source.close()
+            self._pending_source = None
+        for loader, source in tuple(self._dataset_sources.items()):
+            if loader != id(self._adapter):
+                if source is not None:
+                    source.close()
+                del self._dataset_sources[loader]
+                self._demo_datasets.discard(loader)
 
     def _submit(self, job, on_success, message, *, on_error=None):
         self.last_error = None
@@ -251,29 +262,46 @@ class DetectionWindow(ViewerWindow):
         if not self._capture_filter_controls():
             return
         self._filter_deadline = None
-        self._load_options = (self.prediction_path.text_value.strip(), self.split_choice.selected_text, self._filter_config)
+        self._load_options = (self.prediction_path.text_value.strip(), self.split_choice.selected_text)
+        self._dataset_split = self.split_choice.selected_text
         super().load_dataset(initial_scene=initial_scene, initial_frame=initial_frame)
 
     def _open_source(self, path):
         if not path:
             return None
-        return open_predictions(Path(path).expanduser(), cache_dir=self._cache_dir,
+        return open_predictions(Path(path).expanduser(), format=self._prediction_format, cache_dir=self._cache_dir,
                                 progress=lambda fraction, message: setattr(self, "_progress", (fraction, message)),
                                 cancelled=lambda: not self._alive)
 
     def _create_dataset_adapter(self, name, root, version):
-        path, split, config = self._load_options
-        base = create_dataset(name, root=root, version=version)
-        # Validate split before indexing a potentially large prediction file.
+        path, split = self._load_options
+        loader = super()._create_dataset_adapter(name, root, version)
         try:
-            base.list_scenes_for_split(split)
+            loader.list_scenes(split=split)
             source = None if name == "demo" else self._open_source(path)
         except Exception:
-            base.close()
+            loader.close()
             raise
+        self._dataset_sources[id(loader)] = source
+        if name == "demo":
+            self._demo_datasets.add(id(loader))
+        return loader
+
+    def _load_prepared_frame(self, loader, frame_id, mode, raw):
+        observation = super()._load_prepared_frame(loader, frame_id, mode, raw)
+        self._pending_review = compose_review(
+            observation, source=self._dataset_sources.get(id(loader)),
+            config=self._filter_config, demo=id(loader) in self._demo_datasets,
+        )
+        return observation
+
+    def _dataset_class_labels(self, loader):
+        labels = dict(super()._dataset_class_labels(loader))
+        source = self._dataset_sources.get(id(loader))
         if source is not None:
-            self._sources.append(source)
-        return ReviewDatasetAdapter(base, split=split, source=source, config=config, demo=name == "demo")
+            for class_id in source.class_names:
+                labels.setdefault(class_id, class_id)
+        return labels
 
     def load_predictions(self):
         if self._busy:
@@ -283,86 +311,67 @@ class DetectionWindow(ViewerWindow):
             return
         if not self._capture_filter_controls():
             return
-        path, current, old = self.prediction_path.text_value.strip(), self.renderer.frame, self._adapter
-        if old.demo:
+        if id(self._adapter) in self._demo_datasets:
             self._show_error(ValueError("The demo generates its own detections. Select a real dataset to load a prediction file."))
             return
+        path, observation = self.prediction_path.text_value.strip(), self.renderer.frame
         config = self._filter_config
         def job():
             source = self._open_source(path)
-            adapter = ReviewDatasetAdapter(old.base, split=old.split, source=source, config=config)
+            if source is not None:
+                self._pending_source = source
             try:
-                return adapter, adapter.compose(current)
+                return source, compose_review(observation, source=source, config=config)
             except Exception:
                 if source is not None:
+                    self._pending_source = None
                     source.close()
                 raise
         def loaded(result):
-            adapter, data = result
-            self._adapter = adapter
-            if adapter.source is not None:
-                self._sources.append(adapter.source)
-            self._rebuild_classes(adapter.class_names)
-            self._replace_review_boxes(data)
-            self._update_frame_controls(data)
+            source, review = result
+            self._pending_source = None
+            previous = self._source
+            self._dataset_sources[id(self._adapter)] = source
+            if previous is not None and previous is not source:
+                previous.close()
+            labels = self._dataset_class_labels(self._adapter)
+            self.renderer.set_class_labels(labels)
+            self._rebuild_classes(tuple(dict.fromkeys(labels.values())))
+            self._replace_review_boxes(review)
+            self._update_frame_controls(observation)
         self._submit(job, loaded, "Indexing predictions…")
 
-    def _on_split(self, name, _index):
-        if self._busy or self._adapter is None or name == self._adapter.split:
-            return
-        adapter = self._adapter
-        if not self._capture_filter_controls():
-            self.split_choice.selected_text = adapter.split
-            return
-        config = self._filter_config
-        mode, raw = self.renderer.settings.color_scheme, self.renderer.settings.use_raw_points
-        def job():
-            scenes = adapter.base.list_scenes_for_split(name)
-            if not scenes:
-                raise ValueError(f"No scenes from split {name!r} are installed.")
-            updated = ReviewDatasetAdapter(adapter.base, split=name, source=adapter.source, config=config, demo=adapter.demo)
-            frames = updated.list_frames(scenes[0].token)
-            data = self._load_prepared_frame(updated, frames[0].token, mode, raw)
-            return updated, scenes, frames, data
-        def loaded(result):
-            updated, scenes, frames, data = result
-            self._render_loaded_frame(data, reset_camera=True)
-            self._adapter, self._scenes, self._frames = updated, scenes, frames
-            self._scene_index = self._frame_index = 0
-            self.scene_choice.clear_items()
-            for scene in scenes:
-                self.scene_choice.add_item(scene.name)
-            self.scene_choice.selected_index = 0
-            self._update_frame_controls(data)
-        self._submit(job, loaded, "Loading split…", on_error=lambda: setattr(self.split_choice, "selected_text", adapter.split))
+    def _on_split(self, name, index):
+        if self._capture_filter_controls():
+            super()._on_dataset_split(name, index)
 
     def _request_frame(self, index):
-        if self._busy or self._adapter is None or index == self._frame_index:
-            return
-        if not self._capture_filter_controls():
-            return
-        self._adapter.config = self._filter_config
-        super()._request_frame(index)
+        if self._capture_filter_controls():
+            super()._request_frame(index)
 
     def _on_scene_choice(self, name, index):
-        if self._busy or self._adapter is None or index == self._scene_index:
-            return
-        if not self._capture_filter_controls():
-            return
-        self._adapter.config = self._filter_config
-        super()._on_scene_choice(name, index)
+        if self._capture_filter_controls():
+            super()._on_scene_choice(name, index)
 
-    def _layers(self, data):
-        predictions = () if data.filtered is None else tuple(detection.box for detection in data.filtered.detections)
-        return (BoxLayer("gt", data.boxes, self._gt_color, self._show_gt),
+    def _layers(self, review):
+        predictions = () if review.filtered is None else tuple(item.box for item in review.filtered.detections)
+        return (BoxLayer("gt", review.observation.annotations.boxes, self._gt_color, self._show_gt),
                 BoxLayer("detections", predictions, self._detection_color, self._show_detections))
 
-    def _render_loaded_frame(self, data, *, reset_camera=False):
-        self.renderer.set_frame(data, reset_camera=reset_camera, box_layers=self._layers(data))
+    def _render_loaded_frame(self, observation, *, reset_camera=False):
+        pending = self._pending_review
+        if pending is not None and pending.observation is observation:
+            review = pending
+        else:
+            review = replace(self._review_frame, observation=observation)
+        self.renderer.set_frame(observation, reset_camera=reset_camera, box_layers=self._layers(review))
+        self._review_frame = review
+        if review is pending:
+            self._pending_review = None
 
-    def _replace_review_boxes(self, data):
-        self.renderer.set_box_layers(self._layers(data))
-        self.renderer.frame = data
+    def _replace_review_boxes(self, review):
+        self.renderer.set_box_layers(self._layers(review))
+        self._review_frame = review
 
     def _rebuild_classes(self, class_names):
         previous = {name: checkbox.checked for name, checkbox in self._class_checkboxes.items()}
@@ -387,27 +396,27 @@ class DetectionWindow(ViewerWindow):
         self.window.set_needs_layout()
 
     def _update_class_counts(self):
-        data = self.renderer.frame
+        data = self._review_frame
         if data is None:
             return
         from collections import Counter
-        gt = Counter(box.class_name for box in data.boxes)
-        pred = Counter(detection.box.class_name for detection in (() if data.filtered is None else data.filtered.detections))
+        gt = Counter(self.renderer.class_label(box.class_id) for box in data.observation.annotations.boxes)
+        pred = Counter(self.renderer.class_label(item.box.class_id) for item in (() if data.filtered is None else data.filtered.detections))
         for name, label in self._class_count_labels.items():
             label.text = f"GT {gt[name]} · Det {pred[name]}"
 
-    def _update_frame_controls(self, data):
-        super()._update_frame_controls(data)
-        adapter = self._adapter
-        if adapter is None:
+    def _update_frame_controls(self, observation):
+        super()._update_frame_controls(observation)
+        loader = self._adapter
+        if loader is None:
             return
-        if adapter is not self._last_connection_adapter:
+        if loader is not self._last_connection_loader:
             self.connection_section.set_is_open(False)
-            self._last_connection_adapter = adapter
+            self._last_connection_loader = loader
         self._prune_sources()
-        self.split_choice.selected_text = adapter.split
-        source = adapter.source
-        if adapter.demo:
+        self.split_choice.selected_text = self._dataset_split
+        source, review = self._source, self._review_frame
+        if id(loader) in self._demo_datasets:
             self.source_status.text = "Generated detections · includes duplicate proposals"
             self.coverage_label.text = "Demo validation scenes"
             self.filter_hint.text = "Generated candidates; filters always start from the original boxes."
@@ -416,22 +425,22 @@ class DetectionWindow(ViewerWindow):
             self.coverage_label.text = "Ground truth only"
         else:
             self.source_status.text = textwrap.fill(f"{source.info.name} · {source.info.coordinate_frame} coordinates", 42)
-            covered = sum(frame.token in source.frame_tokens for frame in self._frames)
+            covered = sum(frame.frame_id in source.frame_tokens for frame in self._frames)
             self.coverage_label.text = f"Prediction coverage: {covered} / {len(self._frames)} scene frames"
-            stage = source.info.stage
             self.filter_hint.text = textwrap.fill(
-                "Pre-NMS candidates; export score floor and candidate limits still apply." if stage == "pre_nms" else
+                "Pre-NMS candidates; export score floor and candidate limits still apply." if source.info.stage == "pre_nms" else
                 "Saved boxes only. Earlier score filtering or NMS cannot be undone here.", 44)
-        if data.predictions is None:
+        count = len(observation.annotations.boxes)
+        if review.predictions is None:
             text = "Predictions unavailable for this frame." if source is not None else "No predictions loaded."
             self.filter_counts.text = text
-            self.status.text = f"{len(data.points):,} points · {len(data.boxes)} GT\n{text}"
+            self.status.text = f"{len(observation.points):,} points · {count} GT\n{text}"
         else:
-            result = data.filtered
+            result = review.filtered
             self.filter_counts.text = (f"Loaded {result.loaded_count:,} → score {result.score_count:,}\n"
                                        f"Spatial {result.spatial_count:,} → pre-limit {result.pre_nms_count:,}\n"
                                        f"NMS {result.nms_count:,} → output {result.output_count:,}")
-            self.status.text = f"{len(data.points):,} points · {len(data.boxes)} GT · {result.output_count} detections"
+            self.status.text = f"{len(observation.points):,} points · {count} GT · {result.output_count} detections"
         self.window.set_needs_layout()
 
     def _set_layer_visible(self, name, checked):
@@ -440,7 +449,7 @@ class DetectionWindow(ViewerWindow):
         else:
             self._show_detections = checked
         if self.renderer.frame is not None:
-            self.renderer.set_box_layers(self._layers(self.renderer.frame))
+            self.renderer.set_box_layers(self._layers(self._review_frame))
 
     def _pick_layer_color(self, name):
         dialog = gui.Dialog("Ground truth color" if name == "gt" else "Detection color")
@@ -464,7 +473,7 @@ class DetectionWindow(ViewerWindow):
             self._detection_color = value
         getattr(self, f"{name}_color_button").background_color = color
         if self.renderer.frame is not None:
-            self.renderer.set_box_layers(self._layers(self.renderer.frame))
+            self.renderer.set_box_layers(self._layers(self._review_frame))
 
     def _score_changed(self, value):
         self.score_edit.double_value = value
@@ -527,6 +536,7 @@ class DetectionWindow(ViewerWindow):
         return changed
 
     def apply_filters(self, config=None):
+        supplied = config is not None
         if self._busy:
             self._filter_deadline = time.monotonic() + .15
             return
@@ -536,14 +546,14 @@ class DetectionWindow(ViewerWindow):
             self.status.text = f"Invalid filters: {error}"
             return
         self._filter_config = config
-        if self._adapter is not None:
-            self._adapter.config = config
-        data = self.renderer.frame
+        if supplied:
+            self._sync_filter_controls()
+        data = self._review_frame
         if data is None or data.predictions is None:
             return
         def loaded(filtered):
             self._replace_review_boxes(filtered)
-            self._update_frame_controls(filtered)
+            self._update_frame_controls(filtered.observation)
         super()._submit(lambda: refilter(data, config), loaded, "Filtering detections…")
 
     def _sync_filter_controls(self):
@@ -630,7 +640,7 @@ class DetectionWindow(ViewerWindow):
         self.detections_color_button.background_color = gui.Color(*pred)
         self.renderer.settings.line_width = self.line_width.double_value = width
         if self.renderer.frame is not None:
-            self.renderer.set_box_layers(self._layers(self.renderer.frame))
+            self.renderer.set_box_layers(self._layers(self._review_frame))
         self._sync_filter_controls()
         self._filter_changed()
 
@@ -638,12 +648,23 @@ class DetectionWindow(ViewerWindow):
         self.last_error = str(error)
         super()._show_error(error)
 
+    def _close_sources(self):
+        if self._pending_source is not None:
+            self._pending_source.close()
+            self._pending_source = None
+        for source in self._dataset_sources.values():
+            if source is not None:
+                source.close()
+        self._dataset_sources.clear()
+        self._demo_datasets.clear()
+
     def _on_close(self):
+        if not self._alive:
+            return True
         self._filter_deadline = None
-        result = super()._on_close()
-        for source in self._sources:
-            source.close()
-        return result
+        # Source cleanup follows any active import/read on the same worker.
+        self._executor.submit(self._close_sources)
+        return super()._on_close()
 
 
 def run_app(**kwargs):

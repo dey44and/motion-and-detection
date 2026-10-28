@@ -32,9 +32,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataroot", "--root", dest="root", type=Path,
         help="dataset root containing release metadata and camera images",
     )
-    parser.add_argument("--version", default="v1.0-mini", help="nuScenes release (default: v1.0-mini)")
+    parser.add_argument("--version", help="dataset release (nuScenes default: v1.0-mini)")
+    parser.add_argument(
+        "--dataset-config", type=Path, metavar="FILE",
+        help="shared DatasetConfig JSON with local source paths and provider options",
+    )
     parser.add_argument("--split", help="dataset split, such as val or train (default: all)")
-    parser.add_argument("--scene", help="initial scene name or token")
+    parser.add_argument("--scene", help="initial scene name or ID")
     parser.add_argument("--frame", type=_nonnegative_int, default=0, help="initial zero-based frame index (default: 0)")
     parser.add_argument("--demo", action="store_true", help="open a synthetic example without dataset files")
     parser.add_argument("--app-version", action="version", version=f"%(prog)s {__version__}")
@@ -47,17 +51,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     dataset = "demo" if args.demo else args.dataset
+    config = None
+    if args.dataset_config is not None:
+        if args.root is not None or args.version is not None or dataset == "demo":
+            parser.error("--dataset-config cannot be combined with --root/--dataroot, --version, or demo data")
+        from dataset_utils import load_dataset_config
+        from dataset_utils.errors import DatasetConfigurationError
+
+        try:
+            config = load_dataset_config(args.dataset_config)
+        except DatasetConfigurationError as exc:
+            parser.error(str(exc))
     try:
         from .ui.app import run_app
 
         return run_app(
             dataset=dataset,
             root=args.root,
-            version=args.version,
+            version=args.version if args.version is not None else "v1.0-mini",
             scene=args.scene,
             frame=args.frame,
-            autoload=dataset == "demo" or args.root is not None,
+            autoload=dataset == "demo" or args.root is not None or config is not None,
             **({"split": args.split} if args.split is not None else {}),
+            **({"config": config} if config is not None else {}),
         )
     except ModuleNotFoundError as exc:
         if exc.name not in {"tkinter", "_tkinter"}:

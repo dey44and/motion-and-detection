@@ -1,3 +1,3 @@
-"""A desktop viewer with dataset adapters and reusable point cloud processing."""
+"""Point-cloud visualization using the shared dataset interface."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

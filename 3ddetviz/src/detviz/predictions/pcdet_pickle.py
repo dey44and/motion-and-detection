@@ -58,7 +58,7 @@ def _frame_rows(entry: object, class_names: tuple[str, ...] | None):
         raise PredictionError("OpenPCDet frame metadata must be a dictionary.")
     token = metadata.get("token", entry.get("sample_token"))
     if not isinstance(token, str) or not token:
-        raise PredictionError("OpenPCDet frames require metadata.token (a nuScenes sample token).")
+        raise PredictionError("OpenPCDet frames require metadata.token (the exact dataset frame ID).")
     if "sample_token" in entry and entry["sample_token"] != token:
         raise PredictionError(f"OpenPCDet frame {token!r} has inconsistent sample tokens.")
     try:

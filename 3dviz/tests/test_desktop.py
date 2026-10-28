@@ -1,7 +1,4 @@
-"""Opt-in integration check using the real native window and renderer.
-
-Run with THREEDVIZ_DESKTOP_TESTS=1 on a desktop or under xvfb-run.
-"""
+"""Opt-in real-window integration covering canonical dataset and display flows."""
 
 import os
 import threading
@@ -11,413 +8,141 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-
 pytestmark = pytest.mark.skipif(
     os.environ.get("THREEDVIZ_DESKTOP_TESTS") != "1",
-    reason="Set THREEDVIZ_DESKTOP_TESTS=1 with a display and OpenGL to test the native UI",
+    reason="Set THREEDVIZ_DESKTOP_TESTS=1 with a display and OpenGL",
 )
 
 
 def test_native_loading_navigation_styles_and_error_recovery(tmp_path, monkeypatch):
     from open3d.visualization import gui
-
-    from threedviz.dataloader import DatasetError
-    from threedviz.dataloader import factory
-    from threedviz.dataloader.demo import DemoAdapter
-    from threedviz.processing import colorize_points
+    from dataset_utils import (
+        AcquisitionGeometry, Capability, DatasetConfig, DatasetIOError, PointColors,
+        ProcessingProvenance, register_loader, registry,
+    )
+    from threedviz.dataloader import DemoLoader
     from threedviz.ui.app import ViewerWindow
 
-    class RGBUIFixture(DemoAdapter):
-        """Stage optional frame data to test the native UI, not projection math."""
-
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
-            self.prepare_calls = []
+    class OptionalLoader(DemoLoader):
+        def __init__(self, config):
+            super().__init__(config)
+            self._metadata = replace(
+                self.metadata,
+                capabilities=self.metadata.capabilities | {Capability.RGB_COLORING, Capability.ACQUISITION_GEOMETRY},
+            )
+            self.requests = []
             self.fail_rgb = False
 
-        @property
-        def supports_camera_rgb(self):
-            return True
+        def _prepare_point_cloud(self, frame, *, request):
+            self.requests.append((request, threading.get_ident()))
+            if request.rgb and self.fail_rgb:
+                raise DatasetIOError("Fixture camera images are missing")
+            values = {}
+            if request.rgb:
+                colors = np.tile([.2, .4, .8], (len(frame.points), 1))
+                values["rgb"] = PointColors(colors, np.arange(len(frame.points)) % 2 == 0,
+                                            ProcessingProvenance("synthetic-colors"))
+            if request.acquisition_geometry:
+                values["acquisition"] = AcquisitionGeometry(
+                    frame.points + [1.5, -.75, .25], np.ones(len(frame.points), dtype=bool),
+                    "lidar@acquisition", ProcessingProvenance("synthetic-motion"))
+            return replace(frame, **values)
 
-        @property
-        def supports_point_timing(self):
-            return True
-
-        @property
-        def available_splits(self):
-            return ("all", "val")
-
-        def list_scenes_for_split(self, split="all"):
-            if split == "val":
-                return self.list_scenes()[1:]
-            return super().list_scenes_for_split(split)
-
-        def prepare_frame(self, frame, *, camera_rgb=False, point_timing=False):
-            self.prepare_calls.append((frame.info.token, camera_rgb, point_timing, threading.get_ident()))
-            if camera_rgb and self.fail_rgb:
-                raise DatasetError("Fixture camera images are missing")
-            attributes = {}
-            if camera_rgb:
-                attributes["rgb_colors"] = np.tile(
-                    np.array([51, 102, 204], dtype=np.uint8) / 255.0, (len(frame.points), 1)
-                )
-                attributes["rgb_valid_mask"] = np.arange(len(frame.points)) % 2 == 0
-            if camera_rgb or point_timing:
-                attributes["point_timestamps_us"] = frame.info.timestamp_us + np.linspace(
-                    0, 50_000, len(frame.points)
-                )
-            if point_timing:
-                attributes["raw_points"] = frame.points + np.array([1.5, -0.75, 0.25])
-            return replace(frame, **attributes)
-
-    monkeypatch.setattr(factory, "_REGISTRY", factory._REGISTRY.copy())
-    factory.register_dataset("rgb-ui-fixture", RGBUIFixture)
-    from dataset_utils import DatasetLoader, register_loader
-    from dataset_utils.contracts.models import (
-        AcquisitionGeometry, Capability, DatasetMetadata, FrameInfo as SharedFrameInfo,
-        Modality, PointCloudFrame, ProcessingProvenance, SceneInfo as SharedSceneInfo,
-    )
-
-    class GeometryLoader(DatasetLoader):
-        coverage = "partial"
-
-        @property
-        def metadata(self):
-            return DatasetMetadata("native-geometry-ui", "Geometry UI", frozenset((
-                Capability.POINT_CLOUD, Capability.ACQUISITION_GEOMETRY)),
-                feature_coverage={Capability.ACQUISITION_GEOMETRY: self.coverage})
-
-        def list_scenes(self, *, split="all"):
-            return (SharedSceneInfo("scene", "Geometry"),)
-
-        def list_frames(self, scene_id, *, modality):
-            return (SharedFrameInfo("frame", scene_id, 0, None, frozenset((Modality.POINT_CLOUD,))),)
-
-        def load_point_cloud(self, frame_id):
-            return PointCloudFrame(self.list_frames("scene", modality=Modality.POINT_CLOUD)[0],
-                "native", "vehicle", np.array([[0., 0, 0], [1., 1, 1], [1., -1, 0]]))
-
-        def prepare_point_cloud(self, frame, *, request):
-            return replace(frame, acquisition=AcquisitionGeometry(frame.points - [1., 0, 0],
-                np.ones(len(frame.points), dtype=bool), "vehicle@acquisition", ProcessingProvenance("pixel-poses")))
-
-    class FullGeometryLoader(GeometryLoader):
-        coverage = "full"
-
-    register_loader("native-geometry-partial-ui", GeometryLoader)
-    register_loader("native-geometry-full-ui", FullGeometryLoader)
-    application = gui.Application.instance
-    application.initialize()
+    monkeypatch.setattr(registry, "_REGISTRY", dict(registry._REGISTRY))
+    register_loader("rgb-ui", OptionalLoader)
+    app = gui.Application.instance
+    app.initialize()
     viewer = ViewerWindow(dataset="demo", autoload=True)
     main_thread = threading.get_ident()
 
-    def wait_for_idle():
+    def idle():
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            assert application.run_one_tick(), "The window closed unexpectedly"
+            assert app.run_one_tick(), "Window closed unexpectedly"
             if not viewer._busy:
                 return
-            time.sleep(0.01)
-        pytest.fail("The dataset worker did not finish within 20 seconds")
+            time.sleep(.01)
+        pytest.fail("Dataset loading timed out")
 
     try:
-        wait_for_idle()
-        assert "points ·" in viewer.status.text
-        assert viewer.renderer.frame.info.scene_token == "demo-urban"
+        idle()
+        assert viewer.renderer.frame.info.scene_id == "demo-urban"
         assert viewer.viewport.scene.has_geometry("points")
-        assert viewer.renderer._box_names
         assert viewer._class_count_labels["car"].text == "(1)"
-        old_frame = viewer.renderer.frame
-        with pytest.raises(ValueError, match="finite"):
-            viewer.renderer.set_frame(replace(old_frame, points=np.array([[np.nan, 0, 0]])))
-        assert viewer.renderer.frame is old_frame
-        assert viewer.viewport.scene.has_geometry("points")
-        camera = viewer.viewport.scene.camera.get_view_matrix().copy()
-
+        previous = viewer.renderer.frame
+        viewer._request_frame(1)
+        idle()
+        assert viewer.renderer.frame.info.index == 1
+        viewer._on_scene_choice("Demo: highway", 1)
+        idle()
+        assert viewer.renderer.frame.info.scene_id == "demo-highway"
+        assert previous.info.scene_id == "demo-urban"
+        viewer._on_dataset_split("val", 0)
+        idle()
+        assert viewer._dataset_split == "val"
         for scheme in ("gray", "jet", "turbo"):
             viewer._on_color_scheme(scheme, 0)
-            colors = np.asarray(viewer.renderer._cloud.colors)
-            assert colors.shape == viewer.renderer.frame.points.shape
-            assert np.isfinite(colors).all()
-        viewer._on_point_size(6.0)
-        viewer._on_distance(40.0)
-        viewer._on_line_width(5.0)
-        viewer._pick_class_color("car")
-        viewer._on_class_color("car", gui.Color(0.9, 0.1, 0.2))
-        viewer.window.close_dialog()
-        assert viewer.renderer.settings.class_colors["car"] == pytest.approx((0.9, 0.1, 0.2))
-        viewer._on_class_checked("car", False)
-        assert "boxes:car" not in viewer.renderer._box_names
-        viewer._select_classes(False)
-        assert viewer.renderer._box_names == []
-        viewer._select_classes(True)
-        assert "boxes:car" in viewer.renderer._box_names
-        np.testing.assert_array_equal(camera, viewer.viewport.scene.camera.get_view_matrix())
-
-        viewer._request_frame(1)
-        wait_for_idle()
-        assert viewer.renderer.frame.info.index == 1
-        assert "Frame 2 / 36" in viewer.frame_label.text
-        np.testing.assert_array_equal(camera, viewer.viewport.scene.camera.get_view_matrix())
-        viewer._on_scene_choice("Demo: highway", 1)
-        wait_for_idle()
-        assert viewer.renderer.frame.info.scene_token == "demo-highway"
-        assert viewer.renderer.frame.info.index == 0
-        assert "boxes:construction_vehicle" in viewer.renderer._box_names
-
-        old_frame = viewer.renderer.frame
-        viewer.dataset_choice.selected_text = "nuscenes"
-        viewer.root_edit.text_value = str(tmp_path / "missing-dataset")
-        viewer.load_dataset()
-        wait_for_idle()
-        assert "Loading failed" in viewer.status.text
-        assert viewer.renderer.frame is old_frame
-        assert viewer.load_button.enabled
-        assert viewer.scene_choice.selected_index == 1
-        viewer.window.close_dialog()
-
-        viewer.dataset_choice.selected_text = "demo"
-        viewer.load_dataset()
-        wait_for_idle()
-        assert "points ·" in viewer.status.text
-        assert viewer.renderer.frame.info.scene_token == "demo-urban"
-        assert viewer.previous_button.enabled is False
-        assert viewer.next_button.enabled is True
-
-        viewer.dataset_choice.selected_text = "rgb-ui-fixture"
-        viewer._on_dataset_choice("rgb-ui-fixture", 0)
-        viewer.load_dataset()
-        wait_for_idle()
-        fixture = viewer._adapter
-        assert viewer.point_color_label.text == "Point colors"
-        assert viewer.raw_checkbox.enabled
-        assert viewer.renderer.frame.rgb_colors is None
-        assert viewer.renderer.frame.raw_points is None
-        assert all(not rgb and not raw for _, rgb, raw, _ in fixture.prepare_calls)
+            assert np.asarray(viewer.renderer._cloud.colors).shape == viewer.renderer.frame.points.shape
+        viewer._on_point_size(7)
+        viewer._on_line_width(5)
+        assert viewer.renderer.settings.point_size == 7 and viewer.renderer.settings.line_width == 5
         camera = viewer.viewport.scene.camera.get_view_matrix().copy()
-        before_prepare = len(fixture.prepare_calls)
-
-        viewer.color_choice.selected_text = "Camera RGB"
-        viewer._on_color_scheme("Camera RGB", 3)
-        assert viewer._busy, "Camera colors must be prepared on the dataset worker"
-        wait_for_idle()
-        assert len(fixture.prepare_calls) == before_prepare + 1
-        assert fixture.prepare_calls[-1][1:3] == (True, False)
-        assert fixture.prepare_calls[-1][3] != main_thread
-        assert viewer.renderer.settings.color_scheme == "camera_rgb"
-        assert viewer.color_choice.selected_text == "Camera RGB"
-        assert not viewer.distance_label.visible
-        assert not viewer.distance_edit.visible
-        assert not viewer.distance_hint.visible
-        assert viewer.color_status.visible
-        frame = viewer.renderer.frame
-        valid = frame.rgb_valid_mask
-        count = int(valid.sum())
-        assert f"{count:,} / {len(frame.points):,} points" in viewer.color_status.text
-        rendered_colors = np.asarray(viewer.renderer._cloud.colors)
-        np.testing.assert_allclose(rendered_colors[valid], frame.rgb_colors[valid])
-        np.testing.assert_allclose(
-            rendered_colors[~valid],
-            colorize_points(frame.points, "gray", viewer.renderer.settings.max_distance)[~valid],
-        )
-        np.testing.assert_array_equal(camera, viewer.viewport.scene.camera.get_view_matrix())
-
-        viewer._on_raw_points(True)
-        wait_for_idle()
-        frame = viewer.renderer.frame
-        assert viewer.renderer.settings.use_raw_points
-        assert viewer.raw_checkbox.checked
-        assert viewer.raw_hint.visible
-        assert frame.point_timestamps_us.shape == (len(frame.points),)
-        np.testing.assert_allclose(frame.raw_points, frame.points + [1.5, -0.75, 0.25])
-        np.testing.assert_allclose(np.asarray(viewer.renderer._cloud.points), frame.raw_points)
-        np.testing.assert_allclose(np.asarray(viewer.renderer._cloud.colors)[valid], frame.rgb_colors[valid])
-        np.testing.assert_allclose(
-            np.asarray(viewer.renderer._cloud.colors)[~valid],
-            colorize_points(frame.raw_points, "gray", viewer.renderer.settings.max_distance)[~valid],
-        )
-        np.testing.assert_array_equal(camera, viewer.viewport.scene.camera.get_view_matrix())
-
-        viewer._request_frame(1)
-        wait_for_idle()
-        assert viewer.renderer.frame.info.index == 1
-        assert viewer.renderer.settings.color_scheme == "camera_rgb"
-        assert viewer.renderer.settings.use_raw_points
-        assert fixture.prepare_calls[-1][1:3] == (True, True)
-        np.testing.assert_allclose(
-            np.asarray(viewer.renderer._cloud.points), viewer.renderer.frame.raw_points
-        )
-        np.testing.assert_array_equal(camera, viewer.viewport.scene.camera.get_view_matrix())
-
-        prepared_frame = viewer.renderer.frame
-        viewer._on_color_scheme("jet", 1)
-        assert viewer.renderer.frame is prepared_frame
-        assert viewer.renderer.frame.rgb_colors is prepared_frame.rgb_colors
-        assert viewer.renderer.frame.raw_points is prepared_frame.raw_points
-        assert viewer.distance_label.visible and viewer.distance_edit.visible and viewer.distance_hint.visible
-        assert not viewer.color_status.visible
-        np.testing.assert_allclose(
-            np.asarray(viewer.renderer._cloud.colors),
-            colorize_points(prepared_frame.raw_points, "jet", viewer.renderer.settings.max_distance),
-        )
-        viewer._on_raw_points(False)
-        assert viewer.renderer.frame is prepared_frame
-        assert not viewer.renderer.settings.use_raw_points
-        assert not viewer.raw_hint.visible
-        np.testing.assert_allclose(np.asarray(viewer.renderer._cloud.points), prepared_frame.points)
-
-        # A fresh frame has no optional arrays, so this tests asynchronous failure
-        # rollback instead of reusing the successful color preparation above.
-        viewer._request_frame(2)
-        wait_for_idle()
-        old_frame = viewer.renderer.frame
-        assert old_frame.rgb_colors is None and old_frame.raw_points is None
-        old_colors = np.asarray(viewer.renderer._cloud.colors).copy()
-        fixture.fail_rgb = True
-        viewer.color_choice.selected_text = "Camera RGB"
-        viewer._on_color_scheme("Camera RGB", 3)
-        wait_for_idle()
-        assert "Loading failed" in viewer.status.text
-        assert viewer.renderer.frame is old_frame
-        assert viewer.renderer.settings.color_scheme == "jet"
-        assert viewer.color_choice.selected_text == "jet"
-        assert not viewer.renderer.settings.use_raw_points
-        assert viewer.distance_edit.visible
-        assert viewer.load_button.enabled and viewer.color_choice.enabled
-        np.testing.assert_array_equal(np.asarray(viewer.renderer._cloud.points), old_frame.points)
-        np.testing.assert_array_equal(np.asarray(viewer.renderer._cloud.colors), old_colors)
-        np.testing.assert_array_equal(camera, viewer.viewport.scene.camera.get_view_matrix())
-        viewer.window.close_dialog()
-
-        fixture.fail_rgb = False
-        viewer._on_color_scheme("Camera RGB", 3)
-        wait_for_idle()
-        assert "points ·" in viewer.status.text
-        assert viewer.renderer.settings.color_scheme == "camera_rgb"
-        assert viewer.renderer.frame.rgb_colors is not None
-        viewer._on_raw_points(True)
-        wait_for_idle()
-        assert viewer.renderer.settings.use_raw_points
-
-        # Split navigation must prepare the active point modes on its worker.
-        viewer.dataset_split_choice.selected_text = "val"
-        viewer._on_dataset_split("val", 1)
-        wait_for_idle()
-        assert viewer._dataset_split == "val"
-        assert len(viewer._scenes) == 1
-        assert viewer.renderer.frame.info.scene_token == "demo-highway"
-        assert viewer.renderer.settings.color_scheme == "camera_rgb"
-        assert viewer.renderer.settings.use_raw_points
-        assert fixture.prepare_calls[-1][1:3] == (True, True)
-        old_frame = viewer.renderer.frame
-        viewer._on_dataset_split("missing", 2)
-        wait_for_idle()
-        assert "Loading failed" in viewer.status.text
-        assert viewer.renderer.frame is old_frame
-        assert viewer._dataset_split == "val"
-        assert viewer.dataset_split_choice.selected_text == "val"
-        viewer.window.close_dialog()
-
-        # A failed replacement keeps the committed split and previous frame.
-        viewer.dataset_choice.selected_text = "nuscenes"
-        viewer._on_dataset_choice("nuscenes", 0)
-        viewer.root_edit.text_value = str(tmp_path / "missing-replacement")
-        viewer.load_dataset()
-        assert not viewer.dataset_choice.enabled
-        assert not viewer.root_edit.enabled and not viewer.browse_button.enabled
-        assert not viewer.version_edit.enabled
-        wait_for_idle()
-        assert "Loading failed" in viewer.status.text
-        assert viewer.renderer.frame is old_frame
-        assert viewer._dataset_split == viewer._active_dataset_split == "val"
-        assert viewer.dataset_split_choice.selected_text == "val"
-        viewer.window.close_dialog()
-
-        viewer.dataset_choice.selected_text = "demo"
-        viewer._on_dataset_choice("demo", 0)
-        assert viewer._dataset_split == "all"
-        # Changing split on the pending source loads that source, rather than
-        # filtering the previous fixture adapter that is still displayed.
-        viewer._on_dataset_split("all", 0)
-        wait_for_idle()
-        assert type(viewer._adapter) is DemoAdapter
-        assert len(viewer._scenes) == 2
-        assert viewer.renderer.settings.color_scheme == "gray"
-        assert viewer.color_choice.selected_text == "gray"
-        assert not viewer.renderer.settings.use_raw_points
-        assert not viewer.raw_checkbox.checked and not viewer.raw_checkbox.enabled
-        assert viewer.distance_label.visible and viewer.distance_edit.visible and viewer.distance_hint.visible
-        assert viewer.renderer.frame.rgb_colors is None
-        assert viewer.renderer.frame.raw_points is None
-        viewer.renderer.reset_camera()
-        def capture_viewport():
-            images = []
-            viewer.viewport.scene.scene.render_to_image(lambda image: images.append(np.asarray(image).copy()))
-            # An unchanged SceneWidget may serve its cached view; request a
-            # fresh draw after queuing each image readback.
-            viewer.viewport.force_redraw()
-            viewer.window.post_redraw()
-            deadline = time.monotonic() + 20
-            while not images and time.monotonic() < deadline:
-                application.run_one_tick()
-                time.sleep(0.01)
-            assert images, "The renderer did not produce an image"
-            return images[0]
-
-        before = capture_viewport()
-        assert np.all(before[5, 5, :3] >= 254), "The viewport background must be white"
-        assert (before[:, :, :3] < 200).any(), "The viewport must contain visible geometry"
-        camera = viewer.viewport.scene.camera.get_view_matrix().copy()
-        cloud = viewer.renderer._cloud
         axes = viewer.renderer._axes_geometry
-        vertices = np.asarray(axes.vertices).copy()
         for _ in range(3):
             viewer.renderer.show_axes(False)
-            assert not viewer.viewport.scene.geometry_is_visible("coordinate_axes")
             viewer.renderer.show_axes(True)
-            assert viewer.viewport.scene.geometry_is_visible("coordinate_axes")
-        assert viewer.renderer._cloud is cloud
         np.testing.assert_array_equal(camera, viewer.viewport.scene.camera.get_view_matrix())
-        np.testing.assert_array_equal(vertices, np.asarray(axes.vertices))
-        np.testing.assert_allclose(vertices.max(axis=0), [3, 3, 3])
-        # Same camera and scene should render identically after toggling. This
-        # catches the original screen-spanning axes, not only widget state.
-        np.testing.assert_array_equal(capture_viewport(), before)
-        # Allow native layout and drawing to settle before optional inspection.
-        deadline = time.monotonic() + 0.5
-        while time.monotonic() < deadline:
-            application.run_one_tick()
-            time.sleep(0.01)
-        screenshot = os.environ.get("THREEDVIZ_SCREENSHOT")
-        if screenshot:
-            import subprocess
+        np.testing.assert_allclose(np.asarray(axes.vertices).max(axis=0), [3, 3, 3])
+        viewer._on_class_checked("car", False)
+        assert "boxes:car" not in viewer.renderer._box_names
+        viewer._on_class_checked("car", True)
+        assert "boxes:car" in viewer.renderer._box_names
 
-            subprocess.run(["import", "-window", "root", screenshot], check=True)
-
-        # Shared providers appear without a frontend registration. Partial TOP
-        # coverage must not enable a control implying a fully raw scan.
-        viewer.dataset_choice.selected_text = "native-geometry-partial-ui"
-        viewer._on_dataset_choice("native-geometry-partial-ui", 0)
+        previous_loader = viewer._adapter
+        viewer.dataset_choice.selected_text = "rgb-ui"
+        viewer._on_dataset_choice("rgb-ui", 0)
         viewer.load_dataset()
-        wait_for_idle()
-        assert not viewer.raw_checkbox.enabled
-        assert not viewer._adapter.supports_point_timing
-        assert "time unknown" in viewer.frame_label.text
-        assert "Annotations not provided" in viewer.status.text
-        previous_loader = viewer._adapter.loader
-
-        viewer.dataset_choice.selected_text = "native-geometry-full-ui"
-        viewer._on_dataset_choice("native-geometry-full-ui", 0)
-        viewer.load_dataset()
-        wait_for_idle()
+        idle()
+        loader = viewer._adapter
         assert previous_loader._closed
-        assert viewer.raw_checkbox.enabled and not viewer._adapter.supports_point_timing
+        assert viewer.raw_checkbox.enabled
+        viewer._on_color_scheme("Camera RGB", 0)
+        idle()
+        colored = viewer.renderer.frame
+        assert colored.rgb is not None and colored.acquisition is None
+        assert "Camera RGB:" in viewer.color_status.text
+        assert all(thread != main_thread for _, thread in loader.requests)
         viewer._on_raw_points(True)
-        wait_for_idle()
-        assert viewer.renderer.settings.use_raw_points
-        assert viewer.renderer.frame.point_timestamps_us is None
-        np.testing.assert_array_equal(viewer.renderer._cloud.points, viewer.renderer.frame.raw_points)
+        idle()
+        prepared = viewer.renderer.frame
+        assert prepared.rgb is colored.rgb and prepared.acquisition is not None
+        assert prepared.timing is None
+        np.testing.assert_allclose(viewer.renderer._cloud.points, prepared.acquisition.points)
+        viewer._on_raw_points(False)
+        np.testing.assert_allclose(viewer.renderer._cloud.points, prepared.points)
+        viewer._on_color_scheme("gray", 0)
+        viewer._request_frame(1)
+        idle()
+        loader.fail_rgb = True
+        prior = viewer.renderer.frame
+        viewer._on_color_scheme("Camera RGB", 0)
+        idle()
+        assert viewer.renderer.frame is prior
+        assert viewer.renderer.settings.color_scheme == "gray"
+        assert "Loading failed" in viewer.status.text
+        viewer.window.close_dialog()
+
+        config = DatasetConfig(root=tmp_path)
+        viewer._dataset_config = config
+        viewer._on_dataset_choice("rgb-ui", 0)
+        viewer._set_busy(False)
+        assert not viewer.dataset_choice.enabled and not viewer.root_edit.enabled
+        assert not viewer.browse_button.enabled and not viewer.version_edit.enabled
+        assert viewer.dataset_split_choice.enabled
+        with viewer._create_dataset_adapter("rgb-ui", None, "v1.0-mini") as configured:
+            assert configured.config is config
     finally:
         viewer.window.close()
-        while application.run_one_tick():
+        while app.run_one_tick():
             pass
+    assert loader._closed

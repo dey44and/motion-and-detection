@@ -2,7 +2,6 @@
 
 import builtins
 import sys
-from pathlib import Path
 from types import ModuleType
 
 import pytest
@@ -53,10 +52,12 @@ def test_demo_autoloads_without_a_dataset_root(arguments, launches):
 @pytest.mark.parametrize("arguments,expected", [
     (["--frame", "-1"], "must be zero or greater"),
     (["--frame", "1.5"], "must be an integer"),
-    (["--split", "invalid"], "invalid choice"),
     (["--dataset", "invalid"], "invalid choice"),
     (["--demo", "--predictions", "results.json"], "generates its own predictions"),
     (["--dataset", "demo", "--predictions", "results.json"], "generates its own predictions"),
+    (["--dataset-config", "dataset.json", "--root", "/data"], "cannot be combined"),
+    (["--dataset-config", "dataset.json", "--version", "v1.0-mini"], "cannot be combined"),
+    (["--demo", "--dataset-config", "dataset.json"], "not demo"),
 ])
 def test_invalid_arguments_fail_before_window_launch(arguments, expected, launches, capsys):
     with pytest.raises(SystemExit) as exit_info:
@@ -64,6 +65,29 @@ def test_invalid_arguments_fail_before_window_launch(arguments, expected, launch
     assert exit_info.value.code == 2
     assert expected in capsys.readouterr().err
     assert launches == []
+
+
+def test_dataset_defined_split_is_forwarded_without_nuscenes_assumptions(launches):
+    assert cli.main(["--dataset", "waymo", "--split", "my-validation"]) == 0
+    assert launches[0]["split"] == "my-validation"
+
+
+def test_non_nuscenes_datasets_default_to_all_scenes(launches):
+    assert cli.main(["--dataset", "waymo"]) == 0
+    assert launches[0]["split"] == "all"
+
+
+def test_explicit_prediction_format_is_forwarded(launches):
+    assert cli.main(["--predictions", "predictions.data", "--prediction-format", "nuscenes_json"]) == 0
+    assert launches[0]["prediction_format"] == "nuscenes_json"
+
+
+def test_dataset_config_is_loaded_before_starting_the_window(launches, tmp_path):
+    path = tmp_path / "dataset.json"
+    path.write_text('{"root": "data", "storage_format": "native", "release": "v1.0-mini"}')
+    assert cli.main(["--dataset-config", str(path)]) == 0
+    assert launches[0]["config"].root == tmp_path / "data"
+    assert launches[0]["autoload"] is True
 
 
 @pytest.mark.parametrize("option", ["--help", "--app-version"])

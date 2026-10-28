@@ -65,16 +65,16 @@ def test_native_viewer_navigation_overlays_and_failure_recovery(monkeypatch):
         assert all(panel.canvas.type(item) == "rectangle" for panel, item in rectangles)
         assert all(float(panel.canvas.itemcget(item, "width")) == 4 for panel, item in rectangles)
         panel, item = rectangles[0]
-        box_class = next(box.class_name for box in panel.boxes if box.class_name in panel.visible_classes)
+        box_class = next(viewer._class_key(box.class_id) for box in panel.boxes if viewer._class_key(box.class_id) in panel.visible_classes)
         monkeypatch.setattr("cameraviz.ui.app.colorchooser.askcolor", lambda *args, **kwargs: ((255, 0, 255), "#ff00ff"))
         viewer.choose_color(box_class)
         assert viewer.class_colors[box_class] == "#ff00ff"
         assert panel.canvas.itemcget(panel.canvas.find_withtag("bounding_box")[0], "outline") == "#ff00ff"
 
-        old_token = viewer.frame_data.info.token
+        old_token = viewer.frame_data.info.frame_id
         viewer.step_frame(1)
         _wait(root, lambda: not viewer.busy and viewer.frame_index == 1)
-        assert viewer.frame_data.info.token != old_token
+        assert viewer.frame_data.info.frame_id != old_token
         assert viewer.mode_var.get() == "2D rectangles"
         assert viewer.width_var.get() == 4
         assert viewer.class_colors[box_class] == "#ff00ff"
@@ -92,10 +92,10 @@ def test_native_viewer_navigation_overlays_and_failure_recovery(monkeypatch):
         # A missing frame must retain all existing images and navigation.
         old_frame = viewer.frame_data
         old_images = {name: panel.camera for name, panel in viewer.panels.items()}
-        load_frame = viewer.adapter.load_frame
+        load_frame = viewer.loader.load_cameras
         def fail(_token):
             raise FileNotFoundError("Missing camera image: recovery-test.jpg")
-        viewer.adapter.load_frame = fail
+        viewer.loader.load_cameras = fail
         viewer.step_frame(1)
         _wait(root, lambda: not viewer.busy)
         assert "recovery-test.jpg" in viewer.last_error
@@ -103,7 +103,7 @@ def test_native_viewer_navigation_overlays_and_failure_recovery(monkeypatch):
         assert viewer.frame_index == 1
         assert all(panel.camera is old_images[name] for name, panel in viewer.panels.items())
         assert str(viewer.next_button.cget("state")) == "normal"
-        viewer.adapter.load_frame = load_frame
+        viewer.loader.load_cameras = load_frame
         viewer.step_frame(1)
         _wait(root, lambda: not viewer.busy and viewer.frame_index == 2)
         assert viewer.last_error is None
@@ -112,7 +112,7 @@ def test_native_viewer_navigation_overlays_and_failure_recovery(monkeypatch):
         viewer._select_scene()
         _wait(root, lambda: not viewer.busy and viewer.scene_index == 1)
         assert viewer.frame_index == 0
-        assert viewer.frame_data.info.scene_token == "demo-roundabout"
+        assert viewer.frame_data.info.scene_id == "demo-roundabout"
         root.geometry("1100x650")
         _wait(root, lambda: root.winfo_width() == 1100)
         # Wait for the debounced resize and verify original aspect ratio.
@@ -128,7 +128,7 @@ def test_native_viewer_navigation_overlays_and_failure_recovery(monkeypatch):
         viewer.load_dataset()
         _wait(root, lambda: not viewer.busy)
         assert viewer.last_error
-        assert viewer.frame_data.info.scene_token == "demo-roundabout"
+        assert viewer.frame_data.info.scene_id == "demo-roundabout"
         assert str(viewer.scene_combo.cget("state")) == "readonly"
     finally:
         viewer.close()
@@ -136,30 +136,28 @@ def test_native_viewer_navigation_overlays_and_failure_recovery(monkeypatch):
 
 def test_custom_layout_missing_camera_and_annotation_free_dataset():
     import tkinter as tk
-    from cameraviz.dataloader import CameraInfo, DemoAdapter, register_dataset
+    from dataset_utils import AnnotationSet, Modality, SensorInfo, register_loader
+    from cameraviz.dataloader.demo import DemoDataset
     from cameraviz.ui.app import CameraViewer
 
-    present = CameraInfo("SINGLE_CAMERA", "Custom view", 0, 0)
-    missing = CameraInfo("MISSING_CAMERA", "Optional view", 0, 1)
-    class Adapter(DemoAdapter):
-        @property
-        def available_splits(self):
-            return ("all", "val")
-        def list_scenes_for_split(self, split="all"):
-            if split == "val":
-                return self.list_scenes()[1:]
-            return super().list_scenes_for_split(split)
-        @property
-        def camera_layout(self):
-            return (present, missing)
-        @property
-        def class_names(self):
-            return ()
-        def load_frame(self, token):
-            frame = super().load_frame(token)
-            return replace(frame, cameras=(replace(frame.cameras[1], info=present),), boxes=())
+    class CustomDataset(DemoDataset):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self._metadata = replace(self.metadata, classes=(), splits=("all", "val"), sensors=(
+                SensorInfo("SINGLE_CAMERA", Modality.CAMERAS, "Custom view"),
+                SensorInfo("MISSING_CAMERA", Modality.CAMERAS, "Optional view"),
+            ))
 
-    register_dataset("desktop-custom-camera-test", Adapter)
+        def _list_scenes(self, *, split="all"):
+            return self._scenes[1:] if split == "val" else self._scenes
+
+        def _load_cameras(self, frame_id):
+            frame = super()._load_cameras(frame_id)
+            return replace(frame, cameras=(replace(frame.cameras[1], sensor_id="SINGLE_CAMERA"),),
+                           annotations=AnnotationSet(frame.reference_frame_id))
+
+    register_loader("desktop-custom-camera-test", CustomDataset)
     root = tk.Tk()
     viewer = CameraViewer(root, dataset="desktop-custom-camera-test", autoload=True)
     try:
@@ -179,7 +177,7 @@ def test_custom_layout_missing_camera_and_annotation_free_dataset():
         assert viewer.last_error is None
         assert viewer._active_split == "val"
         assert len(viewer.scenes) == 1
-        assert viewer.frame_data.info.scene_token == "demo-roundabout"
+        assert viewer.frame_data.info.scene_id == "demo-roundabout"
         old_frame = viewer.frame_data
         viewer.split_var.set("missing")
         viewer._split_changed()
@@ -196,52 +194,51 @@ def test_custom_layout_missing_camera_and_annotation_free_dataset():
         assert viewer.last_error is None
         assert len(viewer.panels) == 6
         assert len(viewer.scenes) == 2
-        assert viewer.frame_data.info.scene_token == "demo-intersection"
+        assert viewer.frame_data.info.scene_id == "demo-intersection"
     finally:
         viewer.close()
 
 
 def test_split_changes_load_pending_source_and_preserve_active_source_on_failure(tmp_path):
     import tkinter as tk
-    from cameraviz.dataloader import DatasetError, DemoAdapter, register_dataset
+    from dataset_utils import DatasetError, register_loader
+    from cameraviz.dataloader.demo import DemoDataset
     from cameraviz.ui.app import CameraViewer
 
-    class Adapter(DemoAdapter):
-        def __init__(self, *, root=None, version="v1.0-mini"):
-            if root is not None and root.name == "missing":
+    class SourceDataset(DemoDataset):
+        def __init__(self, config):
+            if config.root is not None and config.root.name == "missing":
                 raise DatasetError("The selected dataset root is missing.")
             super().__init__()
-            self.loaded_root = root
-            self.loaded_version = version
+            self.config = config
+            self.loaded_root = config.root
+            self.loaded_version = config.release
+            self._metadata = replace(self.metadata, splits=("all", "val"))
             self.split_calls = []
 
-        @property
-        def available_splits(self):
-            return ("all", "val")
-
-        def list_scenes_for_split(self, split="all"):
-            self.split_calls.append(split)
+        def _list_scenes(self, *, split="all"):
             if split == "val":
-                return self.list_scenes()[1:]
-            return super().list_scenes_for_split(split)
+                self.split_calls.append(split)
+                return self._scenes[1:]
+            return self._scenes
 
-    class ReplacementAdapter(Adapter):
+    class ReplacementDataset(SourceDataset):
         pass
 
-    register_dataset("desktop-source-first", Adapter)
-    register_dataset("desktop-source-second", ReplacementAdapter)
+    register_loader("desktop-source-first", SourceDataset)
+    register_loader("desktop-source-second", ReplacementDataset)
     root = tk.Tk()
     viewer = CameraViewer(root, dataset="desktop-source-first", root_path=tmp_path / "missing", version="release-a", autoload=True)
     try:
         viewer.split_var.set("val")
         _wait(root, lambda: viewer.last_error is not None and not viewer.busy)
-        assert viewer.adapter is None
+        assert viewer.loader is None
         assert viewer.split_var.get() == "val"
         viewer.root_var.set(str(tmp_path / "first"))
         viewer.split_var.set("all")
         viewer.load_dataset()
         _wait(root, lambda: viewer.frame_data is not None and not viewer.busy)
-        original = viewer.adapter
+        original = viewer.loader
         assert viewer.last_error is None
 
         # Changing a split after selecting another dataset loads that source.
@@ -251,34 +248,34 @@ def test_split_changes_load_pending_source_and_preserve_active_source_on_failure
         viewer._split_changed()
         _wait(root, lambda: not viewer.busy)
         assert viewer.last_error is None
-        assert isinstance(viewer.adapter, ReplacementAdapter)
-        assert viewer.adapter is not original
+        assert isinstance(viewer.loader, ReplacementDataset)
+        assert viewer.loader is not original
         assert original.split_calls == []
-        assert viewer.adapter.split_calls == ["val"]
+        assert viewer.loader.split_calls == ["val"]
         assert viewer._active_split == "val"
-        assert viewer.frame_data.info.scene_token == "demo-roundabout"
+        assert viewer.frame_data.info.scene_id == "demo-roundabout"
 
         # Root/version changes also reload, even if the split is unchanged.
-        replacement = viewer.adapter
+        replacement = viewer.loader
         viewer.root_var.set(str(tmp_path / "second"))
         viewer.version_var.set("release-b")
         viewer._split_changed()
         _wait(root, lambda: not viewer.busy)
         assert viewer.last_error is None
-        assert viewer.adapter is not replacement
-        assert viewer.adapter.loaded_root == tmp_path / "second"
-        assert viewer.adapter.loaded_version == "release-b"
+        assert viewer.loader is not replacement
+        assert viewer.loader.loaded_root == tmp_path / "second"
+        assert viewer.loader.loaded_version == "release-b"
         assert viewer._active_split == "val"
 
         # Equivalent paths and surrounding whitespace keep the same adapter.
-        active = viewer.adapter
+        active = viewer.loader
         viewer.root_var.set(str(tmp_path / "second") + "/.")
         viewer.version_var.set(" release-b ")
         viewer.split_var.set("all")
         viewer._split_changed()
         _wait(root, lambda: not viewer.busy)
         assert viewer.last_error is None
-        assert viewer.adapter is active
+        assert viewer.loader is active
         assert len(viewer.scenes) == 2
         active_source, active_frame = viewer._active_source, viewer.frame_data
 
@@ -288,7 +285,7 @@ def test_split_changes_load_pending_source_and_preserve_active_source_on_failure
         viewer._split_changed()
         _wait(root, lambda: not viewer.busy)
         assert "root is missing" in viewer.last_error
-        assert viewer.adapter is active
+        assert viewer.loader is active
         assert viewer._active_source == active_source
         assert viewer.frame_data is active_frame
         assert viewer._active_split == viewer.split_var.get() == "all"
@@ -298,7 +295,7 @@ def test_split_changes_load_pending_source_and_preserve_active_source_on_failure
         viewer._split_changed()
         _wait(root, lambda: not viewer.busy)
         assert viewer.last_error is None
-        assert viewer.adapter is active
+        assert viewer.loader is active
         assert viewer._active_split == "val"
     finally:
         viewer.close()
@@ -309,7 +306,7 @@ def test_shared_camera_only_provider_uncalibrated_images_and_source_cleanup():
     import tkinter as tk
     import numpy as np
     from dataset_utils import DatasetLoader, register_loader
-    from dataset_utils.contracts.models import (
+    from dataset_utils import (
         AnnotationSet, AnnotationStatus, CameraFrameSet, CameraObservation, Capability, DatasetMetadata, FrameInfo,
         Modality, SceneInfo, SensorInfo,
     )
@@ -329,13 +326,13 @@ def test_shared_camera_only_provider_uncalibrated_images_and_source_cleanup():
             return DatasetMetadata("image-only-ui", "Image only", frozenset((Capability.CAMERAS,)),
                 sensors=(SensorInfo("new-camera", Modality.CAMERAS, "A new camera"),))
 
-        def list_scenes(self, *, split="all"):
+        def _list_scenes(self, *, split="all"):
             return (SceneInfo("scene", "Camera scene", frame_counts={Modality.CAMERAS: 1}),)
 
-        def list_frames(self, scene_id, *, modality):
+        def _list_frames(self, scene_id, *, modality):
             return (FrameInfo("frame", scene_id, 0, None, frozenset((Modality.CAMERAS,))),)
 
-        def load_cameras(self, frame_id):
+        def _load_cameras(self, frame_id):
             self.read_threads.append(threading.get_ident())
             return CameraFrameSet(self.list_frames("scene", modality=Modality.CAMERAS)[0],
                 "images", "local", (CameraObservation("new-camera", np.full((30, 40, 3), 120, dtype=np.uint8)),))
@@ -344,8 +341,8 @@ def test_shared_camera_only_provider_uncalibrated_images_and_source_cleanup():
             self.released = True
 
     class WithheldLoader(CameraOnlyLoader):
-        def load_cameras(self, frame_id):
-            frame = super().load_cameras(frame_id)
+        def _load_cameras(self, frame_id):
+            frame = super()._load_cameras(frame_id)
             return replace(frame, annotations=AnnotationSet("local", AnnotationStatus.WITHHELD))
 
     class AvailableEmptyLoader(CameraOnlyLoader):
@@ -353,8 +350,8 @@ def test_shared_camera_only_provider_uncalibrated_images_and_source_cleanup():
         def metadata(self):
             return replace(super().metadata, capabilities=frozenset((Capability.CAMERAS, Capability.BOXES_3D)))
 
-        def load_cameras(self, frame_id):
-            frame = super().load_cameras(frame_id)
+        def _load_cameras(self, frame_id):
+            frame = super()._load_cameras(frame_id)
             return replace(frame, annotations=AnnotationSet("local", AnnotationStatus.AVAILABLE))
 
     register_loader("native-image-only-ui", CameraOnlyLoader)
@@ -366,10 +363,10 @@ def test_shared_camera_only_provider_uncalibrated_images_and_source_cleanup():
     try:
         _wait(root, lambda: viewer.frame_data is not None and not viewer.busy and viewer.panels["new-camera"]._photo is not None)
         assert viewer.last_error is None
-        active = viewer.adapter.loader
+        active = viewer.loader
         assert active.read_threads and all(thread != threading.get_ident() for thread in active.read_threads)
         camera = viewer.frame_data.cameras[0]
-        assert camera.intrinsics is camera.sensor_to_world is camera.projection_model is None
+        assert camera.intrinsics is camera.T_reference_from_camera is camera.projection_model is None
         assert viewer.panels["new-camera"].canvas.find_withtag("camera_image")
         assert not viewer.panels["new-camera"].canvas.find_withtag("bounding_box")
         assert "time unknown" in viewer.frame_label.cget("text")
@@ -387,7 +384,7 @@ def test_shared_camera_only_provider_uncalibrated_images_and_source_cleanup():
         viewer.load_dataset()
         _wait(root, lambda: not viewer.busy)
         assert viewer.last_error is None
-        active = viewer.adapter.loader
+        active = viewer.loader
         for name, status, description in (
             ("native-withheld-ui", "withheld", "Ground truth withheld"),
             ("native-available-empty-ui", "available", "0 annotated objects"),
@@ -398,12 +395,75 @@ def test_shared_camera_only_provider_uncalibrated_images_and_source_cleanup():
             viewer.load_dataset()
             _wait(root, lambda: not viewer.busy)
             assert viewer.last_error is None and previous.released
-            assert viewer.frame_data.annotation_status == status
+            assert viewer.frame_data.annotations.status == status
             assert description in viewer.status_label.cget("text")
-            active = viewer.adapter.loader
+            active = viewer.loader
     finally:
         viewer.close()
     deadline = time.monotonic() + 5
     while active is not None and not active.released and time.monotonic() < deadline:
         time.sleep(.01)
     assert active is not None and active.released
+
+
+def test_explicit_configuration_reaches_provider_and_keeps_sources_locked(tmp_path):
+    import tkinter as tk
+    import numpy as np
+    from dataset_utils import DatasetConfig, DatasetLoader, register_loader
+    from dataset_utils import (
+        AnnotationSet, AnnotationStatus, Box3D, CameraFrameSet, CameraObservation,
+        Capability, ClassInfo, DatasetMetadata, FrameInfo, Modality, PinholeProjection, SceneInfo, SensorInfo,
+    )
+    from cameraviz.ui.app import CameraViewer
+
+    class ConfiguredLoader(DatasetLoader):
+        @property
+        def metadata(self):
+            return DatasetMetadata("configured-ui", "Configured", frozenset((Capability.CAMERAS, Capability.BOXES_3D)),
+                classes=(ClassInfo("native.car", "native.car", "Car", "Vehicles"),),
+                sensors=(SensorInfo("camera", Modality.CAMERAS, "Camera"),), splits=("all", "val"))
+
+        def _list_scenes(self, *, split="all"):
+            return (SceneInfo("scene", split, frame_counts={Modality.CAMERAS: 1}),)
+
+        def _list_frames(self, scene_id, *, modality):
+            return (FrameInfo("frame", scene_id, 0, modalities=frozenset((Modality.CAMERAS,))),)
+
+        def _load_cameras(self, frame_id):
+            model = PinholeProjection(np.array([[5., 0, 5], [0, 5., 5], [0, 0, 1]]), np.eye(4))
+            camera = CameraObservation("camera", np.zeros((10, 10, 3), dtype=np.uint8), projection_model=model)
+            box = Box3D("car", "native.car", np.array([0., 0, 10]), np.ones(3) * 2, np.eye(3))
+            return CameraFrameSet(self.list_frames("scene", modality=Modality.CAMERAS)[0],
+                "images", "reference", (camera,), AnnotationSet("reference", AnnotationStatus.AVAILABLE, (box,)))
+
+    register_loader("configured-camera-desktop", ConfiguredLoader)
+    config = DatasetConfig(root=tmp_path, release="custom-release", options={"custom_option": 17})
+    root = tk.Tk()
+    viewer = CameraViewer(root, dataset="configured-camera-desktop", config=config, autoload=True)
+    try:
+        _wait(root, lambda: viewer.frame_data is not None and not viewer.busy)
+        assert viewer.last_error is None
+        assert viewer.loader.config is config
+        assert tuple(viewer.class_vars) == ("Vehicles",)
+        assert viewer.frame_data.annotations.boxes[0].class_id == "native.car"
+        _wait(root, lambda: bool(viewer.panels["camera"].canvas.find_withtag("bounding_box")))
+        viewer.show_classes(False)
+        assert not viewer.panels["camera"].canvas.find_withtag("bounding_box")
+        viewer.show_classes(True)
+        assert viewer.panels["camera"].canvas.find_withtag("bounding_box")
+        assert viewer.root_var.get() == str(tmp_path)
+        assert viewer.version_var.get() == "custom-release"
+        for control in (viewer.dataset_combo, viewer.root_entry, viewer.version_entry, viewer.browse_button):
+            assert str(control.cget("state")) == "disabled"
+        assert str(viewer.load_button.cget("state")) == "normal"
+        assert str(viewer.split_combo.cget("state")) == "readonly"
+        active = viewer.loader
+        viewer.split_var.set("val")
+        viewer._split_changed()
+        _wait(root, lambda: not viewer.busy)
+        assert viewer.last_error is None
+        assert viewer.loader is active
+        assert viewer.scenes[0].display_name == "val"
+        assert str(viewer.root_entry.cget("state")) == "disabled"
+    finally:
+        viewer.close()

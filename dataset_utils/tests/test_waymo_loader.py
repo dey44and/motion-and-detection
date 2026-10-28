@@ -11,8 +11,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from dataset_utils.contracts.config import DatasetConfig
-from dataset_utils.contracts.models import (
+from dataset_utils.config import DatasetConfig
+from dataset_utils.models import (
     AnnotationAlignment, AnnotationStatus, Capability, Modality, PointCloudPreparation,
 )
 from dataset_utils.errors import (
@@ -145,7 +145,7 @@ def _loader(sources, *, processed=True, native=True, options=None):
 
 def test_native_and_processed_profiles_share_ids_but_keep_modality_indices(sources):
     loader = _loader(sources)
-    assert loader.reader is not None and loader.processed_adapter is not None
+    assert loader.reader is not None
     scenes = loader.list_scenes(split="val")
     assert scenes[0].scene_id == "context" and scenes[0].frame_counts[Modality.POINT_CLOUD] is None
     clouds = loader.list_frames("context", modality=Modality.POINT_CLOUD)
@@ -322,12 +322,9 @@ def test_additional_classes_are_declared_without_eager_metadata_loading(sources)
     assert configured.load_point_cloud("waymo:context:1000000").annotations.boxes[1].class_id == "Custom"
 
 
-def test_prepare_rejects_foreign_frames_and_rgb_success_is_not_published_when_acquisition_fails(sources, monkeypatch):
+def test_rgb_success_is_not_published_when_acquisition_fails(sources, monkeypatch):
     loader = _loader(sources)
     frame = loader.load_point_cloud("waymo:context:1000000")
-    other = _loader(sources)
-    with pytest.raises(DatasetValidationError, match="foreign"):
-        other.prepare_point_cloud(frame, request=PointCloudPreparation(rgb=True))
     native = loader._native(frame.info)
     loader._pointset(frame.info)  # Keep row correspondence fixed for this staged failure.
     without_poses = replace(native, lasers=tuple(replace(laser, returns=tuple(
@@ -427,3 +424,94 @@ def test_native_point_read_distinguishes_missing_lasers_from_valid_empty_ranges(
     path.write_bytes(_record(proto))
     empty = _loader(sources, processed=False).load_point_cloud("waymo:context:1000000")
     assert empty.points.shape == (0, 3)
+
+
+@pytest.mark.parametrize("selected", ["parent", "workspace", "processed"])
+def test_automatic_source_discovery_prefers_processed_and_pairs_native_records(sources, tmp_path, selected):
+    from dataset_utils.waymo.processed import DEFAULT_PROCESSED_TAG
+
+    root = tmp_path / "dataset"
+    workspace = root / "waymo_pcdet_workspace"
+    processed = workspace / DEFAULT_PROCESSED_TAG
+    native = root / "waymo_og_format_unpacked"
+    shutil.copytree(sources[1], processed)
+    shutil.copytree(sources[0], native)
+    path = {"parent": root, "workspace": workspace, "processed": processed}[selected]
+    with WaymoLoader(DatasetConfig(root=path)) as loader:
+        frame = loader.load_point_cloud("waymo:context:1200000")
+        assert frame.source_id.endswith(DEFAULT_PROCESSED_TAG)
+        assert frame.info.index == 1  # Display index differs from original NPY index 2.
+        prepared = loader.prepare_point_cloud(frame, request=PointCloudPreparation(rgb=True))
+        assert prepared.rgb.valid_mask.any()
+    with WaymoLoader(DatasetConfig(root=root, storage_format="native")) as loader:
+        assert loader.load_point_cloud(frame.info.frame_id).source_id == "waymo:native:all-lidars-both-returns"
+
+
+def test_malformed_processed_source_does_not_fall_back_to_valid_native_data(sources, tmp_path):
+    from dataset_utils.waymo.processed import DEFAULT_PROCESSED_TAG
+
+    root = tmp_path / "dataset"
+    shutil.copytree(sources[0], root / "waymo_og_format_unpacked")
+    (root / "waymo_pcdet_workspace" / DEFAULT_PROCESSED_TAG).mkdir(parents=True)
+    with pytest.raises(DatasetValidationError, match="No complete OpenPCDet"):
+        WaymoLoader(DatasetConfig(root=root))
+
+
+def test_ambiguous_processed_sources_require_an_explicit_tag(sources, tmp_path):
+    root = tmp_path / "workspace"
+    first, second = root / "waymo_processed_data_first", root / "waymo_processed_data_second"
+    shutil.copytree(sources[1], first)
+    shutil.copytree(sources[1], second)
+    with pytest.raises(DatasetConfigurationError, match="Several Waymo processed directories"):
+        WaymoLoader(DatasetConfig(root=root))
+    with WaymoLoader(DatasetConfig(root=root, options={"processed_tag": second.name})) as loader:
+        assert loader.load_point_cloud("waymo:context:1000000").source_id.endswith(second.name)
+
+
+def test_explicit_processed_tag_can_select_a_nonstandard_directory_name(sources, tmp_path):
+    root = tmp_path / "workspace"
+    profile = root / "research-profile"
+    shutil.copytree(sources[1], profile)
+    with WaymoLoader(DatasetConfig(root=root, options={"processed_tag": profile.name})) as loader:
+        assert loader.load_point_cloud("waymo:context:1000000").source_id.endswith(profile.name)
+
+
+def test_processed_metadata_stays_lazy_and_sparse_indices_select_original_files(sources, monkeypatch):
+    from dataset_utils.waymo import processed
+
+    reads = []
+    original = processed._NumpyMetadataUnpickler.load
+
+    def observe(stream):
+        reads.append(True)
+        return original(stream)
+
+    monkeypatch.setattr(processed._NumpyMetadataUnpickler, "load", observe)
+    with _loader(sources, native=False) as loader:
+        assert loader.list_scenes()[0].frame_counts[Modality.POINT_CLOUD] is None
+        assert not reads
+        frames = loader.list_frames("context", modality=Modality.POINT_CLOUD)
+        assert len(reads) == 1
+        cloud = loader.load_point_cloud(frames[1].frame_id)
+        assert len(reads) == 1 and cloud.info.index == 1
+        expected = np.load(sources[1] / "segment-context_with_camera_labels/0002.npy")
+        np.testing.assert_array_equal(cloud.points, expected[:, :3])
+        np.testing.assert_array_equal(cloud.attributes["nlz"], expected[:, 5])
+
+
+def test_processed_metadata_rejects_non_numpy_pickle_globals(sources):
+    from pathlib import Path
+
+    metadata = sources[1] / "segment-context_with_camera_labels/segment-context_with_camera_labels.pkl"
+    metadata.write_bytes(pickle.dumps(Path("unexpected-object")))
+    with _loader(sources, native=False) as loader:
+        with pytest.raises(DatasetValidationError, match="Unsupported Waymo metadata pickle global"):
+            loader.list_frames("context", modality=Modality.POINT_CLOUD)
+
+
+def test_ground_truth_database_directory_is_not_a_processed_cloud_profile(sources, tmp_path):
+    root = tmp_path / "dataset"
+    shutil.copytree(sources[0], root / "waymo_og_format_unpacked")
+    (root / "waymo_pcdet_workspace/waymo_processed_data_v0_5_0_gt_database_train").mkdir(parents=True)
+    with WaymoLoader(DatasetConfig(root=root)) as loader:
+        assert loader.load_point_cloud("waymo:context:1000000").source_id == "waymo:native:all-lidars-both-returns"

@@ -1,19 +1,17 @@
 # dataset-utils
 
-Shared nuScenes and Waymo sensor data for `3dviz`, `2dcameraviz`, and `3ddetviz`.
-The distribution is named `dataset-utils`; Python imports use `dataset_utils`.
-The package contains dataset reading, common data models, calibration/pose
-transforms, point timing, camera RGB projection and split definitions. It has
-no GUI or renderer imports and can be used from an ordinary Python program.
+`dataset_utils` provides a GUI-independent dataset interface shared by
+`2dcameraviz`, `3dviz` and `3ddetviz`. It includes nuScenes and Waymo readers,
+immutable observation records, calibration/pose transforms, split catalogs,
+and optional point RGB, timing and acquisition geometry. New datasets implement
+the same interface and require no dataset-specific viewer code.
 
-The implemented [version-1 loader contract](docs/loader_contract.md) defines
+The [dataset interface](docs/loader_contract.md) defines
 the shared extension API, capabilities, records, and conformance requirements.
-Both viewers use generic adapters over this API; existing low-level reader
-imports remain available for compatibility.
-
-NumPy and Pillow support the common processing paths; protobuf and CRC32C
-support native Waymo records. Open3D, Tkinter, Matplotlib, TensorFlow, the
-nuScenes/Waymo SDKs and detector frameworks are not required by this package.
+For a complete file-backed example, start with
+[Add a custom dataset](docs/custom_datasets.md). The
+[architecture guide](../docs/VISUALIZATION_ARCHITECTURE.md) explains how the
+packages fit together.
 
 From the repository root:
 
@@ -28,8 +26,11 @@ python -m pip install -e './dataset_utils' -e './3dviz[dev]'
 python -m pip install -e './dataset_utils' -e './2dcameraviz[dev]'
 ```
 
-`3ddetviz` additionally uses `3dviz`'s existing renderer and window, so its
-local-source installation includes `-e './3dviz'` as documented in that tool.
+`3ddetviz` uses `3dviz`'s renderer and window; install all three dependencies:
+
+```bash
+python -m pip install -e './dataset_utils' -e './3dviz' -e './3ddetviz[dev]'
+```
 
 ## Shared loader API
 
@@ -51,27 +52,53 @@ with create_loader("nuscenes", config) as dataset:
 Capabilities describe the configured sources. RGB, point timestamps, and
 acquisition geometry are independent; masks and provenance describe coverage
 and whether timing is recorded or estimated. Annotation status distinguishes
-available-empty, not-provided, and withheld ground truth. Normalized arrays are
-immutable snapshots and remain valid after cache eviction or loader close.
+available-empty, not-provided, and withheld ground truth.
 
 Waymo accepts `storage_format="auto"`, `"native"`, or `"openpcdet"`. Supply
 `source_paths={"processed": "/data/processed", "native": "/data/original"}`
-when the representations are stored independently. Automatic directory discovery
-remains a convenience. Its options are `processed_tag` and `additional_classes`;
+when the representations are stored independently, or use automatic directory
+discovery. Its options are `processed_tag` and `additional_classes`.
 nuScenes accepts `auto`/`native`, an optional `native` source, and no options.
 Unknown options, sources, and incompatible releases produce configuration errors.
 
-Register a new backend once with `register_loader(name, constructor)` before
-launching the chosen viewer in that process. The constructor receives an
+Register a backend once with `register_loader(name, constructor)` before
+launching the viewer in that process, or expose an installed entry point:
+
+```toml
+[project.entry-points."dataset_utils.loaders"]
+my_dataset = "my_package:MyDatasetLoader"
+```
+
+`available_loaders()` lists built-ins, explicit registrations and installed
+plugins without importing plugin code. Construction imports only the selected
+plugin. Names cannot override existing names. The constructor receives an
 immutable `DatasetConfig` and returns `DatasetLoader`. The applicable viewers
 discover it through the shared registry, using sensor roles/order for camera
-layout and class display groups for filtering. No dataset-specific UI code or
-second per-viewer registration is needed. Automatic external-package discovery
-is outside version 1; see the contract for required methods and error behavior.
+layout and class display groups for filtering. See the contract for required
+methods, error behavior and lifecycle ownership.
 
-The examples below expose the lower-level compatibility readers. Their record
-types differ from the normalized factory API above; new extensions should
-implement the contract rather than copy a viewer adapter.
+All viewer CLIs accept `--dataset-config FILE`. The public
+`load_dataset_config(FILE)` reads the same strict JSON schema into a
+`DatasetConfig`. For example:
+
+```json
+{
+  "root": "../datasets/waymo",
+  "storage_format": "openpcdet",
+  "source_paths": {"native": "../waymo-original"},
+  "options": {"processed_tag": "default"}
+}
+```
+
+Root paths resolve against the JSON file directory; named sources resolve
+against that root, or the file directory when root is absent. The only accepted
+fields are `root`, `release`, `storage_format`, `source_paths` and `options`.
+Unknown fields, duplicate keys and non-finite option numbers are rejected.
+Providers validate the settings they support. See the
+[configuration reference](docs/loader_contract.md#3-configuration-and-construction).
+
+The examples below expose lower-level native readers for dataset-specific
+research. Viewers and new dataset adapters use the shared records above.
 
 ## nuScenes input and API
 
@@ -90,26 +117,27 @@ from dataset_utils.nuscenes import NuScenesReader
 
 lidar = NuScenesReader(root="/datasets/nuscenes", version="v1.0-mini", sensor="lidar")
 scene = lidar.list_scenes_for_split("val")[0]
-info = lidar.list_frames(scene.token)[0]
-frame = lidar.load_frame(info.token)
+info = lidar.list_frames(scene.scene_id)[0]
+frame = lidar.load_frame(info.frame_id)
 colored = lidar.prepare_frame(frame, camera_rgb=True)
 
 cameras = NuScenesReader(root="/datasets/nuscenes", version="v1.0-mini", sensor="camera")
-camera_frame = cameras.load_camera_frame(cameras.list_frames(scene.token)[0].token)
+camera_frame = cameras.load_camera_frame(cameras.list_frames(scene.scene_id)[0].frame_id)
 ```
 
 The reader exposes scene/frame lists, annotation class names and official
 offline split membership. On mini, `train` and `val` select `mini_train` and
 `mini_val`; release/split mismatches report an error. Annotation-free releases
-remain useful. Ten detection class aliases are retained alongside additional
-original categories.
+remain useful. Native category IDs are retained; the loader's class metadata
+supplies detection display groups alongside additional original categories.
 
-Shared `SceneInfo`, `FrameInfo`, `BoundingBox3D` and `PointCloudFrame` models live
-in `dataset_utils.models`. Point-cloud boxes use reference sensor coordinates,
-local axes are length/width/height, and `reference_sensor_to_world` preserves the
-LiDAR reference pose. `load_camera_frame` returns world-coordinate boxes and
-camera RGB images, intrinsics and each exposure's sensor-to-world pose.
-Frontend adapters add their layout and presentation models to these values.
+The reader returns the shared records in `dataset_utils.models` directly.
+Point-cloud annotations use reference sensor coordinates; dimensions are LWH,
+and `T_world_from_reference` preserves the LiDAR reference pose.
+`load_camera_frame` returns a `CameraFrameSet` containing world-reference
+annotations, RGB images, and explicit camera poses/projection models.
+Optional data is accessed through `frame.rgb`, `frame.timing` and
+`frame.acquisition`; there is no intermediate native frame model.
 
 The nuScenes backend also owns the nominal HDL-32E acquisition-time estimate,
 pose interpolation, undoing existing ego compensation and camera RGB sampling.
@@ -231,23 +259,35 @@ strict tolerance. Matching only point count is insufficient.
 
 ```text
 dataset_utils/src/dataset_utils/
-  models.py        # shared scene/frame/box/point-cloud values
+  dataset.py       # small interface; public methods call explicit provider hooks
+  models.py        # shared records used directly by all three viewers
+  config.py        # local paths and provider options
+  registry.py      # optional name-based construction
+  projection.py    # undistorted pinhole model
   errors.py        # dataset errors independent of a frontend
   nuscenes/        # tables, calibration, images/LiDAR, timing, RGB and splits
-  waymo/           # native records, range images, camera model and associations
+  waymo/           # native records, range images, processed storage and camera model
 ```
 
-Storage and sensor geometry belong here. Frontend `dataloader` packages remain
-small adapter/factory boundaries; they configure camera labels/layouts and map
-shared values into the frontend's presentation contract. Point-cloud distance
+Storage and sensor geometry belong here. Frontend `dataloader` packages select
+a shared loader or their generated demo; they do not define another data
+model or keep copies of dataset observations. Point-cloud distance
 colors, bounding-box overlays, rendering, UI controls and navigation belong to
 their viewers. Prediction import, confidence filtering and NMS remain in
-`3ddetviz`. Existing frontend imports can re-export shared models and numerical
-helpers without maintaining another implementation.
+`3ddetviz`. Layout and display groups are resolved from metadata in the viewer.
+
+The active implementation has no runtime cloud hashes, ownership tokens or
+automatic method wrapping. Record constructors check shapes and geometry;
+provider tests check row preservation. Native TFRecord integrity checks and
+processed/native correspondence checks retain their distinct scientific purpose.
+
+The preceding implementation is retained in
+[`archive/visualization_before_simplification`](../archive/visualization_before_simplification/SNAPSHOT.md).
 
 Adding another frontend should reuse these readers without adding GUI imports
 to `dataset_utils`. Supporting another dataset can add a backend module and
-register a frontend adapter without changing the existing readers.
+register its shared loader or expose an installed entry point without changing
+the viewers or existing readers. See the [custom dataset guide](docs/custom_datasets.md).
 
 ## Validation and references
 

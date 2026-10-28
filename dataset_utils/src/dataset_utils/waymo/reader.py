@@ -142,6 +142,19 @@ def frame_from_proto(value, *, include_points=True, include_cameras=True) -> Nat
         camera_labels(value.projected_lidar_labels) if include_cameras else ())
 
 
+def find_native_root(root: Path) -> Path | None:
+    """Find TFRecords by filenames, including a paired dataset beside a workspace."""
+    candidates = (root, root / "waymo_og_format_unpacked",
+                  *(ancestor / "waymo_og_format_unpacked" for ancestor in root.parents))
+    for candidate in dict.fromkeys(candidates):
+        if candidate.is_dir() and any(
+            next(folder.glob("*.tfrecord"), None) is not None
+            for folder in (candidate, *(candidate / split for split in ("training", "validation", "testing")))
+        ):
+            return candidate
+    return None
+
+
 class NativeWaymoReader:
     def __init__(self, root, *, split=None):
         try:
@@ -149,10 +162,7 @@ class NativeWaymoReader:
         except (KeyError, TypeError):
             raise NativeWaymoError(f"Unsupported native Waymo split {split!r}.") from None
         self.root = Path(root).expanduser().resolve()
-        candidates = (self.root, self.root / "waymo_og_format_unpacked", self.root.parent / "waymo_og_format_unpacked")
-        native_root = next((candidate for candidate in candidates if candidate.is_dir() and (
-            any((candidate / folder).is_dir() for folder in ("training", "validation", "testing"))
-            or next(candidate.glob("*.tfrecord"), None) is not None)), None)
+        native_root = find_native_root(self.root)
         if native_root is None:
             raise NativeWaymoError(f"Native Waymo TFRecords not found under {self.root}. Select waymo_og_format_unpacked or its dataset parent.")
         self.native_root = native_root
@@ -177,6 +187,13 @@ class NativeWaymoReader:
         self._headers = {}
         self._frames = OrderedDict()
         self._lock = threading.RLock()
+
+    def close(self) -> None:
+        """Release cached payloads and record indexes after pending reads finish."""
+        with self._lock:
+            self._frames.clear()
+            self._headers.clear()
+            self._offsets.clear()
 
     def list_sequences(self):
         return tuple(self._sequences[name] for name in sorted(self._sequences))

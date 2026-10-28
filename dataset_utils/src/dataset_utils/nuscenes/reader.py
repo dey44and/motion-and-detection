@@ -2,8 +2,7 @@
 
 The selected sensor controls keyframe enumeration, not metadata indexing.
 Frame tokens are nuScenes sample tokens. Sensor payloads are loaded lazily.
-The ten detection categories are merged following the official devkit mapping;
-other annotation categories keep their original names so no boxes are dropped.
+Native class identities are retained; the loader supplies detection display groups.
 
 Format and coordinate conventions:
 https://github.com/nutonomy/nuscenes-devkit/blob/master/python-sdk/nuscenes/nuscenes.py
@@ -20,9 +19,23 @@ from typing import Any
 
 import numpy as np
 
-from ..errors import DatasetError
-from ..models import BoundingBox3D, PointCloudFrame, FrameInfo, SceneInfo
-from .models import NuScenesCamera, NuScenesCameraFrame
+from ..errors import DataUnavailableError, DatasetError, DatasetValidationError, UnknownIdentifierError
+from ..models import (
+    AcquisitionGeometry, AnnotationAlignment, AnnotationSet, AnnotationStatus,
+    AnnotationTiming, Box3D, CameraFrameSet, CameraObservation, FrameInfo,
+    Modality, PointCloudFrame, PointColors, PointTiming, ProcessingProvenance,
+    SceneInfo, TimingQuality,
+)
+from ..projection import PinholeProjection
+
+_POINT_SOURCE = "nuscenes:native:LIDAR_TOP:compensated-v1"
+_CAMERA_SOURCE = "nuscenes:native:camera-keyframes-v1"
+_TIMING_ASSUMPTIONS = (
+    "Point times are estimated from the nominal HDL-32E firing model, not recorded per return.",
+    "One scene-stable azimuth phase and interpolated recorded ego poses undo existing ego compensation.",
+    "A missing preceding sweep uses the next sweep interval or a nominal 50 ms interval.",
+    "Returns in one firing column share its nominal time; object motion is not compensated.",
+)
 
 DETECTION_CLASSES = (
     "car", "truck", "construction_vehicle", "bus", "trailer", "barrier",
@@ -66,12 +79,6 @@ def _timestamp(value: Any) -> int | None:
         return result
     except (TypeError, ValueError, OverflowError):
         return None
-
-
-def _required_timestamp(value: Any, context: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise DatasetError(f"Invalid {context}: expected a nonnegative integer timestamp.")
-    return value
 
 
 def _vector(value: Any, length: int, context: str) -> np.ndarray:
@@ -244,20 +251,15 @@ class NuScenesReader:
         self._trajectories: dict[str, Any] = {}
         self._nominal_phases: dict[str, float] = {}
         self._image_cache: OrderedDict[Path, np.ndarray] = OrderedDict()
-        self._preparation_reader: NuScenesReader | None = None
 
         self._annotations: dict[str, list[tuple[dict[str, Any], str]]] = defaultdict(list)
-        # Keep native category identity alongside the compatibility display
-        # aliases; normalized loaders must not collapse pedestrian/bus types.
-        self._native_annotation_names: dict[str, list[str]] = defaultdict(list)
+        # Keep native category identity; the loader supplies display groups.
         native_class_names: set[str] = set()
-        class_names = set(DETECTION_CLASSES)
         for category in categories.values():
             name = category.get("name")
             if not isinstance(name, str) or not name:
                 raise DatasetError("Invalid category.json record: expected a nonempty name.")
             native_class_names.add(name)
-            class_names.add(_CATEGORY_TO_DETECTION.get(name, name))
         for annotation in self._read_table("sample_annotation", optional=True):
             sample_token = annotation.get("sample_token")
             self._record(samples, sample_token, "sample")
@@ -268,12 +270,8 @@ class NuScenesReader:
                 name = category.get("name")
             if not isinstance(name, str) or not name:
                 raise DatasetError(f"Invalid category for annotation {annotation.get('token')!r}.")
-            class_name = _CATEGORY_TO_DETECTION.get(name, name)
             native_class_names.add(name)
-            self._native_annotation_names[sample_token].append(name)
-            class_names.add(class_name)
-            self._annotations[sample_token].append((annotation, class_name))
-        self._class_names = DETECTION_CLASSES + tuple(sorted(class_names.difference(DETECTION_CLASSES)))
+            self._annotations[sample_token].append((annotation, name))
         self._native_class_names = tuple(sorted(native_class_names))
 
         samples_by_scene: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -293,18 +291,21 @@ class NuScenesReader:
             scene_samples = samples_by_scene[scene_token]
             lidar_frames = self._scene_frame_infos(scene_samples, scene_token, "lidar")
             camera_frames = self._scene_frame_infos(scene_samples, scene_token, "camera")
-            self._lidar_frames.update((frame.token, frame) for frame in lidar_frames)
-            self._camera_frames.update((frame.token, frame) for frame in camera_frames)
+            self._lidar_frames.update((frame.frame_id, frame) for frame in lidar_frames)
+            self._camera_frames.update((frame.frame_id, frame) for frame in camera_frames)
             frames = lidar_frames if self.sensor == "lidar" else camera_frames
             self._frames_by_scene[scene_token] = frames
-            self._frames.update((frame.token, frame) for frame in frames)
+            self._frames.update((frame.frame_id, frame) for frame in frames)
             scene_infos.append(SceneInfo(
-                token=scene_token,
-                name=scene.get("name", scene_token),
+                scene_id=scene_token,
+                display_name=scene.get("name", scene_token),
                 description=scene.get("description", ""),
-                frame_count=len(frames),
+                frame_counts={
+                    Modality.POINT_CLOUD: None if scene_token in self._frame_index_error_scenes["lidar"] else len(lidar_frames),
+                    Modality.CAMERAS: None if scene_token in self._frame_index_error_scenes["camera"] else len(camera_frames),
+                },
             ))
-        self._scenes = tuple(sorted(scene_infos, key=lambda scene: (scene.name, scene.token)))
+        self._scenes = tuple(sorted(scene_infos, key=lambda scene: (scene.display_name, scene.scene_id)))
 
     def _retain_keyframe(self, data: dict[str, Any]) -> None:
         token = data.get("token")
@@ -334,7 +335,10 @@ class NuScenesReader:
                 return ()
         relevant.sort(key=lambda sample: (int(sample["timestamp"]), sample["token"]))
         return tuple(
-            FrameInfo(sample["token"], scene_token, index, int(sample["timestamp"]))
+            FrameInfo(sample["token"], scene_token, index, int(sample["timestamp"]),
+                      frozenset(mode for mode, index in ((Modality.POINT_CLOUD, self._lidar_by_sample),
+                                                         (Modality.CAMERAS, self._cameras_by_sample))
+                                if sample["token"] in index))
             for index, sample in enumerate(relevant)
         )
 
@@ -414,7 +418,7 @@ class NuScenesReader:
 
     @property
     def class_names(self) -> tuple[str, ...]:
-        return self._class_names
+        return self._native_class_names
 
     @property
     def supports_point_timing(self) -> bool:
@@ -439,7 +443,7 @@ class NuScenesReader:
         from .splits import scene_names_for_split
 
         names = scene_names_for_split(split, self.version)
-        return self._scenes if names is None else tuple(scene for scene in self._scenes if scene.name in names)
+        return self._scenes if names is None else tuple(scene for scene in self._scenes if scene.display_name in names)
 
     def list_frames(self, scene_token: str) -> tuple[FrameInfo, ...]:
         try:
@@ -462,13 +466,38 @@ class NuScenesReader:
             "Extract the sensor files (samples/LIDAR_TOP) under your dataset root."
         )
 
+    def _annotation_set(self, frame_id, reference, timestamp, boxes):
+        if self.version.endswith("test"):
+            status = AnnotationStatus.WITHHELD
+        elif not (self.table_root / "sample_annotation.json").is_file():
+            status = AnnotationStatus.NOT_PROVIDED
+        else:
+            status = AnnotationStatus.AVAILABLE
+        return AnnotationSet(
+            reference, status, boxes if status == AnnotationStatus.AVAILABLE else (),
+            AnnotationTiming(timestamp, AnnotationAlignment.REFERENCE_TIME),
+        )
+
+    def _pose_timestamp(self, data):
+        pose = self._poses.get(data.get("ego_pose_token"))
+        if pose is None:
+            return None
+        return _timestamp(pose.get("timestamp")) if "timestamp" in pose else _timestamp(data.get("timestamp"))
+
+    def _frame_info(self, frame_id: str, modality: Modality) -> FrameInfo:
+        if frame_id not in self._known_frame_tokens:
+            raise UnknownIdentifierError(f"Unknown nuScenes frame {frame_id!r}.")
+        sensor = "lidar" if modality == Modality.POINT_CLOUD else "camera"
+        error = self._frame_index_errors[sensor].get(frame_id)
+        if error is not None:
+            raise DatasetValidationError(error)
+        frames = self._lidar_frames if modality == Modality.POINT_CLOUD else self._camera_frames
+        if frame_id not in frames:
+            raise DataUnavailableError(f"nuScenes frame {frame_id!r} has no {modality.value} observation.")
+        return frames[frame_id]
+
     def load_frame(self, frame_token: str) -> PointCloudFrame:
-        if frame_token in self._frame_index_errors["lidar"]:
-            raise DatasetError(self._frame_index_errors["lidar"][frame_token])
-        try:
-            frame_info = self._lidar_frames[frame_token]
-        except KeyError:
-            raise DatasetError(f"Unknown nuScenes frame {frame_token!r}.") from None
+        frame_info = self._frame_info(frame_token, Modality.POINT_CLOUD)
         data = self._lidar_by_sample[frame_token]
         path = self._point_file(data.get("filename"))
         try:
@@ -500,45 +529,46 @@ class NuScenesReader:
             center = sensor_to_ego.T @ (
                 ego_to_global.T @ (box.center - ego_translation) - sensor_translation
             )
-            boxes.append(BoundingBox3D(
+            boxes.append(Box3D(
                 center=center,
                 size=box.size,
                 rotation=global_to_sensor @ box.rotation,
-                class_name=box.class_name,
-                token=box.token,
+                class_id=box.class_id,
+                annotation_id=box.annotation_id,
+                instance_id=box.instance_id,
             ))
+        attributes = {"intensity": np.ascontiguousarray(scan[:, 3])}
+        if (np.isfinite(scan[:, 4]).all() and np.all(scan[:, 4] == np.floor(scan[:, 4]))
+                and np.all((scan[:, 4] >= 0) & (scan[:, 4] < 32))):
+            attributes["ring"] = np.ascontiguousarray(scan[:, 4], dtype=np.int32)
+        reference = f"sensor:LIDAR_TOP:{data['token']}"
+        end = _timestamp(data.get("timestamp"))
+        start = self._lidar_sweep_start_us.get(data["token"])
+        if start is not None and (end is None or start >= end):
+            start = None
         return PointCloudFrame(
-            info=frame_info,
-            points=np.ascontiguousarray(scan[:, :3]),
-            intensity=np.ascontiguousarray(scan[:, 3]),
-            boxes=tuple(boxes),
-            reference_sensor_to_world=reference_sensor_to_world,
-            lidar_timestamp_us=(
-                frame_info.timestamp_us if _timestamp(data.get("timestamp")) is None
-                else _timestamp(data.get("timestamp"))
-            ),
-            ring_indices=(
-                np.ascontiguousarray(scan[:, 4], dtype=np.int32)
-                if np.isfinite(scan[:, 4]).all()
-                and np.all(scan[:, 4] == np.floor(scan[:, 4]))
-                and np.all((scan[:, 4] >= 0) & (scan[:, 4] < 32))
-                else None
-            ),
+            info=frame_info, source_id=_POINT_SOURCE, reference_frame_id=reference,
+            points=np.ascontiguousarray(scan[:, :3]), attributes=attributes,
+            annotations=self._annotation_set(frame_token, reference, frame_info.timestamp_us, tuple(boxes)),
+            reference_pose_timestamp_us=self._pose_timestamp(data),
+            world_frame_id=f"world:scene:{frame_info.scene_id}", T_world_from_reference=reference_sensor_to_world,
+            scan_start_us=start, scan_end_us=end,
         )
 
-    def _world_boxes(self, frame_token: str) -> tuple[BoundingBox3D, ...]:
+    def _world_boxes(self, frame_token: str) -> tuple[Box3D, ...]:
         boxes = []
         for annotation, class_name in self._annotations.get(frame_token, ()):
             token = annotation.get("token", "")
             size = _vector(annotation.get("size"), 3, f"box {token!r} size")
             if np.any(size <= 0):
                 raise DatasetError(f"Invalid box {token!r} size: dimensions must be positive.")
-            boxes.append(BoundingBox3D(
+            boxes.append(Box3D(
                 center=_vector(annotation.get("translation"), 3, f"box {token!r} translation"),
                 size=size[[1, 0, 2]],
                 rotation=_quaternion_matrix(annotation.get("rotation"), f"box {token!r} rotation"),
-                class_name=class_name,
-                token=token,
+                class_id=class_name,
+                annotation_id=token,
+                instance_id=annotation.get("instance_token") or None,
             ))
         return tuple(boxes)
 
@@ -592,33 +622,43 @@ class NuScenesReader:
             dimensions.append(value)
         return dimensions[0], dimensions[1]
 
-    def load_camera_frame(self, frame_token: str) -> NuScenesCameraFrame:
-        """Load only camera keyframe images, with boxes kept in world space."""
-        if frame_token in self._frame_index_errors["camera"]:
-            raise DatasetError(self._frame_index_errors["camera"][frame_token])
-        try:
-            info = self._camera_frames[frame_token]
-        except KeyError:
-            raise DatasetError(f"Unknown nuScenes frame {frame_token!r}.") from None
+    def load_camera_frame(self, frame_id: str) -> CameraFrameSet:
+        info = self._frame_info(frame_id, Modality.CAMERAS)
+        reference = f"world:scene:{info.scene_id}"
         cameras = []
         for channel in CAMERA_CHANNELS:
-            data = self._cameras_by_sample[frame_token].get(channel)
+            data = self._cameras_by_sample[frame_id].get(channel)
             if data is None:
                 continue
             calibration = self._record(self._calibrations, data.get("calibrated_sensor_token"), "calibrated_sensor")
-            pose = self._record(self._poses, data.get("ego_pose_token"), "ego_pose")
             image = self._image(data.get("filename"))
             self._camera_dimensions(data, image=image)
-            sensor_to_world = _transform(pose, f"{channel} camera ego pose") @ _transform(calibration, f"{channel} camera calibration")
-            sensor_to_world.setflags(write=False)
-            cameras.append(NuScenesCamera(
-                channel=channel,
-                image=image,
-                intrinsics=self._camera_intrinsics(calibration, channel),
-                sensor_to_world=sensor_to_world,
-                timestamp_us=_required_timestamp(data.get("timestamp"), f"{channel} camera exposure"),
+            timestamp = data.get("timestamp")
+            if timestamp is not None and (isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0):
+                raise DatasetValidationError(f"Invalid {channel} image timestamp in frame {frame_id!r}: expected an integer timestamp or None.")
+            intrinsics = None
+            if calibration.get("camera_intrinsic") is not None:
+                intrinsics = self._camera_intrinsics(calibration, channel)
+            pose = None
+            if data.get("ego_pose_token"):
+                pose = self._record(self._poses, data["ego_pose_token"], "ego_pose")
+            sensor_to_world = None
+            if pose is not None and ("rotation" in pose or "translation" in pose) and ("rotation" in calibration or "translation" in calibration):
+                sensor_to_world = _transform(pose, f"{channel} ego pose") @ _transform(calibration, f"{channel} calibration")
+            projection = None if intrinsics is None or sensor_to_world is None else PinholeProjection(
+                intrinsics=intrinsics, T_reference_from_camera=sensor_to_world,
+            )
+            cameras.append(CameraObservation(
+                sensor_id=channel, image=image, timestamp_us=timestamp,
+                timestamp_kind="recorded_image_timestamp", pose_timestamp_us=self._pose_timestamp(data),
+                intrinsics=intrinsics, T_reference_from_camera=sensor_to_world, projection_model=projection,
             ))
-        return NuScenesCameraFrame(info=info, cameras=tuple(cameras), boxes=self._world_boxes(frame_token))
+        return CameraFrameSet(
+            info=info, source_id=_CAMERA_SOURCE,
+            reference_frame_id=reference, world_frame_id=reference, T_world_from_reference=np.eye(4),
+            cameras=tuple(cameras),
+            annotations=self._annotation_set(frame_id, reference, info.timestamp_us, self._world_boxes(frame_id)),
+        )
 
     def _scene_trajectory(self, scene_token: str):
         from .motion import PoseTrajectory
@@ -689,7 +729,7 @@ class NuScenesReader:
         from .motion import estimate_nominal_phase
 
         self._ensure_sweep_indexes()
-        scene_token = frame.info.scene_token
+        scene_token = frame.info.scene_id
         if scene_token not in self._nominal_phases:
             reference_points = frame.points
             for data in self._lidar_sweeps_by_scene[scene_token]:
@@ -774,23 +814,23 @@ class NuScenesReader:
             return frame
         self._ensure_sweep_indexes()
         try:
-            data = self._lidar_by_sample[frame.info.token]
+            data = self._lidar_by_sample[frame.info.frame_id]
         except KeyError:
-            raise DatasetError(f"Unknown nuScenes frame {frame.info.token!r}.") from None
+            raise DatasetError(f"Unknown nuScenes frame {frame.info.frame_id!r}.") from None
         from .motion import decompensate_points, nominal_point_timestamps
 
         calibration = self._record(self._calibrations, data.get("calibrated_sensor_token"), "calibrated_sensor")
         pose = self._record(self._poses, data.get("ego_pose_token"), "ego_pose")
         sensor_to_ego = _transform(calibration, "LIDAR_TOP calibration")
         sensor_to_world = _transform(pose, "LIDAR_TOP ego pose") @ sensor_to_ego
-        start, end = self._sweep_interval(data, frame.info.scene_token)
-        trajectory = self._scene_trajectory(frame.info.scene_token)
-        if frame.point_timestamps_us is None or frame.raw_points is None:
-            if frame.ring_indices is None:
+        start, end = self._sweep_interval(data, frame.info.scene_id)
+        trajectory = self._scene_trajectory(frame.info.scene_id)
+        if frame.timing is None or frame.acquisition is None:
+            if frame.attributes.get("ring") is None:
                 raise DatasetError("Nominal point timing requires integer HDL-32E ring indices in the range 0–31.")
             try:
                 point_timestamps = nominal_point_timestamps(
-                    frame.points, frame.ring_indices, start, end, trajectory, sensor_to_ego,
+                    frame.points, frame.attributes["ring"], start, end, trajectory, sensor_to_ego,
                     azimuth_phase_rad=self._scene_nominal_phase(frame),
                     reference_sensor_to_world=sensor_to_world,
                 )
@@ -800,20 +840,38 @@ class NuScenesReader:
                 )
             except ValueError as exc:
                 raise DatasetError(f"Cannot prepare nominal point timing: {exc}") from exc
-            frame = replace(frame, point_timestamps_us=point_timestamps, raw_points=raw_points, lidar_timestamp_us=end)
-        if camera_rgb and frame.rgb_colors is None:
+            sources = (frame.source_id, "nuscenes:sample_data", "nuscenes:ego_pose", "nuscenes:calibrated_sensor")
+            frame = replace(
+                frame,
+                timing=frame.timing or PointTiming(
+                    point_timestamps, np.ones(len(frame.points), dtype=bool), TimingQuality.ESTIMATED,
+                    ProcessingProvenance("nuscenes.hdl32e.nominal_timing.v1", sources, _TIMING_ASSUMPTIONS),
+                ),
+                acquisition=frame.acquisition or AcquisitionGeometry(
+                    raw_points, np.ones(len(frame.points), dtype=bool), f"acquisition:LIDAR_TOP:{data['token']}",
+                    ProcessingProvenance("nuscenes.hdl32e.inverse_ego_compensation.v1", sources, _TIMING_ASSUMPTIONS),
+                ),
+            )
+        if camera_rgb and frame.rgb is None:
             from .projection import project_camera_rgb
 
             points_world = frame.points.astype(np.float64) @ sensor_to_world[:3, :3].T + sensor_to_world[:3, 3]
             try:
-                cameras = self._camera_observations(frame.info.scene_token, frame.point_timestamps_us)
+                cameras = self._camera_observations(frame.info.scene_id, frame.timing.timestamps_us)
                 colors, valid = project_camera_rgb(
-                    points_world, frame.point_timestamps_us, cameras,
+                    points_world, frame.timing.timestamps_us, cameras,
                     image_loader=self._load_camera_image, max_time_delta_us=_CAMERA_MAX_TIME_DELTA_US,
                 )
             except (OSError, ValueError, DatasetError) as exc:
                 raise DatasetError(
                     f"Cannot prepare camera RGB: {exc}. Extract nuScenes camera samples/sweeps under the dataset root."
                 ) from exc
-            frame = replace(frame, rgb_colors=colors, rgb_valid_mask=valid)
+            sources = (frame.source_id, "nuscenes:sample_data", "nuscenes:ego_pose", "nuscenes:calibrated_sensor", _CAMERA_SOURCE)
+            frame = replace(frame, rgb=PointColors(colors, valid, ProcessingProvenance(
+                "nuscenes.camera_projection.nominal_hdl32e.v1", sources,
+                _TIMING_ASSUMPTIONS + (
+                    "Native undistorted camera images use their recorded exposure poses and pinhole calibration.",
+                    "Depth competition is approximate; the validity mask identifies usable samples, not proven physical visibility.",
+                ),
+            )))
         return frame

@@ -86,18 +86,6 @@ class FilterConfig:
         object.__setattr__(self, "nms_iou_threshold", threshold)
         object.__setattr__(self, "nms_groups", groups)
 
-    def cache_key(self) -> tuple:
-        """Return a hashable policy key; frame/source revisions belong to callers."""
-
-        return (
-            self.score_threshold, tuple(sorted(self.per_class_scores.items())),
-            self.min_distance, self.max_distance, self.min_height, self.max_height,
-            self.pre_nms_limit, self.max_detections, self.nms_mode,
-            self.nms_iou_threshold, self.nms_groups,
-        )
-
-    def __hash__(self) -> int:
-        return hash(self.cache_key())
 
 
 @dataclass(frozen=True)
@@ -134,16 +122,11 @@ def filter_predictions(frame: PredictionFrame, config: FilterConfig) -> FilterRe
     if not isinstance(config, FilterConfig):
         raise TypeError("config must be a FilterConfig.")
     detections = tuple(frame.detections)
-    identifiers = [detection.identifier for detection in detections]
-    if any(not isinstance(identifier, str) or not identifier for identifier in identifiers):
-        raise ValueError("Detection identifiers must be nonempty strings.")
-    if len(set(identifiers)) != len(identifiers):
-        raise ValueError("Detection identifiers must be unique within a frame.")
     reasons = {}
     score_passing = []
     for detection in detections:
-        score = _number(detection.score, "Detection score", minimum=0, maximum=1)
-        threshold = config.per_class_scores.get(detection.box.class_name, config.score_threshold)
+        score = detection.score
+        threshold = config.per_class_scores.get(detection.box.class_id, config.score_threshold)
         if score >= threshold:
             score_passing.append(detection)
         else:
@@ -151,9 +134,7 @@ def filter_predictions(frame: PredictionFrame, config: FilterConfig) -> FilterRe
 
     spatial_passing = []
     for detection in score_passing:
-        center = np.asarray(detection.box.center, dtype=np.float64)
-        if center.shape != (3,) or not np.isfinite(center).all():
-            raise ValueError("Detection box center must be finite with shape (3,).")
+        center = detection.box.center
         distance = float(np.hypot(center[0], center[1]))
         if distance < config.min_distance or (config.max_distance is not None and distance > config.max_distance):
             reasons[detection.identifier] = "distance"

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import json
 import math
 from pathlib import Path
 from types import MappingProxyType
 
-from ..errors import DatasetConfigurationError
+from .errors import DatasetConfigurationError
 
 
 def _freeze_option(value):
@@ -30,7 +31,7 @@ def _freeze_option(value):
 def _path(value, base):
     try:
         if "://" in str(value):
-            raise DatasetConfigurationError("Version 1 dataset sources must be local filesystem paths.")
+            raise DatasetConfigurationError("Dataset sources must be local filesystem paths.")
         result = Path(value).expanduser()
         return (base / result).resolve() if not result.is_absolute() else result.resolve()
     except (TypeError, ValueError, OSError) as error:
@@ -63,3 +64,43 @@ class DatasetConfig:
             key: _path(value, root or base) for key, value in self.source_paths.items()
         }))
         object.__setattr__(self, "options", _freeze_option(self.options))
+
+
+def _unique_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise DatasetConfigurationError(f"Duplicate configuration key {key!r}.")
+        result[key] = value
+    return result
+
+
+def load_dataset_config(path: str | Path) -> DatasetConfig:
+    """Read a strict JSON configuration, resolving paths relative to its file.
+
+    The object accepts exactly the fields of :class:`DatasetConfig`. A relative
+    root is anchored to the configuration directory; relative named sources
+    are anchored to that root, or to the configuration directory without one.
+    Reading configuration does not import or construct a dataset provider.
+    """
+    config_path = _path(path, Path.cwd())
+    try:
+        values = json.loads(config_path.read_text(encoding="utf-8"), object_pairs_hook=_unique_keys)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise DatasetConfigurationError(f"Cannot read dataset configuration {config_path}: {error}") from error
+    if not isinstance(values, dict):
+        raise DatasetConfigurationError(f"Dataset configuration {config_path} must be a JSON object.")
+    unknown = set(values).difference({"root", "release", "storage_format", "source_paths", "options"})
+    if unknown:
+        raise DatasetConfigurationError(f"Unknown dataset configuration fields: {', '.join(sorted(unknown))}.")
+    root = values.get("root")
+    if root is not None:
+        root = _path(root, config_path.parent)
+        values["root"] = root
+    sources = values.get("source_paths", {})
+    if not isinstance(sources, Mapping):
+        raise DatasetConfigurationError("source_paths must be a JSON object.")
+    values["source_paths"] = {
+        key: _path(value, root or config_path.parent) for key, value in sources.items()
+    }
+    return DatasetConfig(**values)

@@ -7,20 +7,24 @@ from tkinter import ttk
 
 from PIL import Image, ImageTk
 
-from ..dataloader.models import CameraFrame, CameraInfo
+from dataset_utils import AnnotationStatus, CameraObservation
+
+from .layout import CameraSlot
 from ..processing.projection import ProjectedBox
 
 
 class CameraPanel(ttk.Frame):
-    def __init__(self, master: tk.Misc, info: CameraInfo):
+    def __init__(self, master: tk.Misc, info: CameraSlot):
         super().__init__(master, style="Camera.TFrame")
         self.info = info
-        self.camera: CameraFrame | None = None
+        self.camera: CameraObservation | None = None
         self.boxes: tuple[ProjectedBox, ...] = ()
         self.visible_classes: set[str] = set()
         self.class_colors: dict[str, str] = {}
         self.line_width = 2.0
         self.box_mode = "Projected 3D"
+        self.class_groups: dict[str, str] = {}
+        self.annotation_status = AnnotationStatus.NOT_PROVIDED
         self._image: Image.Image | None = None
         self._photo: ImageTk.PhotoImage | None = None
         self._photo_size: tuple[int, int] | None = None
@@ -32,19 +36,22 @@ class CameraPanel(ttk.Frame):
         self.canvas.bind("<Configure>", self._on_resize)
         self.canvas.bind("<Destroy>", self._on_destroy)
 
-    def set_frame(self, camera: CameraFrame | None, boxes: tuple[ProjectedBox, ...] = ()) -> None:
+    def set_frame(self, camera: CameraObservation | None, boxes: tuple[ProjectedBox, ...] = (),
+                  annotation_status: AnnotationStatus = AnnotationStatus.NOT_PROVIDED) -> None:
         self.camera = camera
+        self.annotation_status = annotation_status
         self.boxes = boxes
         self._image = None if camera is None else Image.fromarray(camera.image)
         self._photo = None
         self._photo_size = None
         self.redraw()
 
-    def set_style(self, visible_classes: set[str], class_colors: dict[str, str], line_width: float, box_mode: str) -> None:
+    def set_style(self, visible_classes: set[str], class_colors: dict[str, str], line_width: float, box_mode: str, class_groups: dict[str, str]) -> None:
         self.visible_classes = visible_classes
         self.class_colors = class_colors
         self.line_width = line_width
         self.box_mode = box_mode
+        self.class_groups = class_groups
         self.redraw()
 
     def _on_resize(self, _event: tk.Event) -> None:
@@ -80,13 +87,13 @@ class CameraPanel(ttk.Frame):
         self.canvas.create_image(offset_x, offset_y, image=self._photo, anchor="nw", tags="camera_image")
         # Rounding image dimensions can give slightly different axis scales.
         scale_x, scale_y = target[0] / self._image.width, target[1] / self._image.height
-        selected = [box for box in self.boxes if box.class_name in self.visible_classes]
+        selected = [box for box in self.boxes if self.class_groups.get(box.class_id, box.class_id) in self.visible_classes]
         count = len(selected)
-        annotation_text = {"withheld": "Ground truth withheld", "not_provided": "Annotations not provided"}.get(self.camera.annotation_status)
+        annotation_text = {"withheld": "Ground truth withheld", "not_provided": "Annotations not provided"}.get(self.annotation_status)
         box_text = f"{count} {'box' if count == 1 else 'boxes'}"
         self.header.configure(text=f"{self.info.label}   ·   {annotation_text or box_text}")
         for box in selected:
-            color = self.class_colors.get(box.class_name, "#00aaff")
+            color = self.class_colors.get(self.class_groups.get(box.class_id, box.class_id), "#00aaff")
             if self.box_mode == "2D rectangles":
                 left, top, right, bottom = box.rectangle
                 self.canvas.create_rectangle(

@@ -1,16 +1,30 @@
-"""GUI-independent dataset readers and the version-1 extension contract."""
+"""Dataset adapters and shared records for research visualization."""
 
-from .contracts import *
-from .contracts import __all__ as _contract_exports
+from .config import DatasetConfig, load_dataset_config
+from .dataset import DatasetLoader
 from .errors import (
     DataUnavailableError, DatasetClosedError, DatasetConfigurationError,
-    DatasetError, DatasetIOError, DatasetValidationError,
-    UnknownIdentifierError, UnsupportedCapabilityError,
+    DatasetError, DatasetIOError, DatasetValidationError, UnknownIdentifierError,
+    UnsupportedCapabilityError,
 )
+from .models import (
+    AcquisitionGeometry, AnnotationAlignment, AnnotationSet, AnnotationStatus,
+    AnnotationTiming, Box3D, CameraFrameSet, CameraObservation, Capability,
+    ClassInfo, DatasetMetadata, FrameInfo, Modality, PointCloudFrame,
+    PointCloudPreparation, PointColors, PointTiming, ProcessingProvenance,
+    ProjectionModel, ProjectionResult, SceneInfo, SensorInfo, TimingQuality,
+)
+from .projection import PinholeProjection
+from .registry import available_loaders, create_loader, register_loader
 
-__version__ = "0.2.0"
-__all__ = list(_contract_exports) + [
-    "DataUnavailableError", "DatasetClosedError", "DatasetConfigurationError",
-    "DatasetError", "DatasetIOError", "DatasetValidationError",
-    "UnknownIdentifierError", "UnsupportedCapabilityError",
+__version__ = "0.3.0"
+
+__all__ = [
+    "DatasetConfig", "load_dataset_config", "DatasetLoader", "available_loaders", "create_loader", "register_loader",
+    "DataUnavailableError", "DatasetClosedError", "DatasetConfigurationError", "DatasetError",
+    "DatasetIOError", "DatasetValidationError", "UnknownIdentifierError", "UnsupportedCapabilityError",
+    "AcquisitionGeometry", "AnnotationAlignment", "AnnotationSet", "AnnotationStatus", "AnnotationTiming",
+    "Box3D", "CameraFrameSet", "CameraObservation", "Capability", "ClassInfo", "DatasetMetadata", "FrameInfo",
+    "Modality", "PointCloudFrame", "PointCloudPreparation", "PointColors", "PointTiming", "ProcessingProvenance",
+    "ProjectionModel", "ProjectionResult", "SceneInfo", "SensorInfo", "TimingQuality", "PinholeProjection",
 ]

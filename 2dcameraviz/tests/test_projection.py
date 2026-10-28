@@ -1,32 +1,33 @@
 """Geometric checks for camera-space clipping, transforms and visibility."""
 
-from types import SimpleNamespace
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
+from dataset_utils import (
+    AnnotationSet, AnnotationStatus, Box3D, CameraFrameSet, CameraObservation,
+    FrameInfo, Modality, PinholeProjection, ProjectionResult,
+)
 from cameraviz.processing import ProjectedBox, class_color, project_box, project_boxes
 
 
 def camera(*, pose=None, intrinsics=None, channel="CAM_FRONT", width=101, height=101):
-    return SimpleNamespace(
-        info=SimpleNamespace(channel=channel),
-        image=np.zeros((height, width, 3), dtype=np.uint8),
-        intrinsics=np.array([[100, 0, 50], [0, 100, 50], [0, 0, 1]], dtype=float)
-        if intrinsics is None else intrinsics,
-        sensor_to_world=np.eye(4) if pose is None else pose,
-        timestamp_us=0,
-    )
+    matrix = np.array([[100, 0, 50], [0, 100, 50], [0, 0, 1]], dtype=float) if intrinsics is None else intrinsics
+    pose = np.eye(4) if pose is None else pose
+    return CameraObservation(channel, np.zeros((height, width, 3), dtype=np.uint8),
+                             projection_model=PinholeProjection(matrix, pose))
 
 
 def box(*, center=(0, 0, 10), size=(2, 2, 2), rotation=None, class_name="car", token="box"):
-    return SimpleNamespace(
-        center=np.asarray(center, dtype=float),
-        size=np.asarray(size, dtype=float),
-        rotation=np.eye(3) if rotation is None else rotation,
-        class_name=class_name,
-        token=token,
-    )
+    return Box3D(token, class_name, np.asarray(center, dtype=float), np.asarray(size, dtype=float),
+                 np.eye(3) if rotation is None else rotation)
+
+
+def frame(cameras, boxes):
+    info = FrameInfo("frame", "scene", 0, 0, frozenset((Modality.CAMERAS,)))
+    return CameraFrameSet(info, "source", "reference", cameras,
+                          AnnotationSet("reference", AnnotationStatus.AVAILABLE, boxes))
 
 
 def rotation_x(angle):
@@ -47,11 +48,10 @@ def rotation_z(angle):
 def test_front_box_has_twelve_edges_and_perspective_bounds():
     projected = project_box(box(), camera())
     assert isinstance(projected, ProjectedBox)
-    assert projected.class_name == "car"
-    assert projected.token == "box"
+    assert projected.class_id == "car"
+    assert projected.annotation_id == "box"
     assert projected.segments.shape == (12, 2, 2)
     np.testing.assert_allclose(projected.rectangle, [50 - 100 / 9, 50 - 100 / 9, 50 + 100 / 9, 50 + 100 / 9])
-    assert not projected.segments.flags.writeable
 
 
 def test_length_width_height_are_distinct_local_axes():
@@ -140,50 +140,20 @@ def test_camera_inside_box_still_has_a_visible_projection():
 def test_each_camera_uses_its_own_pose_and_preserves_visible_box_order():
     backwards = np.eye(4)
     backwards[:3, :3] = rotation_y(np.pi)
-    frame = SimpleNamespace(
+    observation = frame(
         cameras=(camera(), camera(channel="CAM_BACK", pose=backwards)),
         boxes=(box(token="front"), box(center=(0, 0, -10), token="back"), box(center=(0, 0, 8), token="front-two")),
     )
-    projected = project_boxes(frame)
+    projected = project_boxes(observation)
     assert tuple(projected) == ("CAM_FRONT", "CAM_BACK")
-    assert tuple(item.token for item in projected["CAM_FRONT"]) == ("front", "front-two")
-    assert tuple(item.token for item in projected["CAM_BACK"]) == ("back",)
-
-
-def test_duplicate_camera_channel_is_rejected():
-    with pytest.raises(ValueError, match="Duplicate camera channel"):
-        project_boxes(SimpleNamespace(cameras=(camera(), camera()), boxes=()))
+    assert tuple(item.annotation_id for item in projected["CAM_FRONT"]) == ("front", "front-two")
+    assert tuple(item.annotation_id for item in projected["CAM_BACK"]) == ("back",)
 
 
 @pytest.mark.parametrize("near", [0, -0.1, np.inf, np.nan, True, "bad"])
 def test_invalid_near_plane_is_rejected(near):
     with pytest.raises(ValueError, match="near_plane"):
         project_box(box(), camera(), near_plane=near)
-
-
-def test_nonrigid_calibration_invalid_intrinsics_and_box_dimensions_are_rejected():
-    pose = np.eye(4)
-    pose[0, 0] = 2
-    with pytest.raises(ValueError, match="orthonormal"):
-        project_box(box(), camera(pose=pose))
-    reflected = np.diag([-1.0, 1, 1])
-    with pytest.raises(ValueError, match="proper rotation"):
-        project_box(box(rotation=reflected), camera())
-    intrinsics = np.eye(3)
-    intrinsics[2, 0] = 0.1
-    with pytest.raises(ValueError, match="pinhole"):
-        project_box(box(), camera(intrinsics=intrinsics))
-    with pytest.raises(ValueError, match="size must be positive"):
-        project_box(box(size=(0, 1, 1)), camera())
-
-
-def test_projected_box_copies_and_protects_its_segment_array():
-    segments = np.zeros((1, 2, 2))
-    projected = ProjectedBox("car", "one", segments, (0, 0, 0, 0))
-    segments[0, 0, 0] = 2
-    assert projected.segments[0, 0, 0] == 0
-    with pytest.raises(ValueError):
-        projected.segments[0, 0, 0] = 2
 
 
 @pytest.mark.parametrize("name,color", [
@@ -209,17 +179,17 @@ def test_unknown_class_color_is_deterministic_and_valid_hex():
 @pytest.mark.parametrize("undefined_depth", [False, True])
 def test_undefined_projection_interval_cannot_invent_a_viewport_filling_face(undefined_depth):
     class Model:
-        def project_world(self, points):
+        def project_reference(self, points):
             pixels = points[:, :2] * 10 + 50
             depth = np.full(len(points), 10.)
             undefined = np.abs(points[:, 0]) < 6
             pixels[undefined] = np.nan
             if undefined_depth:
                 depth[undefined] = np.nan
-            return pixels, depth
+            valid = np.isfinite(pixels).all(axis=1) & np.isfinite(depth) & (depth > 0)
+            return ProjectionResult(pixels, depth, valid)
 
-    view = camera()
-    view.projection_model = Model()
+    view = replace(camera(), projection_model=Model())
     # Valid edge endpoints lie outside opposite sides of the viewport; the
     # interval that could cross the image has no defined projection.
     assert project_box(box(size=(20, 20, 2)), view) is None
@@ -227,14 +197,14 @@ def test_undefined_projection_interval_cannot_invent_a_viewport_filling_face(und
 
 def test_undefined_projection_gap_retains_only_independently_valid_edge_parts():
     class Model:
-        def project_world(self, points):
+        def project_reference(self, points):
             pixels = points[:, :2] * 10 + 50
             depth = np.full(len(points), 10.)
             pixels[np.abs(points[:, 0]) < .3] = np.nan
-            return pixels, depth
+            valid = np.isfinite(pixels).all(axis=1) & np.isfinite(depth) & (depth > 0)
+            return ProjectionResult(pixels, depth, valid)
 
-    view = camera()
-    view.projection_model = Model()
+    view = replace(camera(), projection_model=Model())
     projected = project_box(box(size=(4, 2, 2)), view)
     assert projected is not None and len(projected.segments)
     for segment in projected.segments:

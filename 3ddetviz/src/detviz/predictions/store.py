@@ -16,14 +16,14 @@ from typing import Callable
 
 import numpy as np
 
-from threedviz.dataloader.models import BoundingBox3D
+from dataset_utils import Box3D, DatasetValidationError
 
 from .base import PredictionSource
 from .models import Detection, PredictionCancelled, PredictionError, PredictionFrame, PredictionInfo
 
 Progress = Callable[[float, str], None]
 Cancelled = Callable[[], bool]
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 _PRODUCER_NOTE = (
     "Typical nuScenes/OpenPCDet evaluation files already contain score-filtered and NMS-filtered detections. "
     "The processing stage is unknown unless explicitly declared; filters operate on the saved boxes."
@@ -80,15 +80,8 @@ def source_info(path: Path, format_name: str, coordinate_frame: str, embedded: d
 
 def cache_path(path: Path, format_name: str, cache_dir: str | Path | None, sidecar_path: Path | None, cancelled=None) -> Path:
     stat = path.stat()
-    identity = [str(path), format_name, _CACHE_VERSION, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
-    # Some dataset/export filesystems expose only whole-second modification
-    # times. A content digest also catches same-size overwrites within a second.
-    content = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1_048_576):
-            check_cancelled(cancelled)
-            content.update(chunk)
-    identity.append(content.hexdigest())
+    identity = [str(path.resolve()), format_name, _CACHE_VERSION, stat.st_dev, stat.st_ino,
+                stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
     if sidecar_path is not None:
         identity.append(sidecar_path.read_text(encoding="utf-8"))
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
@@ -147,8 +140,8 @@ def canonical_row(token: str, index: int, *, center, size, rotation, class_name,
 
 def frame_from_rows(token: str, rows: list) -> PredictionFrame:
     return PredictionFrame(token, tuple(
-        Detection(BoundingBox3D(np.array(row[0]), np.array(row[1]), np.array(row[2]), row[3], row[5]),
-                  row[4], row[5], None if row[6] is None else np.array(row[6]))
+        Detection(Box3D(row[5], row[3], row[0], row[1], row[2]),
+                  row[4], row[5], row[6])
         for row in rows
     ))
 
@@ -162,8 +155,6 @@ class SQLitePredictionSource(PredictionSource):
         self._lock = threading.RLock()
         try:
             with closing(self._connect()) as connection:
-                if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                    raise PredictionError("Prediction cache is corrupt.")
                 metadata = json.loads(connection.execute("SELECT value FROM metadata WHERE key='source'").fetchone()[0])
                 if metadata["cache_version"] != _CACHE_VERSION:
                     raise PredictionError("Prediction cache version is incompatible.")
@@ -201,7 +192,7 @@ class SQLitePredictionSource(PredictionSource):
             return None
         try:
             return frame_from_rows(token, json.loads(zlib.decompress(record[0])))
-        except (ValueError, TypeError, IndexError, zlib.error) as exc:
+        except (DatasetValidationError, ValueError, TypeError, IndexError, zlib.error) as exc:
             raise PredictionError(f"Invalid cached predictions for {token!r}: {exc}") from exc
 
     def close(self) -> None:

@@ -8,7 +8,12 @@ import textwrap
 
 from open3d.visualization import gui, rendering
 
-from threedviz.dataloader import DatasetAdapter, available_datasets, create_dataset
+from dataset_utils import (
+    Capability, DatasetConfig, DatasetLoader, Modality, PointCloudPreparation,
+    UnsupportedCapabilityError,
+)
+
+from threedviz.dataloader import available_datasets, create_dataset
 from threedviz.processing import COLOR_SCHEMES, class_color
 from threedviz.visualization.renderer import SceneRenderer
 
@@ -20,8 +25,14 @@ def _discard_loaded_dataset(future, active_adapter):
         result = future.result()
     except Exception:
         return
-    if isinstance(result, tuple) and result and isinstance(result[0], DatasetAdapter) and result[0] is not active_adapter:
+    if isinstance(result, tuple) and result and isinstance(result[0], DatasetLoader) and result[0] is not active_adapter:
         result[0].close()
+
+
+def _supports_acquisition_geometry(loader):
+    metadata = loader.metadata
+    return (Capability.ACQUISITION_GEOMETRY in metadata.capabilities
+            and metadata.feature_coverage.get(Capability.ACQUISITION_GEOMETRY, "full") != "partial")
 
 
 class ViewerWindow:
@@ -38,6 +49,7 @@ class ViewerWindow:
         frame=0,
         autoload=False,
         split="all",
+        config: DatasetConfig | None = None,
     ):
         self.application = gui.Application.instance
         self.window = self.application.create_window(self.window_title, 1440, 900)
@@ -54,6 +66,7 @@ class ViewerWindow:
         self._dataset_split = split
         self._active_dataset_split = "all"
         self._active_dataset_spec = None
+        self._dataset_config = config
         self._ui_dataset_name = dataset
         self._class_checkboxes = {}
         self._class_count_labels = {}
@@ -222,6 +235,8 @@ class ViewerWindow:
         return boxes
 
     def _create_dataset_adapter(self, name, root, version):
+        if self._dataset_config is not None:
+            return create_dataset(name, config=self._dataset_config)
         return create_dataset(name, root=root, version=version)
 
     def _render_loaded_frame(self, data, *, reset_camera=False):
@@ -241,15 +256,20 @@ class ViewerWindow:
                 self.dataset_split_choice.clear_items()
                 self.dataset_split_choice.add_item("all")
                 self.dataset_split_choice.selected_text = "all"
-        has_root = name != "demo"
+        has_root = name != "demo" and self._dataset_config is None
+        self.dataset_choice.enabled = self._dataset_config is None
         self.root_edit.enabled = has_root
         self.browse_button.enabled = has_root
         self.version_edit.enabled = has_root and name != "waymo"
         self.version_edit.visible = self.version_label.visible = name != "waymo"
         self.root_edit.tooltip = (
             "Waymo dataset root, OpenPCDet workspace, or processed sequence directory"
-            if name == "waymo" else "Folder containing samples/ and a nuScenes version folder"
+            if name == "waymo" else "Dataset root; layout is defined by the selected provider"
         )
+        if self._dataset_config is not None:
+            self.root_edit.text_value = str(self._dataset_config.root or "")
+            self.version_edit.text_value = self._dataset_config.release or ""
+            self.root_edit.tooltip = "Dataset sources are supplied by --dataset-config"
         self.window.set_needs_layout()
 
     def _browse(self):
@@ -266,9 +286,10 @@ class ViewerWindow:
     def _set_busy(self, busy):
         self._busy = busy
         name = self.dataset_choice.selected_text
-        self.dataset_choice.enabled = not busy
-        self.root_edit.enabled = self.browse_button.enabled = not busy and name != "demo"
-        self.version_edit.enabled = not busy and name not in ("demo", "waymo")
+        editable = not busy and self._dataset_config is None
+        self.dataset_choice.enabled = editable
+        self.root_edit.enabled = self.browse_button.enabled = editable and name != "demo"
+        self.version_edit.enabled = editable and name not in ("demo", "waymo")
         self.load_button.enabled = not busy
         self.scene_choice.enabled = not busy and bool(self._scenes)
         self.frame_slider.enabled = not busy and len(self._frames) > 1
@@ -278,7 +299,7 @@ class ViewerWindow:
         self.next_button.enabled = not busy and self._frame_index + 1 < len(self._frames)
         self.color_choice.enabled = not busy
         self.raw_checkbox.enabled = (
-            not busy and self._adapter is not None and self._adapter.supports_acquisition_geometry
+            not busy and self._adapter is not None and _supports_acquisition_geometry(self._adapter)
         )
 
     def _submit(self, job, on_success, message, *, on_error=None):
@@ -331,23 +352,22 @@ class ViewerWindow:
         def job():
             adapter = self._create_dataset_adapter(name, root, version)
             try:
-                scenes = adapter.list_scenes() if split == "all" else adapter.list_scenes_for_split(split)
+                scenes = self._list_point_scenes(adapter, split)
                 if not scenes:
                     raise ValueError("This dataset contains no scenes with LiDAR keyframes.")
                 scene_index = 0
                 if initial_scene is not None:
-                    matches = [i for i, item in enumerate(scenes) if initial_scene in (item.name, item.token)]
+                    matches = [i for i, item in enumerate(scenes) if initial_scene in (item.display_name, item.scene_id)]
                     if not matches:
                         raise ValueError(f"Scene {initial_scene!r} was not found in this dataset.")
                     scene_index = matches[0]
-                frames = adapter.list_frames(scenes[scene_index].token)
+                frames = adapter.list_frames(scenes[scene_index].scene_id, modality=Modality.POINT_CLOUD)
                 if not 0 <= initial_frame < len(frames):
                     raise ValueError(f"Frame index must be between 0 and {len(frames) - 1} for this scene.")
-                data = adapter.load_frame(frames[initial_frame].token)
-                data = adapter.prepare_frame(
-                    data,
-                    camera_rgb=mode == "camera_rgb" and adapter.supports_camera_rgb,
-                    point_timing=raw and adapter.supports_acquisition_geometry,
+                display_mode = mode if mode != "camera_rgb" or Capability.RGB_COLORING in adapter.metadata.capabilities else "gray"
+                data = self._load_prepared_frame(
+                    adapter, frames[initial_frame].frame_id, display_mode,
+                    raw and _supports_acquisition_geometry(adapter),
                 )
                 return adapter, scenes, scene_index, frames, initial_frame, data
             except Exception:
@@ -357,9 +377,15 @@ class ViewerWindow:
         def loaded(result):
             adapter, scenes, scene_index, frames, frame_index, data = result
             previous_adapter = self._adapter
-            display_mode = mode if mode != "camera_rgb" or adapter.supports_camera_rgb else "gray"
-            display_raw = raw and adapter.supports_acquisition_geometry
-            self._render_point_display(data, display_mode, display_raw, reset_camera=True)
+            display_mode = mode if mode != "camera_rgb" or (Capability.RGB_COLORING in adapter.metadata.capabilities) else "gray"
+            display_raw = raw and _supports_acquisition_geometry(adapter)
+            previous_labels = self.renderer.class_labels
+            self.renderer.set_class_labels(self._dataset_class_labels(adapter))
+            try:
+                self._render_point_display(data, display_mode, display_raw, reset_camera=True)
+            except Exception:
+                self.renderer.set_class_labels(previous_labels)
+                raise
             self._adapter, self._scenes = adapter, scenes
             self._active_dataset_spec = source
             self._dataset_split = self._active_dataset_split = split
@@ -368,9 +394,9 @@ class ViewerWindow:
             self._frame_index = frame_index
             self.scene_choice.clear_items()
             for item in scenes:
-                self.scene_choice.add_item(item.name)
+                self.scene_choice.add_item(item.display_name)
             self.scene_choice.selected_index = scene_index
-            self._rebuild_classes(adapter.class_names)
+            self._rebuild_classes(tuple(dict.fromkeys(self._dataset_class_labels(adapter).values())))
             self._configure_color_choices()
             self.renderer.update_boxes()
             self._update_frame_controls(data)
@@ -397,7 +423,7 @@ class ViewerWindow:
         if not hasattr(self, "dataset_split_choice") or self._adapter is None:
             return
         self.dataset_split_choice.clear_items()
-        for split in dict.fromkeys((self._dataset_split, *self._adapter.available_splits)):
+        for split in dict.fromkeys((self._dataset_split, *self._adapter.metadata.splits)):
             self.dataset_split_choice.add_item(split)
         self.dataset_split_choice.selected_text = self._dataset_split
 
@@ -418,13 +444,13 @@ class ViewerWindow:
         adapter, previous = self._adapter, self._dataset_split
         mode, raw = self.renderer.settings.color_scheme, self.renderer.settings.use_raw_points
         def job():
-            scenes = adapter.list_scenes_for_split(name)
+            scenes = self._list_point_scenes(adapter, name)
             if not scenes:
                 raise ValueError(f"No installed scenes belong to split {name!r}.")
-            frames = adapter.list_frames(scenes[0].token)
+            frames = adapter.list_frames(scenes[0].scene_id, modality=Modality.POINT_CLOUD)
             if not frames:
                 raise ValueError("This scene has no LiDAR frames.")
-            return scenes, frames, self._load_prepared_frame(adapter, frames[0].token, mode, raw)
+            return scenes, frames, self._load_prepared_frame(adapter, frames[0].frame_id, mode, raw)
         def loaded(result):
             scenes, frames, data = result
             self._render_loaded_frame(data, reset_camera=True)
@@ -433,7 +459,7 @@ class ViewerWindow:
             self._scene_index = self._frame_index = 0
             self.scene_choice.clear_items()
             for scene in scenes:
-                self.scene_choice.add_item(scene.name)
+                self.scene_choice.add_item(scene.display_name)
             self.scene_choice.selected_index = 0
             self._update_split_choices()
             self._update_frame_controls(data)
@@ -446,14 +472,14 @@ class ViewerWindow:
         if self._busy or self._adapter is None or index == self._scene_index:
             return
         adapter = self._adapter
-        token = self._scenes[index].token
+        token = self._scenes[index].scene_id
         mode, raw = self.renderer.settings.color_scheme, self.renderer.settings.use_raw_points
 
         def job():
-            frames = adapter.list_frames(token)
+            frames = adapter.list_frames(token, modality=Modality.POINT_CLOUD)
             if not frames:
                 raise ValueError("This scene has no LiDAR keyframes.")
-            data = self._load_prepared_frame(adapter, frames[0].token, mode, raw)
+            data = self._load_prepared_frame(adapter, frames[0].frame_id, mode, raw)
             return frames, data
 
         def loaded(result):
@@ -474,7 +500,7 @@ class ViewerWindow:
             return
         if not 0 <= index < len(self._frames):
             return
-        adapter, token = self._adapter, self._frames[index].token
+        adapter, token = self._adapter, self._frames[index].frame_id
         mode, raw = self.renderer.settings.color_scheme, self.renderer.settings.use_raw_points
 
         def loaded(data):
@@ -488,10 +514,33 @@ class ViewerWindow:
             f"Loading frame {index + 1}…",
         )
 
+    def _dataset_class_labels(self, loader):
+        """Translate class IDs only at the presentation boundary."""
+        return {item.class_id: item.display_group or item.display_name for item in loader.metadata.classes}
+
     @staticmethod
-    def _load_prepared_frame(adapter, token, mode, raw):
-        frame = adapter.load_frame(token)
-        return adapter.prepare_frame(frame, camera_rgb=mode == "camera_rgb", point_timing=raw)
+    def _list_point_scenes(loader, split):
+        return tuple(scene for scene in loader.list_scenes(split=split)
+                     if scene.frame_counts.get(Modality.POINT_CLOUD) != 0)
+
+    def _load_prepared_frame(self, loader, frame_id, mode, raw):
+        frame = loader.load_point_cloud(frame_id)
+        return self._prepare_frame(loader, frame, mode, raw)
+
+    def _prepare_frame(self, loader, frame, mode, raw):
+        needs_rgb = mode == "camera_rgb" and frame.rgb is None
+        needs_raw = raw and frame.acquisition is None
+        if not needs_rgb and not needs_raw:
+            return frame
+        if needs_raw and not _supports_acquisition_geometry(loader):
+            raise UnsupportedCapabilityError("Full acquisition-time geometry is unavailable for this dataset.")
+        result = loader.prepare_point_cloud(frame, request=PointCloudPreparation(
+            rgb=needs_rgb, acquisition_geometry=needs_raw,
+            timestamps=needs_raw and Capability.POINT_TIMESTAMPS in loader.metadata.capabilities,
+        ))
+        if needs_raw and (result.acquisition is None or not result.acquisition.valid_mask.all()):
+            raise UnsupportedCapabilityError("Acquisition-time geometry covers only part of this scan.")
+        return result
 
     def _restore_navigation(self):
         if self._scenes:
@@ -501,15 +550,15 @@ class ViewerWindow:
 
     def _update_frame_controls(self, data):
         scene = self._scenes[self._scene_index]
-        self.scene_description.text = textwrap.fill(scene.description or scene.name, width=42)
+        self.scene_description.text = textwrap.fill(scene.description or scene.display_name, width=42)
         self.frame_slider.set_limits(0, max(1, len(self._frames) - 1))
         self.frame_slider.int_value = self._frame_index
         current, first = data.info.timestamp_us, self._frames[0].timestamp_us
         elapsed = "time unknown" if current is None or first is None else f"{(current - first) / 1_000_000:.2f} s"
         self.frame_label.text = f"Frame {self._frame_index + 1} / {len(self._frames)} · {elapsed}"
-        self.frame_label.tooltip = data.info.token
-        annotation_text = {"withheld": "Ground truth withheld", "not_provided": "Annotations not provided"}.get(data.annotation_status)
-        self.status.text = f"{len(data.points):,} points · {annotation_text or f'{len(data.boxes)} boxes'}"
+        self.frame_label.tooltip = data.info.frame_id
+        annotation_text = {"withheld": "Ground truth withheld", "not_provided": "Annotations not provided"}.get(data.annotations.status.value)
+        self.status.text = f"{len(data.points):,} points · {annotation_text or f'{len(data.annotations.boxes)} boxes'}"
         self._update_color_controls()
         self._update_class_counts()
         self.window.set_needs_layout()
@@ -549,10 +598,11 @@ class ViewerWindow:
         if self.renderer.frame is None:
             return
         counts = {}
-        for box in self.renderer.frame.boxes:
-            counts[box.class_name] = counts.get(box.class_name, 0) + 1
+        for box in self.renderer.frame.annotations.boxes:
+            label = self.renderer.class_label(box.class_id)
+            counts[label] = counts.get(label, 0) + 1
         for name, label in self._class_count_labels.items():
-            label.text = "(—)" if self.renderer.frame.annotation_status in ("withheld", "not_provided") else f"({counts.get(name, 0)})"
+            label.text = "(—)" if self.renderer.frame.annotations.status.value in ("withheld", "not_provided") else f"({counts.get(name, 0)})"
 
     def _on_class_checked(self, name, checked):
         if checked:
@@ -602,7 +652,7 @@ class ViewerWindow:
         self.color_choice.clear_items()
         for mode in COLOR_SCHEMES:
             self.color_choice.add_item(mode)
-        if self._adapter.supports_camera_rgb:
+        if (Capability.RGB_COLORING in self._adapter.metadata.capabilities):
             self.color_choice.add_item("Camera RGB")
         self._update_color_controls()
 
@@ -615,8 +665,8 @@ class ViewerWindow:
         self.raw_checkbox.checked = settings.use_raw_points
         self.raw_hint.visible = settings.use_raw_points
         frame = self.renderer.frame
-        if is_rgb and frame is not None and frame.rgb_valid_mask is not None:
-            count = int(frame.rgb_valid_mask.sum())
+        if is_rgb and frame is not None and frame.rgb is not None:
+            count = int(frame.rgb.valid_mask.sum())
             self.color_status.text = f"Camera RGB: {count:,} / {len(frame.points):,} points\nUnmatched points use gray."
         else:
             self.color_status.text = ""
@@ -650,11 +700,11 @@ class ViewerWindow:
             self._render_point_display(data, mode, raw)
             self._update_frame_controls(data)
 
-        needs_rgb = mode == "camera_rgb" and frame.rgb_colors is None
-        needs_timing = raw and frame.raw_points is None
+        needs_rgb = mode == "camera_rgb" and frame.rgb is None
+        needs_timing = raw and frame.acquisition is None
         if needs_rgb or needs_timing:
             self._submit(
-                lambda: adapter.prepare_frame(frame, camera_rgb=needs_rgb, point_timing=needs_timing),
+                lambda: self._prepare_frame(adapter, frame, mode, raw),
                 loaded,
                 "Preparing point colors and acquisition times…",
                 on_error=self._update_color_controls,
@@ -699,13 +749,15 @@ class ViewerWindow:
 
 
 def run_app(
-    *, dataset="nuscenes", root=None, version="v1.0-mini", scene=None, frame=0, autoload=False, split="all"
+    *, dataset="nuscenes", root=None, version="v1.0-mini", scene=None, frame=0, autoload=False, split="all",
+    config: DatasetConfig | None = None,
 ):
     application = gui.Application.instance
     application.initialize()
     # Retain the controller while the native event loop owns its window.
     viewer = ViewerWindow(
-        dataset=dataset, root=root, version=version, scene=scene, frame=frame, autoload=autoload, split=split
+        dataset=dataset, root=root, version=version, scene=scene, frame=frame, autoload=autoload, split=split,
+        config=config,
     )
     try:
         application.run()

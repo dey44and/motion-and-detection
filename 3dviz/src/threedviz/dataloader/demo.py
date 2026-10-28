@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 
-from .base import DatasetAdapter, DatasetError
-from .models import BoundingBox3D, FrameData, FrameInfo, SceneInfo
-from .nuscenes import DETECTION_CLASSES
+from dataset_utils import (
+    AnnotationSet, AnnotationStatus, Box3D, Capability, ClassInfo, DatasetConfig,
+    DatasetLoader, DatasetMetadata, FrameInfo, Modality, PointCloudFrame,
+    SceneInfo, SensorInfo, UnknownIdentifierError,
+)
+
+
+DEMO_CLASSES = (
+    "car", "truck", "construction_vehicle", "bus", "trailer", "barrier",
+    "motorcycle", "bicycle", "pedestrian", "traffic_cone",
+)
 
 
 def _yaw_matrix(yaw: float) -> np.ndarray:
@@ -16,48 +22,53 @@ def _yaw_matrix(yaw: float) -> np.ndarray:
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
-class DemoAdapter(DatasetAdapter):
+class DemoLoader(DatasetLoader):
     """Two scenes with 36 frames each, generated lazily from fixed RNG seeds."""
 
-    def __init__(self, *, root: str | Path | None = None, version: str = "v1.0-mini"):
+    def __init__(self, config: DatasetConfig | None = None):
+        super().__init__(DatasetConfig() if config is None else config)
+        self._metadata = DatasetMetadata(
+            "demo", "Synthetic driving scenes", {Capability.POINT_CLOUD, Capability.BOXES_3D},
+            classes=tuple(ClassInfo(name, name, name) for name in DEMO_CLASSES),
+            sensors=(SensorInfo("lidar", Modality.POINT_CLOUD, "Synthetic LiDAR"),),
+            splits=("all", "val", "mini_val"), clock_domain="synthetic microseconds",
+        )
         self._scenes = (
-            SceneInfo("demo-urban", "Demo: city street", "Synthetic traffic, pedestrians and roadside objects.", 36),
-            SceneInfo("demo-highway", "Demo: highway", "Synthetic vehicles and a roadside construction area.", 36),
+            SceneInfo("demo-urban", "Demo: city street", "Synthetic traffic, pedestrians and roadside objects.",
+                      frame_counts={Modality.POINT_CLOUD: 36}),
+            SceneInfo("demo-highway", "Demo: highway", "Synthetic vehicles and a roadside construction area.",
+                      frame_counts={Modality.POINT_CLOUD: 36}),
         )
         self._frames_by_scene = {
-            scene.token: tuple(
-                FrameInfo(f"{scene.token}-{index:03d}", scene.token, index, index * 500_000)
-                for index in range(scene.frame_count)
+            scene.scene_id: tuple(
+                FrameInfo(f"{scene.scene_id}-{index:03d}", scene.scene_id, index, index * 500_000,
+                          frozenset((Modality.POINT_CLOUD,)))
+                for index in range(36)
             ) for scene in self._scenes
         }
         self._frames = {
-            frame.token: frame for frames in self._frames_by_scene.values() for frame in frames
+            frame.frame_id: frame for frames in self._frames_by_scene.values() for frame in frames
         }
 
     @property
-    def class_names(self) -> tuple[str, ...]:
-        return DETECTION_CLASSES
+    def metadata(self) -> DatasetMetadata:
+        return self._metadata
 
-    def list_scenes(self) -> tuple[SceneInfo, ...]:
+    def _list_scenes(self, *, split: str = "all") -> tuple[SceneInfo, ...]:
         return self._scenes
 
-    def list_scenes_for_split(self, split: str = "all") -> tuple[SceneInfo, ...]:
-        if isinstance(split, str) and split.strip().lower() in {"all", "val", "mini_val"}:
-            return self._scenes
-        raise DatasetError(f"Demo data supports all, val and mini_val splits, not {split!r}.")
-
-    def list_frames(self, scene_token: str) -> tuple[FrameInfo, ...]:
+    def _list_frames(self, scene_id: str, *, modality: Modality) -> tuple[FrameInfo, ...]:
         try:
-            return self._frames_by_scene[scene_token]
+            return self._frames_by_scene[scene_id]
         except KeyError:
-            raise DatasetError(f"Unknown demo scene {scene_token!r}.") from None
+            raise UnknownIdentifierError(f"Unknown demo scene {scene_id!r}.") from None
 
-    def load_frame(self, frame_token: str) -> FrameData:
+    def _load_point_cloud(self, frame_id: str) -> PointCloudFrame:
         try:
-            info = self._frames[frame_token]
+            info = self._frames[frame_id]
         except KeyError:
-            raise DatasetError(f"Unknown demo frame {frame_token!r}.") from None
-        highway = info.scene_token == "demo-highway"
+            raise UnknownIdentifierError(f"Unknown demo frame {frame_id!r}.") from None
+        highway = info.scene_id == "demo-highway"
         rng = np.random.default_rng(1050 + (1000 if highway else 0) + info.index)
         ground_z = -1.8
         shift = 3 * np.sin(info.index / 8)
@@ -81,12 +92,12 @@ class DemoAdapter(DatasetAdapter):
             ]
 
         boxes = tuple(
-            BoundingBox3D(
+            Box3D(
+                annotation_id=f"{info.scene_id}-object-{index}",
+                class_id=class_name,
                 center=np.array([xy[0], xy[1], ground_z + size[2] / 2]),
                 size=np.array(size),
                 rotation=_yaw_matrix(yaw),
-                class_name=class_name,
-                token=f"{info.scene_token}-object-{index}",
             ) for index, (class_name, xy, size, yaw) in enumerate(objects)
         )
         ground = np.column_stack((
@@ -109,5 +120,10 @@ class DemoAdapter(DatasetAdapter):
             )))
         points = np.ascontiguousarray(np.concatenate(clouds), dtype=np.float32)
         intensity = rng.uniform(20, 220, len(points)).astype(np.float32)
-        return FrameData(info=info, points=points, boxes=boxes, intensity=intensity,
-                         reference_sensor_to_world=np.eye(4))
+        reference = f"demo:lidar:{info.frame_id}"
+        return PointCloudFrame(
+            info, "demo:generated", reference, points,
+            annotations=AnnotationSet(reference, AnnotationStatus.AVAILABLE, boxes),
+            attributes={"intensity": intensity}, world_frame_id="demo:world",
+            T_world_from_reference=np.eye(4), reference_pose_timestamp_us=info.timestamp_us,
+        )

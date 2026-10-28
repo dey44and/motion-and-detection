@@ -1,12 +1,13 @@
 """Render normalized frames without knowing their source dataset."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import numpy as np
 import open3d as o3d
 from open3d.visualization import gui, rendering
 
-from threedviz.dataloader import BoundingBox3D, FrameData
+from dataset_utils import Box3D, PointCloudFrame
 from threedviz.processing import BOX_EDGES, box_corners, class_color, colorize_points
 
 
@@ -31,7 +32,7 @@ class BoxLayer:
     """
 
     name: str
-    boxes: tuple[BoundingBox3D, ...]
+    boxes: tuple[Box3D, ...]
     color: tuple[float, float, float]
     visible: bool = True
     line_width: float | None = None
@@ -60,7 +61,8 @@ class SceneRenderer:
         self.widget = widget
         self.scaling = scaling
         self.settings = RenderSettings()
-        self.frame: FrameData | None = None
+        self.class_labels: dict[str, str] = {}
+        self.frame: PointCloudFrame | None = None
         self._box_layers: tuple[BoxLayer, ...] | None = None
         self._box_names: list[str] = []
         self._cloud = o3d.geometry.PointCloud()
@@ -79,13 +81,13 @@ class SceneRenderer:
         self.widget.set_view_controls(gui.SceneWidget.Controls.ROTATE_CAMERA)
 
     def set_frame(
-        self, frame: FrameData, *, reset_camera: bool = False,
+        self, frame: PointCloudFrame, *, reset_camera: bool = False,
         box_layers: tuple[BoxLayer, ...] | None | object = _UNCHANGED_LAYERS,
     ):
         """Replace a frame, optionally replacing its box layers atomically.
 
         Omit ``box_layers`` to retain the current configuration. Pass ``None``
-        to use the ordinary per-class-colored ``frame.boxes``; pass a tuple to
+        to use the ordinary per-class-colored ``frame.annotations.boxes``; pass a tuple to
         render exactly those layers, including an empty tuple to hide all boxes.
         """
         # Validate and construct all geometry before replacing a working frame.
@@ -107,6 +109,13 @@ class SceneRenderer:
         if reset_camera:
             self.reset_camera()
         self.widget.force_redraw()
+
+    def set_class_labels(self, labels: Mapping[str, str]) -> None:
+        """Map native class IDs to presentation groups without changing boxes."""
+        self.class_labels = dict(labels)
+
+    def class_label(self, class_id: str) -> str:
+        return self.class_labels.get(class_id, class_id)
 
     @property
     def axes_visible(self) -> bool:
@@ -134,31 +143,20 @@ class SceneRenderer:
 
     def _display_points(self, frame):
         if self.settings.use_raw_points:
-            if frame.raw_points is None:
+            if frame.acquisition is None:
                 raise ValueError("Acquisition-time points have not been prepared for this frame.")
-            points = np.asarray(frame.raw_points, dtype=np.float64)
-            if points.shape != frame.points.shape:
-                raise ValueError("Acquisition-time points must match the point cloud shape.")
-            return points
+            if not frame.acquisition.valid_mask.all():
+                raise ValueError("Acquisition-time geometry must cover every point in the scan.")
+            return frame.acquisition.points
         return frame.points
 
     def _point_colors(self, frame, points):
         if self.settings.color_scheme != "camera_rgb":
             return colorize_points(points, self.settings.color_scheme, self.settings.max_distance)
-        if frame.rgb_colors is None:
+        if frame.rgb is None:
             raise ValueError("Camera RGB colors have not been prepared for this frame.")
-        colors = np.asarray(frame.rgb_colors, dtype=np.float64)
-        if colors.shape != points.shape or not np.isfinite(colors).all():
-            raise ValueError("Camera RGB colors must have shape (N, 3) and contain finite values.")
-        if np.any((colors < 0) | (colors > 1)):
-            raise ValueError("Camera RGB colors must be between zero and one.")
         fallback = colorize_points(points, "gray", self.settings.max_distance)
-        if frame.rgb_valid_mask is None:
-            return colors
-        valid = np.asarray(frame.rgb_valid_mask)
-        if valid.shape != (len(points),) or valid.dtype != np.bool_:
-            raise ValueError("Camera RGB validity must be a boolean array with shape (N,).")
-        return np.where(valid[:, None], colors, fallback)
+        return np.where(frame.rgb.valid_mask[:, None], frame.rgb.values, fallback)
 
     def _point_material(self):
         material = rendering.MaterialRecord()
@@ -225,9 +223,8 @@ class SceneRenderer:
                 if not valid_width:
                     raise ValueError("Box layer line width must be positive and finite.")
             for box in layer.boxes:
-                if not isinstance(box, BoundingBox3D):
-                    raise ValueError("Box layers must contain BoundingBox3D objects.")
-                box_corners(box)
+                if not isinstance(box, Box3D):
+                    raise ValueError("Box layers must contain Box3D objects.")
         return layers
 
     def set_box_layers(self, layers: tuple[BoxLayer, ...] | None):
@@ -246,13 +243,14 @@ class SceneRenderer:
 
     def _box_geometries(self, frame, layers=None):
         geometries = []
-        sources = ((None, frame.boxes),) if layers is None else tuple((layer, layer.boxes) for layer in layers)
+        sources = ((None, frame.annotations.boxes),) if layers is None else tuple((layer, layer.boxes) for layer in layers)
         for layer, boxes in sources:
             grouped: dict[str, list[np.ndarray]] = {}
             for box in boxes:
                 corners = box_corners(box)
-                if box.class_name in self.settings.selected_classes and (layer is None or layer.visible):
-                    grouped.setdefault(box.class_name, []).append(corners)
+                label = self.class_label(box.class_id)
+                if label in self.settings.selected_classes and (layer is None or layer.visible):
+                    grouped.setdefault(label, []).append(corners)
             # One geometry per layer/class keeps draw calls small while
             # preserving independent layer controls and class filtering.
             for class_name, corners in grouped.items():
@@ -287,7 +285,7 @@ class SceneRenderer:
         points = self._display_points(self.frame)
         if len(points):
             geometry.append(points)
-        geometry.extend(box_corners(box) for box in self.frame.boxes)
+        geometry.extend(box_corners(box) for box in self.frame.annotations.boxes)
         if self._box_layers is not None:
             geometry.extend(box_corners(box) for layer in self._box_layers if layer.visible for box in layer.boxes)
         if geometry:

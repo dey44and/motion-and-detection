@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -150,3 +151,42 @@ def test_application_exit_status_is_returned(monkeypatch):
     app.run_app = lambda **kwargs: 7
     monkeypatch.setitem(sys.modules, "cameraviz.ui.app", app)
     assert cli.main(["--demo"]) == 7
+
+
+def test_dataset_configuration_is_resolved_and_forwarded(launches, tmp_path):
+    config_path = tmp_path / "dataset.json"
+    config_path.write_text(json.dumps({
+        "root": "data", "release": "custom-v1", "source_paths": {"native": "records"},
+    }), encoding="utf-8")
+    assert cli.main([
+        "--dataset", "waymo", "--dataset-config", str(config_path), "--split", "val",
+    ]) == 0
+    call = launches[0]
+    assert call["autoload"] is True
+    assert call["dataset"] == "waymo"
+    assert call["split"] == "val"
+    assert call["config"].root == tmp_path / "data"
+    assert call["config"].release == "custom-v1"
+    assert call["config"].source_paths["native"] == tmp_path / "data" / "records"
+
+
+@pytest.mark.parametrize("conflicting", [
+    ["--root", "/data"], ["--dataroot", "/data"],
+    ["--version", "v1.0-mini"], ["--demo"], ["--dataset", "demo"],
+])
+def test_ambiguous_dataset_configuration_is_rejected(conflicting, launches, capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--dataset-config", "dataset.json", *conflicting])
+    assert exc.value.code == 2
+    assert "cannot be combined" in capsys.readouterr().err
+    assert launches == []
+
+
+def test_invalid_dataset_configuration_reports_cli_error(launches, tmp_path, capsys):
+    path = tmp_path / "dataset.json"
+    path.write_text('{"unknown_setting": true}', encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--dataset-config", str(path)])
+    assert exc.value.code == 2
+    assert "unknown_setting" in capsys.readouterr().err
+    assert launches == []
