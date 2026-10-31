@@ -89,8 +89,10 @@ configuration.
 ## Controls and scientific interpretation
 
 - Select a split, scene and frame; use previous/next to step through frames.
-- Choose gray, jet or turbo distance colors. The maximum distance fixes the
-  color scale across frames; farther points use the endpoint color.
+- Choose gray, viridis or concerto distance colors. The scale defaults to
+  0–80 metres; its adjustable maximum stays fixed across frames, and farther
+  points use the endpoint color. Distance is Euclidean distance from the
+  displayed point-cloud reference origin, which need not be the ego origin.
 - Choose Camera RGB when supported. Unmatched points use gray and the sidebar
   reports valid color coverage.
 - Use Undo ego motion compensation when complete acquisition geometry is
@@ -99,6 +101,11 @@ configuration.
 - Drag to rotate, right-drag to pan, scroll to zoom, or reset the camera.
 - Toggle fixed 3-metre axes: X red, Y green and Z blue. Axes do not affect
   camera fitting and toggling them preserves the viewpoint.
+
+Concerto interpolates this palette in order from near to far:
+`#231F62` → `#3D87AE` → `#7EDFD0` → `#D95EA5` → `#EC599D` → `#F28C88` →
+`#F4AA79` → `#56BA62`. Gray retains its dark-to-light range for the white
+background. Camera RGB uses image colors rather than the distance palette.
 
 RGB, scalar point timestamps and acquisition geometry are independent features.
 A dataset may provide acquisition geometry without scalar timestamps. Partial

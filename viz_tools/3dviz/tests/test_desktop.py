@@ -80,9 +80,25 @@ def test_native_loading_navigation_styles_and_error_recovery(tmp_path, monkeypat
         viewer._on_dataset_split("val", 0)
         idle()
         assert viewer._dataset_split == "val"
-        for scheme in ("gray", "jet", "turbo"):
+        camera = viewer.viewport.scene.camera.get_view_matrix().copy()
+        displayed_points = np.asarray(viewer.renderer._cloud.points).copy()
+        colors_by_scheme = {}
+        for scheme in ("gray", "viridis", "concerto"):
             viewer._on_color_scheme(scheme, 0)
-            assert np.asarray(viewer.renderer._cloud.colors).shape == viewer.renderer.frame.points.shape
+            colors_by_scheme[scheme] = np.asarray(viewer.renderer._cloud.colors).copy()
+            assert viewer.renderer.settings.color_scheme == scheme
+            assert viewer.color_choice.selected_text == scheme
+            assert colors_by_scheme[scheme].shape == viewer.renderer.frame.points.shape
+            np.testing.assert_array_equal(viewer.renderer._cloud.points, displayed_points)
+            np.testing.assert_allclose(viewer.viewport.scene.camera.get_view_matrix(), camera)
+        assert not np.allclose(colors_by_scheme["gray"], colors_by_scheme["viridis"])
+        assert not np.allclose(colors_by_scheme["viridis"], colors_by_scheme["concerto"])
+        viewer._on_distance(40)
+        assert not np.allclose(viewer.renderer._cloud.colors, colors_by_scheme["concerto"])
+        np.testing.assert_array_equal(viewer.renderer._cloud.points, displayed_points)
+        np.testing.assert_allclose(viewer.viewport.scene.camera.get_view_matrix(), camera)
+        viewer._on_distance(80)
+        np.testing.assert_allclose(viewer.renderer._cloud.colors, colors_by_scheme["concerto"])
         viewer._on_point_size(7)
         viewer._on_line_width(5)
         assert viewer.renderer.settings.point_size == 7 and viewer.renderer.settings.line_width == 5

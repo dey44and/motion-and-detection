@@ -29,6 +29,36 @@ def test_distance_colors_use_euclidean_range_and_clip() -> None:
     np.testing.assert_allclose(rgb[:, 1], rgb[:, 2])
 
 
+def test_viridis_uses_standard_colors_and_default_80_metre_scale() -> None:
+    points = np.array([[0., 0, 0], [24., 32., 0], [0, 0, -80.], [200., 0, 0]])
+    rgb = colorize_points(points, "viridis")
+    np.testing.assert_allclose(rgb, [
+        [0.267004, 0.004874, 0.329415],
+        [0.127568, 0.566949, 0.550556],
+        [0.993248, 0.906157, 0.143936],
+        [0.993248, 0.906157, 0.143936],
+    ])
+
+
+def test_concerto_preserves_palette_order_and_linear_interpolation() -> None:
+    # Check all 256 lookup entries against independent RGB interpolation.
+    palette = np.array([
+        [35, 31, 98], [61, 135, 174], [126, 223, 208], [217, 94, 165],
+        [236, 89, 157], [242, 140, 136], [244, 170, 121], [86, 186, 98],
+    ]) / 255.0
+    distances = np.linspace(0., 80., 257)
+    points = np.column_stack((distances, np.zeros((257, 2))))
+    lookup_positions = np.minimum(np.arange(257), 255) / 255.0
+    expected = np.column_stack([
+        np.interp(lookup_positions, np.linspace(0., 1., 8), palette[:, channel])
+        for channel in range(3)
+    ])
+    actual = colorize_points(points, "concerto")
+    np.testing.assert_allclose(actual, expected, atol=1e-14)
+    np.testing.assert_allclose(actual[[0, -1]], palette[[0, -1]])
+    np.testing.assert_allclose(colorize_points([[800., 0, 0]], "concerto"), palette[[-1]])
+
+
 @pytest.mark.parametrize("scheme", COLOR_SCHEMES)
 def test_colors_do_not_depend_on_cloud_extent_or_orientation(scheme: str) -> None:
     points = np.array([[1, 2, 2], [6, 8, 0]], dtype=float)

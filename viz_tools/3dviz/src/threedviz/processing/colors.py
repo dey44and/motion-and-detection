@@ -7,8 +7,18 @@ import hashlib
 
 import numpy as np
 from matplotlib import colormaps
+from matplotlib.colors import LinearSegmentedColormap
 
-COLOR_SCHEMES = ("gray", "jet", "turbo")
+COLOR_SCHEMES = ("gray", "viridis", "concerto")
+
+# Ordered from near to far. Keep the colormap local rather than modifying
+# Matplotlib's global registry; both 3D viewers use this same instance.
+_CONCERTO = LinearSegmentedColormap.from_list(
+    "concerto",
+    ("#231F62", "#3D87AE", "#7EDFD0", "#D95EA5",
+     "#EC599D", "#F28C88", "#F4AA79", "#56BA62"),
+    N=256,
+)
 
 # A fixed palette for the nuScenes detection classes. Saturated, moderately dark
 # colors keep thin box edges visible against the viewer's white background.
@@ -29,12 +39,13 @@ _CLASS_COLORS = {
 def colorize_points(
     points: np.ndarray, scheme: str = "gray", max_distance: float = 80.0
 ) -> np.ndarray:
-    """Return one RGB color per point, using its Euclidean sensor distance.
+    """Return one RGB color per point, using distance from the reference origin.
 
     ``points`` must be finite with shape ``(N, 3)``. Distance is normalized to
     ``max_distance`` and clipped there, so colors remain stable between frames.
-    Gray increases from 0.12 to 0.72 instead of reaching white; jet and turbo use
-    Matplotlib's colormaps over the full normalized distance range. Empty point
+    The default scale is 0–80 metres. Gray increases from 0.12 to 0.72 instead
+    of reaching white; viridis uses Matplotlib's standard map. Concerto linearly
+    interpolates its eight ordered colors with a 256-entry lookup table. Empty
     clouds return an empty ``(0, 3)`` array. Invalid inputs raise ``ValueError``.
     """
     if scheme not in COLOR_SCHEMES:
@@ -59,7 +70,8 @@ def colorize_points(
     if scheme == "gray":
         gray = 0.12 + 0.60 * distances
         return np.repeat(gray[:, None], 3, axis=1)
-    return np.asarray(colormaps[scheme](distances)[:, :3], dtype=np.float64)
+    cmap = _CONCERTO if scheme == "concerto" else colormaps[scheme]
+    return np.asarray(cmap(distances)[:, :3], dtype=np.float64)
 
 
 def class_color(class_name: str) -> tuple[float, float, float]:

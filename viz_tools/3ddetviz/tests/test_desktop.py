@@ -47,6 +47,27 @@ def test_native_canonical_review_filters_navigation_sources_and_presets(tmp_path
                 viewer._render_loaded_frame(observation)
         assert viewer._review_frame is review and viewer._pending_review is pending
         viewer._pending_review = None
+        camera = viewer.viewport.scene.camera.get_view_matrix().copy()
+        displayed_points = np.asarray(viewer.renderer._cloud.points).copy()
+        layers = viewer.renderer.box_layers
+        colors_by_scheme = {}
+        for scheme in ("gray", "viridis", "concerto"):
+            viewer._on_color_scheme(scheme, 0)
+            colors_by_scheme[scheme] = np.asarray(viewer.renderer._cloud.colors).copy()
+            assert viewer.renderer.settings.color_scheme == scheme
+            assert viewer.color_choice.selected_text == scheme
+            assert viewer.renderer.frame is observation
+            assert viewer._review_frame.predictions is review.predictions
+            assert viewer._review_frame.filtered is review.filtered
+            np.testing.assert_array_equal(viewer.renderer._cloud.points, displayed_points)
+            np.testing.assert_allclose(viewer.viewport.scene.camera.get_view_matrix(), camera)
+            assert len(viewer.renderer.box_layers) == len(layers)
+            for current, original in zip(viewer.renderer.box_layers, layers):
+                assert (current.name, current.color, current.visible) == (original.name, original.color, original.visible)
+                assert len(current.boxes) == len(original.boxes)
+                assert all(left is right for left, right in zip(current.boxes, original.boxes))
+        assert not np.allclose(colors_by_scheme["gray"], colors_by_scheme["viridis"])
+        assert not np.allclose(colors_by_scheme["viridis"], colors_by_scheme["concerto"])
         cloud, camera = viewer.renderer._cloud, viewer.viewport.scene.camera.get_view_matrix().copy()
         viewer.apply_filters(FilterConfig(score_threshold=.99))
         idle()

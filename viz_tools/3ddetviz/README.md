@@ -55,9 +55,12 @@ registered custom format when suffix detection is inappropriate.
 
 Ground truth and detections have independent visibility and colors, green and
 orange by default. Class checkboxes affect both layers; labels come from dataset
-metadata while boxes retain native class IDs. Point appearance, camera RGB,
-acquisition geometry, axes and mouse controls come from 3dviz. See its
-[camera and timing conventions](../3dviz/README.md#camera-rgb-and-point-timing).
+metadata while boxes retain native class IDs. Point colors offer gray, viridis,
+concerto and Camera RGB when supported. Distance palettes use Euclidean distance
+from the displayed reference origin with a fixed 0–80 metre scale by default;
+the maximum is adjustable and farther points use the endpoint color. Point
+appearance, acquisition geometry, axes and mouse controls come from 3dviz. See
+its [palette, camera and timing conventions](../3dviz/README.md#controls-and-scientific-interpretation).
 
 Detection filters run in this order:
 
