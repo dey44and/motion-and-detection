@@ -1,8 +1,13 @@
-# 3D Geometry and Detection Tools
+# 3D geometry and detection tools
 
 Tools for inspecting autonomous-driving sensor data, ground truth, and 3D
 detections. The visualization packages run independently of the repository's
 OpenPCDet training stack and CUDA extensions.
+
+**[Visualization tools](viz_tools/README.md)** ·
+**[Shared dataset utilities](visual_utils/README.md)** ·
+**[Custom dataset tutorial](visual_utils/docs/custom_datasets.md)** ·
+**[Contributing](CONTRIBUTING.md)**
 
 | Package | Python import / command | Purpose |
 | --- | --- | --- |
@@ -11,20 +16,23 @@ OpenPCDet training stack and CUDA extensions.
 | [3dviz](viz_tools/3dviz/README.md) | `threedviz` / `3dviz` | Point clouds, ground truth, RGB and acquisition-geometry inspection. |
 | [3ddetviz](viz_tools/3ddetviz/README.md) | `detviz` / `3ddetviz` | Prediction review, class/score filters and geometric NMS, using the 3D viewer. |
 
-## Install and try
+## 🚀 Install and try
 
 Use Python 3.10–3.12. From the repository's root:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -e './visual_utils' -e './viz_tools/2dcameraviz' -e './viz_tools/3dviz' -e './viz_tools/3ddetviz'
+python -m pip install -e './visual_utils' \
+  -e './viz_tools/2dcameraviz' \
+  -e './viz_tools/3dviz' \
+  -e './viz_tools/3ddetviz'
 2dcameraviz --demo
 3dviz --demo
 3ddetviz --demo
 ```
 
-## Bring your own dataset
+## 🔌 Bring your own dataset
 
 Implement one `DatasetLoader` in your own package. It adapts native storage to
 shared metadata and sensor records used directly by all three viewers. There
@@ -36,14 +44,13 @@ Prediction-file adapters are a separate extension interface.
 
 Start with the [runnable custom-dataset tutorial](visual_utils/docs/custom_datasets.md),
 then consult the [loader contract](visual_utils/docs/loader_contract.md) and
-[prediction-source contract](viz_tools/3ddetviz/docs/prediction_contract.md)
+[prediction-source contract](viz_tools/3ddetviz/docs/prediction_contract.md).
 
 
-## Acknowledgment
+## Acknowledgments
 
 <img src="docs/open_mmlab.png" align="right" width="20%">
 
-## (Based on OpenPCDet)
-
-`OpenPCDet` is a clear, simple, self-contained open source project for LiDAR-based 3D object detection.
+This repository builds on `OpenPCDet`, an open source project for LiDAR-based
+3D object detection.
 Dataset-specific notices are retained under [visual_utils/third_party](visual_utils/third_party/NOTICE.txt).

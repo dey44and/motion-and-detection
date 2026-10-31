@@ -1,60 +1,54 @@
-# 2dcameraviz
+# 📷 2dcameraviz
 
-A desktop viewer for RGB camera rigs and projected 3D annotations. It uses
-NumPy, Pillow and Tkinter; neither Open3D nor the training stack is required.
-The viewer consumes the same [`visual_utils`](../../visual_utils/README.md)
-records as the point-cloud and detection viewers.
+Explore RGB camera rigs and projected 3D annotations in a desktop window.
+`2dcameraviz` runs with NumPy, Pillow and Tkinter, independently of Open3D and
+the training stack. It shares [`visual_utils`](../../visual_utils/README.md)
+records with the point-cloud and detection viewers.
 
-## Install and run
+**[Quick start](#quick-start)** · **[Datasets](#open-a-dataset)** · **[Controls](#controls-and-interpretation)** · **[Extend](#use-your-own-dataset)** · **[Validate](#interpretation-and-validation)**
 
-Requires Python 3.10–3.12. From the repository root:
+<a id="quick-start"></a>
+## 🚀 Quick start
+
+Use Python 3.10–3.12 and run these commands from the repository root:
 
 ```bash
 python -m pip install -e './visual_utils' -e './viz_tools/2dcameraviz[dev]'
 2dcameraviz --demo
+```
+
+The demo generates its own images and annotations, so you can try the controls
+before connecting a dataset. Use `python -m cameraviz` as an alternative launcher.
+Launching without arguments opens an empty window with dataset controls.
+
+Opening the window requires a graphical display. On Debian/Ubuntu, Tkinter is
+supplied by `python3-tk`. The `--help` and `--app-version` commands also work
+without a display.
+
+<a id="open-a-dataset"></a>
+## 🗂️ Open a dataset
+
+Once you have explored the demo, select a native dataset root:
+
+```bash
 2dcameraviz --dataset nuscenes --root /data/nuscenes --version v1.0-mini
 2dcameraviz --dataset waymo --root /data/waymo --split val
 ```
 
-Use `python -m cameraviz` as an alternative launcher. On Debian/Ubuntu, Tkinter
-is supplied by `python3-tk`. Opening the window requires a graphical display;
-`--help` and `--app-version` work without one. Launching without arguments opens
-an empty window with dataset controls.
-
-`--scene` selects a scene ID or display name; `--frame` selects its zero-based
-display index. `--root` aliases `--dataroot`. `--split` defaults to `all`; the
-loaded dataset supplies its available split names. Arrow keys step through
-frames. Scene and frame loading run on one background worker.
-
-## Views and annotations
-
-The window preserves each image's native orientation and aspect ratio. Choose
-3D wireframes or enclosing 2D rectangles, then control class visibility, colors
-and line width. Camera roles and ordering come from dataset sensor metadata.
-Known roles use the usual front/rear/side grid; unknown roles receive distinct
-slots in stable order. A missing camera keeps its placeholder.
-
-Native class IDs remain intact in observations and projected geometry. Class
-display groups affect only the controls and overlay styles. Available-empty,
-not-provided and withheld ground truth have distinct status labels. A camera
-without an explicit projection model displays its image without box overlays.
-
-## Dataset inputs
-
-**nuScenes:** select an extracted mini, trainval or test root, or its release
-metadata directory. Native JSON tables and camera keyframe images are required;
+**nuScenes** accepts an extracted mini, trainval or test root, or its release
+metadata directory. Native JSON tables and camera keyframe images are required.
 LiDAR files are unnecessary. The backend uses each camera's recorded pose and
-pinhole calibration. Annotation-free releases remain viewable. The six cameras
-are placed as follows:
+pinhole calibration, and annotation-free releases remain viewable. Its six
+camera views use this layout:
 
 | Front left | Front | Front right |
 | --- | --- | --- |
 | Back right | Back | Back left |
 
-**Waymo:** select the dataset parent, `waymo_og_format_unpacked`, or a directory
+**Waymo** accepts the dataset parent, `waymo_og_format_unpacked`, or a directory
 of native Perception TFRecords under `training/`, `validation/` and `testing/`.
-No JPEG extraction, TensorFlow, Waymo SDK or OpenPCDet installation is required.
-Omit the nuScenes `--version` option. The five camera views use:
+It reads the original camera images without JPEG extraction, TensorFlow, the
+Waymo SDK or OpenPCDet. Omit the nuScenes `--version` option. The five views use:
 
 | Front left | Front | Front right |
 | --- | --- | --- |
@@ -62,14 +56,15 @@ Omit the nuScenes `--version` option. The five camera views use:
 
 Waymo overlays use the native distortion and rolling-shutter model, including
 exposure poses and motion. Camera-synchronized boxes override reference-time
-boxes where provided. Curved edges are sampled before image clipping. Processed
-OpenPCDet point clouds and `kitti_format/` trees are not camera-image inputs.
-See [shared dataset documentation](../../visual_utils/README.md) for layouts and
-scientific conventions.
+boxes where provided, and curved edges are sampled before image clipping.
+Processed OpenPCDet clouds and `kitti_format/` trees are not camera-image inputs.
+The [native reader guide](../../visual_utils/docs/dataset_readers.md) gives the full layouts
+and scientific conventions.
 
-## Configure sources
+## ⚙️ Configure sources
 
-For named sources or provider options, save a `DatasetConfig` JSON file:
+The root/version arguments cover simple layouts. For named sources or provider
+options, save a `DatasetConfig` JSON file such as `waymo.json`:
 
 ```json
 {
@@ -78,26 +73,64 @@ For named sources or provider options, save a `DatasetConfig` JSON file:
 }
 ```
 
+Then open the same viewer with that configuration:
+
 ```bash
 2dcameraviz --dataset waymo --dataset-config waymo.json --split val
 ```
 
-The JSON accepts `root`, `release`, `storage_format`, `source_paths` and `options`.
-Relative roots resolve against the JSON directory; relative named sources
-resolve against that root, or the JSON directory if there is no root. Unknown
-fields and duplicate keys are errors. Provider-specific options are validated
-by the provider. `--dataset-config` excludes explicit root/version flags and
-`--demo`; it locks source controls while leaving navigation and styling usable.
+The accepted fields are `root`, `release`, `storage_format`, `source_paths` and
+`options`. Relative roots resolve against the JSON directory. Relative named
+sources resolve against that root, or the JSON directory when there is no root.
+Unknown fields and duplicate keys are errors, and each provider validates its
+own options.
 
-## Use your own dataset
+Use `--dataset-config` on its own instead of explicit root/version flags or
+`--demo`. Configured source controls stay fixed for that window, while
+navigation and overlay styling remain available.
 
-Implement `visual_utils.DatasetLoader` in your package. Return canonical
-`SceneInfo`, `FrameInfo` and `CameraFrameSet` records; implement the protected
-catalog and camera-loading hooks. Supply ordered sensors, native class metadata
-and an explicit projection model when calibration is known. A camera-only
-provider needs no point-cloud methods.
+<a id="controls-and-interpretation"></a>
+## 🎛️ Controls and interpretation
 
-Expose the constructor through your package's `pyproject.toml`:
+Choose a split, scene and frame in the sidebar, then adjust the overlays while
+keeping each image's native orientation and aspect ratio. Scene and frame reads
+run on one background worker so the controls remain responsive.
+
+| Task | Control or argument |
+| --- | --- |
+| Select a dataset split | Split menu or `--split`, which defaults to `all`. Available names come from the loaded dataset. |
+| Open a scene | Scene menu or `--scene`, accepting its ID or display name. |
+| Select a frame | Frame slider or zero-based `--frame`. Left/right arrows step through frames. |
+| Set the dataset root | Root field or `--root`, also available as `--dataroot`. |
+| Change box presentation | Choose projected 3D wireframes or enclosing 2D rectangles, then set class visibility, colors and line width. |
+
+Camera roles and ordering come from sensor metadata. Familiar roles use the
+front/rear/side grid, while unknown roles receive distinct slots in stable
+order. A missing camera keeps its placeholder. A camera without an explicit
+projection model still displays its image, with no box overlay.
+
+Native class IDs remain intact in observations and projected geometry. Display
+groups affect only controls and styles. Status labels distinguish ground truth
+that is available but empty, not provided, or withheld.
+
+To interpret an overlay, keep its spatial and temporal references in mind.
+Boxes and camera models use the camera set's declared reference coordinates,
+and box sizes are length/width/height in metres. Exposure time and annotation
+time remain separate, so moving objects can retain a timing mismatch.
+Projections do not infer image occlusion or provide independently annotated 2D
+boxes. Nonlinear edge sampling is finite, so check numerical calibration
+alongside rendered alignment.
+
+<a id="use-your-own-dataset"></a>
+## 🔌 Use your own dataset
+
+Implement `visual_utils.DatasetLoader` in your package and return shared
+`SceneInfo`, `FrameInfo` and `CameraFrameSet` records. The protected catalog and
+camera-loading hooks supply ordered sensors, native class metadata and an
+explicit projection model when calibration is known. A camera-only provider
+needs no point-cloud methods.
+
+Expose its constructor through your package's `pyproject.toml`:
 
 ```toml
 [project.entry-points."visual_utils.loaders"]
@@ -106,12 +139,12 @@ my_dataset = "my_dataset:MyDatasetLoader"
 
 After installation, launch `2dcameraviz --dataset my_dataset --root /data/mine`.
 For an in-process script, call `visual_utils.register_loader` before launching.
-There is one shared registry; no camera-specific adapter is needed. The name
+The shared registry makes a separate camera adapter unnecessary. The name
 `demo` is reserved by the viewer. Follow the
-[custom-dataset tutorial](../../visual_utils/docs/custom_datasets.md) for a runnable
-provider used by all three viewers.
+[custom-dataset tutorial](../../visual_utils/docs/custom_datasets.md) for a
+runnable provider used by all three viewers.
 
-For Python processing, the camera factory returns the shared loader itself:
+The same loader also supports Python processing without opening a window:
 
 ```python
 from visual_utils import DatasetConfig, Modality
@@ -129,29 +162,31 @@ with create_dataset("nuscenes", config=DatasetConfig(
 ```
 
 `create_dataset` accepts either `config=` or convenience root/version arguments.
-The caller closes the loader after pending reads finish. Python desktop callers
-can use `cameraviz.ui.app.run_app(dataset="my_dataset", config=config, autoload=True)`.
-The [architecture guide](docs/architecture.md) describes the direct data flow.
+The context manager closes the loader after the synchronous reads finish.
+Desktop callers can use
+`cameraviz.ui.app.run_app(dataset="my_dataset", config=config, autoload=True)`.
+The [architecture guide](docs/architecture.md) explains how these shared records
+reach the image panels.
 
-## Interpretation and validation
+<a id="interpretation-and-validation"></a>
+## 🧪 Validation and next reading
 
-Boxes and camera models use the camera set's declared reference coordinates;
-the viewer does not transform them through an invented world frame. Box sizes
-are length/width/height in metres. Recorded exposure time and annotation time
-remain separate; moving objects can retain a timing mismatch. Projections do
-not infer image occlusion or independently annotated 2D boxes. Nonlinear edge
-sampling is finite, so inspect numerical calibration as well as rendered images.
+Run the generated-data and analytical projection checks from the repository root:
 
 ```bash
 python -m pytest viz_tools/2dcameraviz/tests
 CAMERA_VIZ_DESKTOP_TESTS=1 xvfb-run -a python -m pytest viz_tools/2dcameraviz/tests
 ```
 
-Tests use generated data, analytical projection expectations and native camera
-fixtures. Desktop checks exercise the actual Tk window, overlays, navigation,
-source replacement and recovery from failed reads.
+Native camera fixtures exercise calibration and projection behavior. The opt-in
+Tk checks also exercise overlays, navigation, source replacement and recovery
+from failed reads.
 
-Version 0.2 consumes the shared 0.3 records directly. The previous duplicate
-camera models and adapter API are preserved in
-[`archive/visualization_before_simplification`](../../archive/visualization_before_simplification/)
-for comparison; new integrations use `visual_utils`.
+For deeper work, continue with the [camera architecture](docs/architecture.md),
+[shared dataset interface](../../visual_utils/docs/loader_contract.md) or
+[custom-dataset tutorial](../../visual_utils/docs/custom_datasets.md).
+
+Version 0.2 consumes the shared 0.3 records directly. The previous camera models
+and adapter API remain in the
+[implementation archive](../../archive/visualization_before_simplification/)
+for comparison. New integrations use `visual_utils`.
