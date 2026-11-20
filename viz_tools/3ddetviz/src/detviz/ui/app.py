@@ -522,7 +522,7 @@ class DetectionWindow(ViewerWindow):
         self._filter_changed()
 
     def _on_review_tick(self):
-        changed = False
+        changed = super()._on_tick()
         if self._progress is not None:
             fraction, message = self._progress
             self._progress = None

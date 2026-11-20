@@ -16,6 +16,7 @@ from visual_utils import (
 from threedviz.dataloader import available_datasets, create_dataset
 from threedviz.processing import COLOR_SCHEMES, class_color
 from threedviz.visualization.renderer import SceneRenderer
+from .camera import CameraPanel
 
 
 def _discard_loaded_dataset(future, active_adapter):
@@ -78,8 +79,11 @@ class ViewerWindow:
         self.window.add_child(self.viewport)
         self._build_sidebar(dataset, root, version)
         self.window.add_child(self.sidebar)
+        self.camera_panel = CameraPanel(self.viewport, self.window.theme.font_size)
+        self.window.add_child(self.camera_panel.widget)
         self.window.set_on_layout(self._on_layout)
         self.window.set_on_close(self._on_close)
+        self.window.set_on_tick_event(self._on_tick)
         self._set_busy(False)
         if autoload:
             self.load_dataset(initial_scene=scene, initial_frame=frame)
@@ -247,6 +251,18 @@ class ViewerWindow:
         width = min(25 * self.window.theme.font_size, max(1, rect.width // 2))
         self.sidebar.frame = gui.Rect(rect.x, rect.y, width, rect.height)
         self.viewport.frame = gui.Rect(rect.x + width, rect.y, max(1, rect.width - width), rect.height)
+        margin = self.window.theme.font_size
+        panel_width = min(29 * margin, max(1, self.viewport.frame.width - 2 * margin))
+        preferred = self.camera_panel.widget.calc_preferred_size(context, gui.Widget.Constraints())
+        self.camera_panel.widget.frame = gui.Rect(
+            self.viewport.frame.get_right() - panel_width - margin, rect.y + margin,
+            panel_width, preferred.height,
+        )
+
+    def _on_tick(self):
+        if not self._alive or self.renderer.frame is None:
+            return False
+        return self.camera_panel.sync()
 
     def _on_dataset_choice(self, name, index):
         if name != self._ui_dataset_name:

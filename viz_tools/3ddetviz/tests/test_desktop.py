@@ -1,6 +1,7 @@
 """Native detection controls compose review state beside canonical cloud data."""
 
 from dataclasses import replace
+import json
 import pickle
 import os
 import time
@@ -31,8 +32,71 @@ def test_native_canonical_review_filters_navigation_sources_and_presets(tmp_path
                 return
             time.sleep(.01)
         pytest.fail("Review loading did not finish.")
+    def tick_until(predicate):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            assert application.run_one_tick(), "Window closed unexpectedly"
+            if predicate():
+                return
+            time.sleep(.01)
+        pytest.fail("Inherited camera overlay did not follow the live view")
+
+    def snapshot():
+        camera = viewer.viewport.scene.camera
+        return (camera.get_view_matrix().copy(), camera.get_projection_matrix().copy(),
+                np.asarray(viewer.viewport.center_of_rotation).copy())
+
+    def assert_snapshot(expected):
+        for actual, saved in zip(snapshot(), expected):
+            np.testing.assert_allclose(actual, saved, rtol=2e-6, atol=2e-5)
+
     try:
         idle()
+        panel = viewer.camera_panel
+        tick_until(lambda: panel.widget.enabled and bool(panel.view_edit.text_value))
+        viewer.viewport.look_at([.5, 1., 2.], [12., -18., 9.], [.3, .1, 1.])
+        tick_until(lambda: np.allclose(json.loads(panel.view_edit.text_value)["position"], [12., -18., 9.]))
+        full_view = json.loads(panel.view_edit.text_value)
+        full_view.update(fov=47., near=.4, far=700., pivot=[1., 2., 3.])
+        panel.view_edit.text_value = json.dumps(full_view)
+        panel._on_edit(panel.view_edit.text_value)
+        panel.apply()
+        copied_json, copied_camera = panel.view_edit.text_value, snapshot()
+        assert json.loads(copied_json)["fov"] == pytest.approx(47., abs=2e-4)
+
+        # The inherited tick must keep live sync and review debounce working
+        # together, without replacing a pending full-view draft.
+        draft = "{unfinished view"
+        panel.view_edit.text_value = draft
+        panel._on_edit(draft)
+        viewer.viewport.look_at([1., 0., 0.], [4., -13., 7.], [0., 0., 1.])
+        viewer.score_edit.double_value = .99
+        viewer._score_edit_changed(.99)
+        idle()
+        assert viewer._review_frame.filtered.output_count == 0
+        assert panel.view_edit.text_value == draft and panel._dirty
+        assert panel.apply_button.enabled
+        panel.copy_view()
+        assert not panel._dirty and not panel.apply_button.enabled
+        np.testing.assert_allclose(json.loads(panel.view_edit.text_value)["position"],
+                                   [4., -13., 7.], atol=2e-5)
+        unchanged = snapshot()
+        panel.view_edit.text_value = "{"
+        panel._on_edit("{")
+        panel.apply()
+        assert_snapshot(unchanged)
+        assert panel._dirty and panel.apply_button.enabled and panel.message.text
+
+        # Full-view transfer restores orientation, pivot and projection, not
+        # only the camera position, in the inherited detection viewport.
+        panel.view_edit.text_value = copied_json
+        panel._on_edit(copied_json)
+        panel.apply()
+        assert_snapshot(copied_camera)
+        assert json.loads(panel.view_edit.text_value)["fov"] == pytest.approx(47., abs=2e-4)
+        viewer.reset_filters()
+        idle()
+        assert_snapshot(copied_camera)
         observation, review = viewer.renderer.frame, viewer._review_frame
         assert review.observation is observation
         assert review.predictions is not None and len(viewer.renderer.box_layers) == 2
@@ -48,6 +112,7 @@ def test_native_canonical_review_filters_navigation_sources_and_presets(tmp_path
         assert viewer._review_frame is review and viewer._pending_review is pending
         viewer._pending_review = None
         camera = viewer.viewport.scene.camera.get_view_matrix().copy()
+        projection = viewer.viewport.scene.camera.get_projection_matrix().copy()
         displayed_points = np.asarray(viewer.renderer._cloud.points).copy()
         layers = viewer.renderer.box_layers
         colors_by_scheme = {}
@@ -61,6 +126,7 @@ def test_native_canonical_review_filters_navigation_sources_and_presets(tmp_path
             assert viewer._review_frame.filtered is review.filtered
             np.testing.assert_array_equal(viewer.renderer._cloud.points, displayed_points)
             np.testing.assert_allclose(viewer.viewport.scene.camera.get_view_matrix(), camera)
+            np.testing.assert_allclose(viewer.viewport.scene.camera.get_projection_matrix(), projection)
             assert len(viewer.renderer.box_layers) == len(layers)
             for current, original in zip(viewer.renderer.box_layers, layers):
                 assert (current.name, current.color, current.visible) == (original.name, original.color, original.visible)
@@ -69,11 +135,13 @@ def test_native_canonical_review_filters_navigation_sources_and_presets(tmp_path
         assert not np.allclose(colors_by_scheme["gray"], colors_by_scheme["viridis"])
         assert not np.allclose(colors_by_scheme["viridis"], colors_by_scheme["concerto"])
         cloud, camera = viewer.renderer._cloud, viewer.viewport.scene.camera.get_view_matrix().copy()
+        projection = viewer.viewport.scene.camera.get_projection_matrix().copy()
         viewer.apply_filters(FilterConfig(score_threshold=.99))
         idle()
         assert viewer._review_frame.filtered.output_count == 0
         assert viewer.renderer.frame is observation and viewer.renderer._cloud is cloud
         np.testing.assert_allclose(viewer.viewport.scene.camera.get_view_matrix(), camera)
+        np.testing.assert_allclose(viewer.viewport.scene.camera.get_projection_matrix(), projection)
         viewer.apply_filters(FilterConfig(score_threshold=0, nms_mode="class"))
         idle()
         assert 0 < viewer._review_frame.filtered.output_count < len(review.predictions.detections)

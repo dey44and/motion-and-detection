@@ -1,0 +1,5 @@
+recursive-include web_frontend *.json *.ts *.html *.css *.md
+recursive-include web_frontend/src/fonts *.woff2 *.txt
+recursive-include web_frontend/src/assets *.png
+prune web_frontend/node_modules
+prune web_frontend/.vite

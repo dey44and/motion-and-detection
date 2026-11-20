@@ -1,14 +1,14 @@
 # ☁️ 3dviz
 
 Inspect autonomous-driving point clouds, 3D ground truth and camera-derived
-colors in a standalone desktop viewer. Browse scenes and frames, adjust their
+colors in a standalone desktop or local browser viewer. Browse scenes and frames, adjust their
 appearance, and inspect acquisition geometry where the dataset supports it.
 
 Dataset reading belongs to [`visual-utils`](../../visual_utils/README.md).
 Its `DatasetLoader` and canonical observations are shared with research scripts,
 [2dcameraviz](../2dcameraviz/README.md) and [3ddetviz](../3ddetviz/README.md).
 This package provides point colors, box geometry, camera navigation and
-asynchronous desktop controls.
+asynchronous controls. Desktop remains the default; browser mode is optional.
 
 **[Quick start](#install-and-launch)** · **[Data and configuration](#dataset-sources)** · **[Controls and interpretation](#controls-and-scientific-interpretation)** · **[Research and extensions](#research-api-and-extension-boundary)** · **[Validation](#validation)**
 
@@ -35,6 +35,61 @@ CLI help imports neither the renderer nor native dataset readers. The viewer
 runs independently of OpenPCDet, CUDA, TensorFlow and dataset SDKs. Opening a
 window requires a display and working OpenGL drivers, while dataset reading,
 geometry and color utilities remain usable without a desktop.
+
+### 🌐 Browser mode on localhost
+
+Install the optional web dependencies and start a local server:
+
+```bash
+python -m pip install -e './visual_utils' -e './viz_tools/3dviz[web]'
+3dviz --web --demo --port 8080
+```
+
+Open **http://localhost:8080**. Add `--open-browser` to open the URL automatically.
+Choose another port with `--port`; stop the server with Ctrl+C. The ordinary
+`3dviz --demo` command continues to open the desktop viewer.
+
+The browser provides a white, full-page 3D viewport, translucent glass
+**Scene controls** on the left, and a compact floating navigation bar for dataset,
+split, scene and frame selection. The frame scrubber stays in the navigation bar
+when source settings are collapsed. Minimize the left panel from its Scene controls
+header; the header stays available to expand it again. Dataset paths and scene descriptions remain
+visible in the source section. Point size, box line width and color range support
+both sliders and direct numeric entry. A separate camera panel at the top right
+keeps editable camera JSON visible and preserves unapplied drafts while navigating
+the viewport or copying them. A thin animated loading strip spans
+the navigation bar while loading or preparing a frame. Stage messages describe
+the current work; dataset readers do not expose percentage progress.
+
+The same dataset arguments work in browser mode:
+
+```bash
+3dviz --web --dataset nuscenes --root /datasets/nuscenes --version v1.0-mini --split val
+3dviz --web --dataset waymo --root /datasets/waymo --split val --port 8081
+3dviz --web --dataset waymo --dataset-config /datasets/waymo.json
+```
+
+Dataset roots and configuration paths refer to the machine running the Python
+server. Data is read there, rather than uploaded through the browser. A launch
+using `--dataset-config` keeps its connection settings fixed, just as desktop
+mode does. Ordinary launches can change the dataset connection in the page.
+
+Browser mode uses the same dataset providers, RGB projection, acquisition
+geometry and color palettes as desktop mode. Point size, distance colors, box
+styles and camera navigation update locally in the browser. Camera RGB
+preparation stays in Python, preserving the same coverage mask and gray
+fallback. Camera view JSON can be copied, pasted and applied using reference
+coordinates, including position, rotation, pivot, field of view and clipping.
+
+Browser points use instanced 20-face icosahedrons with subtle face lighting.
+Point size sets their screen diameter in pixels; distance palettes and camera
+RGB supply the base colors before lighting.
+
+JavaScript, styles and the Inter font are bundled in the Python package; using the viewer
+requires neither Node.js nor a CDN connection. The browser needs working WebGL 2.
+The web server does not initialize an Open3D window, so it can run without a
+desktop display. Open3D remains an installation dependency for compatibility
+with the default desktop mode and detection viewer.
 
 ### 🛠️ Startup troubleshooting
 
@@ -209,8 +264,28 @@ src/threedviz/
   processing/      dataset-independent geometry and colors
   visualization/   Open3D rendering of canonical observations
   ui/              controls and loading worker
-  cli.py           arguments and lazy desktop launch
+  web/             local API, background jobs, binary frames and bundled browser UI
+  cli.py           arguments and lazy desktop/browser launch
 ```
+
+The browser API consumes the same canonical observations. Each browser tab owns
+a session whose dataset operations are serialized; failed loads retain the
+previous observation. Point positions and optional colors travel as binary
+arrays. Rendering positions are rebased before conversion to float32, while
+source observations remain unchanged. The browser renderer and desktop renderer
+remain separate, allowing `3ddetviz` to retain its current desktop interface.
+
+To develop the browser frontend, use the checked-in npm lockfile:
+
+```bash
+cd viz_tools/3dviz/web_frontend
+npm ci
+npm run build
+```
+
+The build type-checks the TypeScript sources and writes the bundled assets into
+`src/threedviz/web/static` for Python packaging. Commit source and rebuilt assets
+together. Frontend dependencies are needed only for development.
 
 <a id="validation"></a>
 
@@ -221,6 +296,10 @@ From the repository root, run the viewer tests:
 ```bash
 python -m pytest viz_tools/3dviz/tests
 ```
+
+Install `./viz_tools/3dviz[web,dev]` to include API and background-job checks.
+The optional browser integration test additionally uses Playwright and Chrome;
+see its module for the opt-in command.
 
 Tests cover deterministic demo data, shared-provider selection, geometry, colors,
 canonical rendering and box layers. With Xvfb and working OpenGL, opt into the

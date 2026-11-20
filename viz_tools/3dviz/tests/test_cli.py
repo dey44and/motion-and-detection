@@ -76,7 +76,7 @@ def test_help_does_not_import_graphical_dependencies(monkeypatch, capsys):
     original_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
-        if name.startswith(("open3d", "tensorflow", "waymo_open_dataset")) or name in {"ui.app", "threedviz.ui.app"}:
+        if name.startswith(("open3d", "tensorflow", "waymo_open_dataset", "fastapi", "uvicorn")) or name in {"ui.app", "threedviz.ui.app"}:
             raise AssertionError(f"help imported graphical module {name}")
         return original_import(name, *args, **kwargs)
 
@@ -124,6 +124,58 @@ def test_dataset_config_rejects_ambiguous_or_demo_launches(conflicting, launches
         cli.main(["--dataset-config", str(tmp_path / "sources.json"), *conflicting])
     assert error.value.code == 2 and "--dataset-config" in capsys.readouterr().err
     assert not launches
+
+
+def test_browser_mode_forwards_options_without_importing_desktop(monkeypatch, launches, tmp_path):
+    calls = []
+    server = ModuleType("threedviz.web.server")
+    server.run_server = lambda **kwargs: calls.append(kwargs)
+    monkeypatch.setitem(sys.modules, "threedviz.web.server", server)
+    assert cli.main(["--web", "--demo", "--port", "8097", "--open-browser", "--split", "val"]) == 0
+    assert not launches
+    assert calls == [{
+        "dataset": "demo", "root": None, "version": "v1.0-mini",
+        "scene": None, "frame": 0, "autoload": True, "split": "val",
+        "port": 8097, "open_browser": True,
+    }]
+    assert cli.main(["--web"]) == 0
+    assert calls[-1]["port"] == 8080 and not calls[-1]["open_browser"]
+    assert not calls[-1]["autoload"]
+
+
+@pytest.mark.parametrize("arguments", [["--port", "8080"], ["--open-browser"]])
+def test_browser_only_options_require_web(arguments, launches, capsys):
+    with pytest.raises(SystemExit) as error:
+        cli.main(arguments)
+    assert error.value.code == 2 and "require --web" in capsys.readouterr().err
+    assert not launches
+
+
+@pytest.mark.parametrize("port", ["0", "65536", "-1", "bad"])
+def test_invalid_browser_ports_are_rejected(port, launches, capsys):
+    with pytest.raises(SystemExit) as error:
+        cli.main(["--web", "--port", port])
+    assert error.value.code == 2 and "between 1 and 65535" in capsys.readouterr().err
+    assert not launches
+
+
+@pytest.mark.parametrize("missing", ["fastapi", "uvicorn", "unrelated_dependency"])
+def test_missing_browser_dependencies_have_specific_guidance(missing, monkeypatch, capsys):
+    original_import = builtins.__import__
+
+    def missing_web_import(name, *args, **kwargs):
+        if name in {"web.server", "threedviz.web.server"}:
+            raise ModuleNotFoundError(f"No module named '{missing}'", name=missing)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_web_import)
+    if missing == "unrelated_dependency":
+        with pytest.raises(ModuleNotFoundError, match=missing):
+            cli.main(["--web"])
+    else:
+        with pytest.raises(SystemExit) as error:
+            cli.main(["--web"])
+        assert error.value.code == 1 and "3dviz[web]" in capsys.readouterr().err
 
 
 def test_invalid_dataset_config_reports_cli_error_before_graphics_import(launches, tmp_path, capsys):
