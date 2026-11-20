@@ -9,7 +9,7 @@ from .. import backbones_2d, backbones_3d, dense_heads, roi_heads
 from ..backbones_2d import map_to_bev
 from ..backbones_3d import pfe, vfe
 from ..model_utils import model_nms_utils
-
+import ast
 
 class Detector3DTemplate(nn.Module):
     def __init__(self, model_cfg, num_class, dataset):
@@ -69,13 +69,31 @@ class Detector3DTemplate(nn.Module):
         if self.model_cfg.get('BACKBONE_3D', None) is None:
             return None, model_info_dict
 
-        backbone_3d_module = backbones_3d.__all__[self.model_cfg.BACKBONE_3D.NAME](
-            model_cfg=self.model_cfg.BACKBONE_3D,
-            input_channels=model_info_dict['num_point_features'],
-            grid_size=model_info_dict['grid_size'],
-            voxel_size=model_info_dict['voxel_size'],
-            point_cloud_range=model_info_dict['point_cloud_range']
-        )
+        # A separate configuration loader for LitePT backbone
+        if 'LitePT' in self.model_cfg.BACKBONE_3D.NAME:
+            new_cfg = {}
+            # Safely parse strings into proper Python types
+            for k, v in self.model_cfg.BACKBONE_3D.items():
+                if isinstance(v, str):
+                    try:
+                        new_cfg[k] = ast.literal_eval(v)
+                    except (ValueError, SyntaxError):
+                        # leave as string if it can't be parsed
+                        pass
+                else:
+                    new_cfg[k] = v
+            new_cfg['grid_size']=model_info_dict['grid_size']
+            backbone_3d_module = backbones_3d.__all__[self.model_cfg.BACKBONE_3D.NAME](
+                **new_cfg
+            )
+        else:
+            backbone_3d_module = backbones_3d.__all__[self.model_cfg.BACKBONE_3D.NAME](
+                model_cfg=self.model_cfg.BACKBONE_3D,
+                input_channels=model_info_dict['num_point_features'],
+                grid_size=model_info_dict['grid_size'],
+                voxel_size=model_info_dict['voxel_size'],
+                point_cloud_range=model_info_dict['point_cloud_range']
+            )
         model_info_dict['module_list'].append(backbone_3d_module)
         model_info_dict['num_point_features'] = backbone_3d_module.num_point_features
         model_info_dict['backbone_channels'] = backbone_3d_module.backbone_channels \
