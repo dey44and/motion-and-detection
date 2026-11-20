@@ -3,13 +3,17 @@ import argparse
 import datetime
 import glob
 import os
+import random
+import time
 from pathlib import Path
 from test import repeat_eval_ckpt
 
+import numpy as np
 import torch
 import torch.nn as nn
 from tensorboardX import SummaryWriter
 
+from eval_utils import eval_utils
 from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
 from pcdet.datasets import build_dataloader
 from pcdet.models import build_network, model_fn_decorator
@@ -42,6 +46,7 @@ def parse_config():
     parser.add_argument('--max_waiting_mins', type=int, default=0, help='max waiting minutes')
     parser.add_argument('--start_epoch', type=int, default=0, help='')
     parser.add_argument('--num_epochs_to_eval', type=int, default=0, help='number of checkpoints to be evaluated')
+    parser.add_argument('--eval_each_epoch', action='store_true', help='run validation after each training epoch')
     parser.add_argument('--save_to_file', action='store_true', default=False, help='')
     
     parser.add_argument('--use_tqdm_to_record', action='store_true', default=False, help='if True, the intermediate losses will not be logged to file, only tqdm will be used')
@@ -171,6 +176,68 @@ def main():
         last_epoch=last_epoch, optim_cfg=cfg.OPTIMIZATION
     )
 
+    eval_output_dir = output_dir / 'eval' / 'eval_with_train'
+
+    def build_validation_loader(seed=None):
+        _, loader, _ = build_dataloader(
+            dataset_cfg=cfg.DATA_CONFIG, class_names=cfg.CLASS_NAMES,
+            batch_size=args.batch_size, dist=dist_train, workers=args.workers,
+            logger=logger, training=False, seed=seed,
+        )
+        return loader
+
+    epoch_end_callback = None
+    if args.eval_each_epoch:
+        validation_seed = 666 + cfg.LOCAL_RANK if args.fix_random_seed else None
+        test_loader = build_validation_loader(validation_seed)
+        eval_model = model.module if dist_train else model
+        # Rank zero's CPU scoring can take longer than the training group's NCCL timeout.
+        eval_sync_group = None
+        if dist_train:
+            eval_sync_group = torch.distributed.new_group(backend='gloo', timeout=datetime.timedelta(hours=1))
+
+        def evaluate_epoch(epoch, resume=False):
+            result_dir = eval_output_dir / f'epoch_{epoch}' / cfg.DATA_CONFIG.DATA_SPLIT['test']
+            completion_file = result_dir / '.complete'
+            if resume:
+                pending = [not completion_file.is_file() if cfg.LOCAL_RANK == 0 else None]
+                if eval_sync_group is not None:
+                    torch.distributed.broadcast_object_list(pending, src=0, group=eval_sync_group)
+                if not pending[0]:
+                    return
+
+            if cfg.LOCAL_RANK == 0:
+                completion_file.unlink(missing_ok=True)
+            start_time = time.perf_counter()
+            training_mode = model.training
+            numpy_state = np.random.get_state()
+            python_state = random.getstate()
+            try:
+                with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+                    if validation_seed is not None:
+                        torch.random.default_generator.manual_seed(validation_seed)
+                        torch.cuda.manual_seed(validation_seed)
+                        np.random.seed(validation_seed)
+                        random.seed(validation_seed)
+                    metrics = eval_utils.eval_one_epoch(
+                        cfg, args, eval_model, test_loader, epoch, logger,
+                        dist_test=dist_train, result_dir=result_dir,
+                    )
+            finally:
+                np.random.set_state(numpy_state)
+                random.setstate(python_state)
+                model.train(training_mode)
+
+            if cfg.LOCAL_RANK == 0:
+                for key, value in metrics.items():
+                    tb_log.add_scalar(f'eval/{key}', value, epoch)
+                completion_file.touch()
+                logger.info('Epoch %d validation took %.1f minutes', epoch, (time.perf_counter() - start_time) / 60)
+            if eval_sync_group is not None:
+                torch.distributed.barrier(group=eval_sync_group)
+
+        epoch_end_callback = evaluate_epoch
+
     # -----------------------start training---------------------------
     logger.info('**********************Start training %s/%s(%s)**********************'
                 % (cfg.EXP_GROUP_PATH, cfg.TAG, args.extra_tag))
@@ -199,7 +266,8 @@ def main():
         use_logger_to_record=not args.use_tqdm_to_record, 
         show_gpu_stat=not args.wo_gpu_stat,
         use_amp=args.use_amp,
-        cfg=cfg
+        cfg=cfg,
+        epoch_end_callback=epoch_end_callback,
     )
 
     if hasattr(train_set, 'use_shared_memory') and train_set.use_shared_memory:
@@ -208,15 +276,12 @@ def main():
     logger.info('**********************End training %s/%s(%s)**********************\n\n\n'
                 % (cfg.EXP_GROUP_PATH, cfg.TAG, args.extra_tag))
 
+    if args.eval_each_epoch:
+        return
+
     logger.info('**********************Start evaluation %s/%s(%s)**********************' %
                 (cfg.EXP_GROUP_PATH, cfg.TAG, args.extra_tag))
-    test_set, test_loader, sampler = build_dataloader(
-        dataset_cfg=cfg.DATA_CONFIG,
-        class_names=cfg.CLASS_NAMES,
-        batch_size=args.batch_size,
-        dist=dist_train, workers=args.workers, logger=logger, training=False
-    )
-    eval_output_dir = output_dir / 'eval' / 'eval_with_train'
+    test_loader = build_validation_loader()
     eval_output_dir.mkdir(parents=True, exist_ok=True)
     args.start_epoch = max(args.epochs - args.num_epochs_to_eval, 0)  # Only evaluate the last args.num_epochs_to_eval epochs
 

@@ -309,13 +309,17 @@ class NuScenesDataset(DatasetTemplate):
         result_str, result_dict = nuscenes_utils.format_nuscene_results(metrics, self.class_names, version=eval_version)
         return result_str, result_dict
 
-    def create_groundtruth_database(self, used_classes=None, max_sweeps=10):
+    def create_groundtruth_database(self, used_classes=None, max_sweeps=10, *, suffix='withvelo', overwrite=True):
         import torch
 
-        database_save_path = self.root_path / f'gt_database_{max_sweeps}sweeps_withvelo'
-        db_info_save_path = self.root_path / f'nuscenes_dbinfos_{max_sweeps}sweeps_withvelo.pkl'
+        # Append the sufix at the end of the path
+        database_save_path = self.root_path / f'gt_database_{max_sweeps}sweeps_{suffix}'
+        db_info_save_path = self.root_path / f'nuscenes_dbinfos_{max_sweeps}sweeps_{suffix}.pkl'
 
-        database_save_path.mkdir(parents=True, exist_ok=True)
+        # Check for file existance
+        if not overwrite and (db_info_save_path.exists() or db_info_save_path.is_symlink()):
+            raise FileExistsError(db_info_save_path)
+        database_save_path.mkdir(parents=True, exist_ok=overwrite)
         all_db_infos = {}
 
         for idx in tqdm(range(len(self.infos))):
@@ -350,8 +354,13 @@ class NuScenesDataset(DatasetTemplate):
         for k, v in all_db_infos.items():
             print('Database %s: %d' % (k, len(v)))
 
-        with open(db_info_save_path, 'wb') as f:
+        # (CODEX) Stage the index inside the reserved donor directory for a new database.
+        index_write_path = db_info_save_path if overwrite else database_save_path / db_info_save_path.name
+        with index_write_path.open('wb') as f:
             pickle.dump(all_db_infos, f)
+        if not overwrite:
+            db_info_save_path.hardlink_to(index_write_path)
+            index_write_path.unlink()
 
 
 def create_nuscenes_info(version, data_path, save_path, max_sweeps=10, with_cam=False):

@@ -151,7 +151,8 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 start_epoch, total_epochs, start_iter, rank, tb_log, ckpt_save_dir, train_sampler=None,
                 lr_warmup_scheduler=None, ckpt_save_interval=1, max_ckpt_save_num=50,
                 merge_all_iters_to_one_epoch=False, use_amp=False,
-                use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None, show_gpu_stat=False, cfg=None):
+                use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None,
+                show_gpu_stat=False, cfg=None, epoch_end_callback=None):
     accumulated_iter = start_iter
 
     # use for disable data augmentation hook
@@ -164,6 +165,10 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
             assert hasattr(train_loader.dataset, 'merge_all_iters_to_one_epoch')
             train_loader.dataset.merge_all_iters_to_one_epoch(merge=True, epochs=total_epochs)
             total_it_each_epoch = len(train_loader) // max(total_epochs, 1)
+
+        # At an epoch boundary the restored weights can also finish an interrupted validation.
+        if epoch_end_callback is not None and start_epoch > 0 and start_iter == start_epoch * total_it_each_epoch:
+            epoch_end_callback(start_epoch, resume=True)
 
         dataloader_iter = iter(train_loader)
         for cur_epoch in tbar:
@@ -209,6 +214,8 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 save_checkpoint(
                     checkpoint_state(model, optimizer, trained_epoch, accumulated_iter), filename=ckpt_name,
                 )
+            if epoch_end_callback is not None:
+                epoch_end_callback(trained_epoch)
 
 
 def model_state_to_cpu(model_state):
