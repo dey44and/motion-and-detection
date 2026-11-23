@@ -8,6 +8,7 @@ from tqdm import tqdm
 from ...ops.roiaware_pool3d import roiaware_pool3d_utils
 from ...utils import common_utils
 from ..dataset import DatasetTemplate
+from .hdl32e_timing import RINGS_PER_COLUMN, point_ages_from_sweep_end
 from pyquaternion import Quaternion
 from PIL import Image
 
@@ -19,6 +20,9 @@ class NuScenesDataset(DatasetTemplate):
             dataset_cfg=dataset_cfg, class_names=class_names, training=training, root_path=root_path, logger=logger
         )
         self.infos = []
+        self.point_time_mode = dataset_cfg.get('POINT_TIME_MODE', 'sweep_end')
+        if self.point_time_mode not in ('sweep_end', 'hdl32e_raw_order'):
+            raise ValueError(f'Unsupported nuScenes point time mode {self.point_time_mode!r}')
         self.camera_config = self.dataset_cfg.get('CAMERA_CONFIG', None)
         if self.camera_config is not None:
             self.use_camera = self.camera_config.get('USE_CAMERA', True)
@@ -82,21 +86,31 @@ class NuScenesDataset(DatasetTemplate):
 
         return sampled_infos
 
-    def get_sweep(self, sweep_info):
-        def remove_ego_points(points, center_radius=1.0):
-            mask = ~((np.abs(points[:, 0]) < center_radius) & (np.abs(points[:, 1]) < center_radius))
-            return points[mask]
+    def get_point_ages(self, scan_info, num_rows, sweep_lag=0.0, point_mask=None):
+        if self.point_time_mode == 'sweep_end':
+            num_points = num_rows if point_mask is None else np.count_nonzero(point_mask)
+            return np.full((num_points, 1), sweep_lag, dtype=np.float64)
 
+        num_columns = scan_info.get('hdl32e_num_columns')
+        if num_columns is None or num_columns * RINGS_PER_COLUMN != num_rows:
+            raise ValueError(f'Missing or mismatched HDL-32E timing metadata for {scan_info["lidar_path"]}')
+        sweep_ages = point_ages_from_sweep_end(num_columns)
+        if point_mask is not None:
+            sweep_ages = sweep_ages[point_mask]
+        return (sweep_ages + sweep_lag)[:, None]
+
+    def get_sweep(self, sweep_info):
         lidar_path = self.root_path / sweep_info['lidar_path']
         points_sweep = np.fromfile(str(lidar_path), dtype=np.float32, count=-1).reshape([-1, 5])[:, :4]
-        points_sweep = remove_ego_points(points_sweep).T
+        keep = ~((np.abs(points_sweep[:, 0]) < 1.0) & (np.abs(points_sweep[:, 1]) < 1.0))
+        cur_times = self.get_point_ages(sweep_info, len(points_sweep), sweep_info['time_lag'], point_mask=keep)
+        points_sweep = points_sweep[keep].T
         if sweep_info['transform_matrix'] is not None:
             num_points = points_sweep.shape[1]
             points_sweep[:3, :] = sweep_info['transform_matrix'].dot(
                 np.vstack((points_sweep[:3, :], np.ones(num_points))))[:3, :]
 
-        cur_times = sweep_info['time_lag'] * np.ones((1, points_sweep.shape[1]))
-        return points_sweep.T, cur_times.T
+        return points_sweep.T, cur_times
 
     def get_lidar_with_sweeps(self, index, max_sweeps=1):
         info = self.infos[index]
@@ -104,7 +118,7 @@ class NuScenesDataset(DatasetTemplate):
         points = np.fromfile(str(lidar_path), dtype=np.float32, count=-1).reshape([-1, 5])[:, :4]
 
         sweep_points_list = [points]
-        sweep_times_list = [np.zeros((points.shape[0], 1))]
+        sweep_times_list = [self.get_point_ages(info, len(points))]
 
         for k in np.random.choice(len(info['sweeps']), max_sweeps - 1, replace=False):
             points_sweep, times_sweep = self.get_sweep(info['sweeps'][k])
@@ -413,31 +427,45 @@ def create_nuscenes_info(version, data_path, save_path, max_sweeps=10, with_cam=
 if __name__ == '__main__':
     import yaml
     import argparse
-    from pathlib import Path
     from easydict import EasyDict
 
     parser = argparse.ArgumentParser(description='arg parser')
-    parser.add_argument('--cfg_file', type=str, default=None, help='specify the config of dataset')
-    parser.add_argument('--func', type=str, default='create_nuscenes_infos', help='')
-    parser.add_argument('--version', type=str, default='v1.0-trainval', help='')
+    parser.add_argument('--cfg_file', type=Path, help='dataset config file')
+    parser.add_argument('--func', choices=('create_nuscenes_infos', 'prepare_point_timing'),
+                        default='create_nuscenes_infos')
+    parser.add_argument('--version', type=str, help='override the dataset version')
     parser.add_argument('--with_cam', action='store_true', default=False, help='use camera or not')
+    parser.add_argument('--output_dir', type=Path, help='destination directory for timing-aware infos')
+    parser.add_argument('--workers', type=int, default=1, help='number of LiDAR readers for point timing')
     args = parser.parse_args()
 
+    repo_root = Path(__file__).resolve().parents[3]
     if args.func == 'create_nuscenes_infos':
         dataset_cfg = EasyDict(yaml.safe_load(open(args.cfg_file)))
-        ROOT_DIR = (Path(__file__).resolve().parent / '../../../').resolve()
-        dataset_cfg.VERSION = args.version
+        dataset_cfg.VERSION = args.version or 'v1.0-trainval'
         create_nuscenes_info(
             version=dataset_cfg.VERSION,
-            data_path=ROOT_DIR / 'data' / 'nuscenes',
-            save_path=ROOT_DIR / 'data' / 'nuscenes',
+            data_path=repo_root / 'data' / 'nuscenes',
+            save_path=repo_root / 'data' / 'nuscenes',
             max_sweeps=dataset_cfg.MAX_SWEEPS,
             with_cam=args.with_cam
         )
 
         nuscenes_dataset = NuScenesDataset(
             dataset_cfg=dataset_cfg, class_names=None,
-            root_path=ROOT_DIR / 'data' / 'nuscenes',
+            root_path=repo_root / 'data' / 'nuscenes',
             logger=common_utils.create_logger(), training=True
         )
         nuscenes_dataset.create_groundtruth_database(max_sweeps=dataset_cfg.MAX_SWEEPS)
+    elif args.func == 'prepare_point_timing':
+        from ...config import cfg_from_yaml_file
+        from .prepare_point_timing import prepare_point_timing
+
+        if args.workers < 1:
+            parser.error('--workers must be positive')
+        tools_dir = repo_root / 'tools'
+        cfg_file = args.cfg_file or tools_dir / 'cfgs' / 'dataset_configs' / 'nuscenes_dataset.yaml'
+        dataset_cfg = cfg_from_yaml_file(cfg_file, EasyDict())
+        version = args.version or dataset_cfg.VERSION
+        root_path = tools_dir / dataset_cfg.DATA_PATH / version
+        prepare_point_timing(dataset_cfg, root_path, output_dir=args.output_dir, workers=args.workers)

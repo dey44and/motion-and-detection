@@ -4,7 +4,7 @@ set -euo pipefail
 # The Slurm job accepts an optional batch size and experiment tag.
 variant=$1
 batch_size=${2:-16}
-experiment=${3:-"coarse-${variant}-b${batch_size}"}
+default_experiment="coarse-${variant}-b${batch_size}"
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 project_dir=/projects/nedevschi/andreii/motion-and-detection
 
@@ -18,7 +18,6 @@ args=(
     --launcher none
     --batch_size "$batch_size"
     --workers 8
-    --extra_tag "$experiment"
     --fix_random_seed
     --wo_gpu_stat
     --eval_each_epoch
@@ -33,13 +32,37 @@ case "$variant" in
             exit 1
         fi
         ;;
-    gt-off)
-        args+=(--set DATA_CONFIG.DATA_AUGMENTOR.DISABLE_AUG_LIST "['placeholder', 'gt_sampling']")
+    gt-off|point-time-gt-off)
+        overrides=(DATA_CONFIG.DATA_AUGMENTOR.DISABLE_AUG_LIST "['placeholder', 'gt_sampling']")
         ;;
     *)
         printf 'Unknown LitePT training variant %s\n' "$variant" >&2
         exit 2
         ;;
 esac
+
+if [[ "$variant" == point-time-gt-off ]]; then
+    default_experiment="${variant}-b${batch_size}"
+    info_dir=point_time_hdl32e_raw_order
+    train_info="$info_dir/nuscenes_infos_10sweeps_train.pkl"
+    val_info="$info_dir/nuscenes_infos_10sweeps_val.pkl"
+    for info in "$train_info" "$val_info"; do
+        path="../data/nuscenes/v1.0-trainval/$info"
+        if [[ ! -f "$path" ]]; then
+            printf 'Point-timing info file is missing at %s\n' "$path" >&2
+            exit 1
+        fi
+    done
+    overrides+=(
+        DATA_CONFIG.POINT_TIME_MODE hdl32e_raw_order
+        DATA_CONFIG.INFO_PATH.train "['$train_info']"
+        DATA_CONFIG.INFO_PATH.test "['$val_info']"
+    )
+fi
+
+args+=(--extra_tag "${3:-$default_experiment}")
+if [[ "$variant" != gt-on ]]; then
+    args+=(--set "${overrides[@]}")
+fi
 
 exec ../.venv/bin/python -u train.py "${args[@]}"

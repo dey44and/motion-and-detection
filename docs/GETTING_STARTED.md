@@ -65,6 +65,14 @@ python -m pcdet.datasets.nuscenes.nuscenes_dataset --func create_nuscenes_infos 
     --with_cam
 ```
 
+To add per-point LiDAR timing to existing train and validation infos, run this command from the repository root.
+It writes timing-aware copies in `point_time_hdl32e_raw_order` under the dataset version directory.
+Set `--output_dir` to choose a different destination.
+
+```sh
+python -m pcdet.datasets.nuscenes.nuscenes_dataset --func prepare_point_timing --workers 2
+```
+
 ### Waymo Open Dataset
 * Please download the official [Waymo Open Dataset](https://waymo.com/open/download/), 
 including the training data `training_0000.tar~training_0031.tar` and the validation 
