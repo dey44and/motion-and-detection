@@ -13,20 +13,22 @@ from __future__ import annotations
 
 import json
 from collections import OrderedDict, defaultdict
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
 from ..errors import DataUnavailableError, DatasetError, DatasetValidationError, UnknownIdentifierError
 from ..models import (
     AcquisitionGeometry, AnnotationAlignment, AnnotationSet, AnnotationStatus,
-    AnnotationTiming, Box3D, CameraFrameSet, CameraObservation, FrameInfo,
+    AnnotationTiming, Box3D, CameraFrameSet, CameraObservation, FrameInfo, LidarSegmentation,
     Modality, PointCloudFrame, PointColors, PointTiming, ProcessingProvenance,
     SceneInfo, TimingQuality,
 )
 from ..projection import PinholeProjection
+from .lidarseg import native_to_evaluation, read_label_file, validate_labels
 
 _POINT_SOURCE = "nuscenes:native:LIDAR_TOP:compensated-v1"
 _CAMERA_SOURCE = "nuscenes:native:camera-keyframes-v1"
@@ -113,6 +115,31 @@ def _transform(record: dict[str, Any], context: str) -> np.ndarray:
     return result
 
 
+class _SceneSweeps(NamedTuple):
+    records: list[dict]
+    lidar: list[dict]
+    cameras: dict[str, list[dict]]
+
+
+class _IndexedSceneRecords(Mapping):
+    """Access one kind of sweep record without preloading all scenes."""
+
+    def __init__(self, reader, field):
+        self._reader = reader
+        self._field = field
+
+    def __getitem__(self, scene_token):
+        if scene_token not in self._reader._frames_by_scene:
+            raise KeyError(scene_token)
+        return getattr(self._reader._indexed_scene(scene_token), self._field)
+
+    def __iter__(self):
+        return iter(self._reader._frames_by_scene)
+
+    def __len__(self):
+        return len(self._reader._frames_by_scene)
+
+
 class NuScenesReader:
     """Indexed lazy sensor reader for mini, trainval and test releases.
 
@@ -121,7 +148,9 @@ class NuScenesReader:
     opens LiDAR files and reading ordinary LiDAR frames never opens images.
     """
 
-    def __init__(self, *, root: str | Path | None, version: str = "v1.0-mini", sensor: str = "lidar", _validate_active_frames: bool = True):
+    def __init__(self, *, root: str | Path | None, version: str = "v1.0-mini", sensor: str = "lidar",
+                 metadata_cache: bool = False, progress: Callable[[str], None] | None = None,
+                 _validate_active_frames: bool = True):
         if sensor not in ("lidar", "camera"):
             raise DatasetError(f"Unknown nuScenes sensor {sensor!r}: expected 'lidar' or 'camera'.")
         self.sensor = sensor
@@ -144,12 +173,25 @@ class NuScenesReader:
                 "Choose the extracted dataset root or its version directory, and check --version."
             )
 
+        self._metadata_index = None
+        try:
+            self._load_catalog(metadata_cache, progress)
+        except BaseException:
+            if self._metadata_index is not None:
+                self._metadata_index.close()
+            raise
+
+    def _load_catalog(self, metadata_cache: bool, progress: Callable[[str], None] | None):
+        source_snapshot = None
+        if metadata_cache:
+            from .metadata import MetadataCacheError, metadata_source_snapshot, open_metadata_index
+
+            source_snapshot = metadata_source_snapshot(self.table_root)
         scenes = self._index_table("scene")
         samples = self._index_table("sample")
         self._known_frame_tokens = frozenset(samples)
         self._sample_scene_tokens = {token: sample.get("scene_token") for token, sample in samples.items()}
         self._calibrations = self._index_table("calibrated_sensor")
-        self._poses = self._index_table("ego_pose")
         sensors = self._index_table("sensor")
         self._sensor_channels = tuple(
             (sensor.get("channel"), sensor.get("modality")) for sensor in sensors.values()
@@ -158,7 +200,35 @@ class NuScenesReader:
             token: (sensor.get("channel"), sensor.get("modality")) for token, sensor in sensors.items()
         }
         categories = self._index_table("category", optional=True)
+        self._lidarseg_categories = tuple(categories.values())
+        self._lidarseg_by_scan: dict[str, dict[str, Any]] | None = None
+        self._lidarseg_mapping: np.ndarray | None = None
         instances = self._index_table("instance", optional=True)
+
+        def annotation_class(annotation):
+            self._record(samples, annotation.get("sample_token"), "sample")
+            name = annotation.get("category_name")
+            if not name:
+                instance = self._record(instances, annotation.get("instance_token"), "instance")
+                category = self._record(categories, instance.get("category_token"), "category")
+                name = category.get("name")
+            if not isinstance(name, str) or not name:
+                raise DatasetError(f"Invalid category for annotation {annotation.get('token')!r}.")
+            return name
+
+        if metadata_cache:
+            try:
+                self._metadata_index = open_metadata_index(
+                    self.table_root, self._sample_scene_tokens, annotation_class,
+                    progress=progress, source_snapshot=source_snapshot,
+                )
+            except MetadataCacheError:
+                if progress is not None:
+                    progress("Metadata cache unavailable. Reading nuScenes tables into memory")
+        index = self._metadata_index
+        if index is not None and progress is not None:
+            progress("Reading nuScenes keyframes from the local index")
+        self._poses = index.poses if index is not None else self._index_table("ego_pose")
 
         # Reverse-index plain JSON; sample.data and sample.anns only exist after
         # SDK enrichment and are intentionally not required by this adapter.
@@ -166,7 +236,11 @@ class NuScenesReader:
         self._cameras_by_sample: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
         # Camera viewing keeps only usable keyframes. The much larger sweep
         # indexes are needed only by optional LiDAR timing/RGB preparation.
-        if self.sensor == "lidar":
+        keyframes_only = index is not None or self.sensor == "camera"
+        if index is not None:
+            self._sample_data = {}
+            data_records = index.keyframes()
+        elif self.sensor == "lidar":
             self._sample_data = self._index_table("sample_data")
             data_records = self._sample_data.values()
         else:
@@ -176,21 +250,18 @@ class NuScenesReader:
         self._lidar_sweeps_by_scene: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._cameras_by_scene: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
         self._has_camera_data = False
+        if index is not None:
+            self._has_camera_data = any(self._is_camera_calibration(token) for token in index.calibration_tokens())
         for data in data_records:
-            if self.sensor == "camera" and not data.get("is_key_frame", False):
+            if keyframes_only and not data.get("is_key_frame", False):
                 # Retain an availability flag for optional point coloring,
                 # including extracts that contain only nonkey camera images.
                 # No nonkey records or decoded images are retained here.
-                try:
-                    calibration = self._calibrations.get(data.get("calibrated_sensor_token"), {})
-                    channel, modality = self._sensor_by_token.get(calibration.get("sensor_token"), (None, None))
-                    self._has_camera_data |= channel in _CAMERA_CHANNELS and modality == "camera"
-                except TypeError:
-                    pass
+                self._has_camera_data |= self._is_camera_calibration(data.get("calibrated_sensor_token"))
                 continue
             sample_token = data.get("sample_token")
             sample = samples.get(sample_token) if isinstance(sample_token, str) else None
-            if sample is not None and self.sensor == "lidar":
+            if sample is not None and not keyframes_only:
                 # A sensor record with unusable optional calibration may still
                 # contribute a valid timestamped ego pose to the trajectory.
                 self._data_by_scene[sample.get("scene_token")].append(data)
@@ -213,7 +284,7 @@ class NuScenesReader:
                 self._has_camera_data = True
                 self._cameras_by_scene[scene_token][channel].append(data)
                 if data.get("is_key_frame", False):
-                    if self.sensor == "camera":
+                    if keyframes_only:
                         self._retain_keyframe(data)
                     cameras = self._cameras_by_sample[sample_token]
                     if channel in cameras:
@@ -221,10 +292,10 @@ class NuScenesReader:
                     cameras[channel] = data
             if channel != "LIDAR_TOP" or sensor.get("modality") != "lidar":
                 continue
-            if self.sensor == "lidar":
+            if not keyframes_only:
                 self._lidar_sweeps_by_scene[scene_token].append(data)
             if data.get("is_key_frame", False):
-                if self.sensor == "camera":
+                if keyframes_only:
                     self._retain_keyframe(data)
                 if sample_token in self._lidar_by_sample:
                     raise DatasetError(f"Multiple LIDAR_TOP keyframes reference sample {sample_token!r}.")
@@ -232,16 +303,19 @@ class NuScenesReader:
 
         # Keep only predecessor timestamps, not nonkeyframe records, for scan
         # intervals in ordinary camera-mode cross-modality point reads.
-        previous_tokens = {data.get("prev") for data in self._lidar_by_sample.values() if data.get("prev")}
-        previous_times = {
-            data.get("token"): _timestamp(data.get("timestamp")) for data in data_records
-            if data.get("token") in previous_tokens
-        }
-        self._lidar_sweep_start_us = {
-            data["token"]: previous_times[data["prev"]] for data in self._lidar_by_sample.values()
-            if data.get("prev") in previous_times and previous_times[data["prev"]] is not None
-        }
-        self._sweep_indexes_ready = self.sensor == "lidar"
+        self._lidar_sweep_start_us = {}
+        if index is None:
+            previous_tokens = {data.get("prev") for data in self._lidar_by_sample.values() if data.get("prev")}
+            previous_times = {
+                data.get("token"): _timestamp(data.get("timestamp")) for data in data_records
+                if data.get("token") in previous_tokens
+            }
+            self._lidar_sweep_start_us = {
+                data["token"]: previous_times[data["prev"]] for data in self._lidar_by_sample.values()
+                if data.get("prev") in previous_times and previous_times[data["prev"]] is not None
+            }
+        self._sweep_indexes_ready = not keyframes_only
+        self._indexed_scenes: OrderedDict[str, _SceneSweeps] = OrderedDict()
 
         for channels in self._cameras_by_scene.values():
             for observations in channels.values():
@@ -260,18 +334,13 @@ class NuScenesReader:
             if not isinstance(name, str) or not name:
                 raise DatasetError("Invalid category.json record: expected a nonempty name.")
             native_class_names.add(name)
-        for annotation in self._read_table("sample_annotation", optional=True):
-            sample_token = annotation.get("sample_token")
-            self._record(samples, sample_token, "sample")
-            name = annotation.get("category_name")
-            if not name:
-                instance = self._record(instances, annotation.get("instance_token"), "instance")
-                category = self._record(categories, instance.get("category_token"), "category")
-                name = category.get("name")
-            if not isinstance(name, str) or not name:
-                raise DatasetError(f"Invalid category for annotation {annotation.get('token')!r}.")
-            native_class_names.add(name)
-            self._annotations[sample_token].append((annotation, name))
+        if index is None:
+            for annotation in self._read_table("sample_annotation", optional=True):
+                name = annotation_class(annotation)
+                native_class_names.add(name)
+                self._annotations[annotation["sample_token"]].append((annotation, name))
+        else:
+            native_class_names.update(index.annotation_classes())
         self._native_class_names = tuple(sorted(native_class_names))
 
         samples_by_scene: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -306,6 +375,14 @@ class NuScenesReader:
                 },
             ))
         self._scenes = tuple(sorted(scene_infos, key=lambda scene: (scene.display_name, scene.scene_id)))
+
+    def _is_camera_calibration(self, token) -> bool:
+        try:
+            calibration = self._calibrations.get(token, {})
+            channel, modality = self._sensor_by_token.get(calibration.get("sensor_token"), (None, None))
+            return channel in _CAMERA_CHANNELS and modality == "camera"
+        except TypeError:
+            return False
 
     def _retain_keyframe(self, data: dict[str, Any]) -> None:
         token = data.get("token")
@@ -343,21 +420,34 @@ class NuScenesReader:
         )
 
     def _ensure_sweep_indexes(self) -> None:
-        """Add motion/RGB indexes without duplicating large common tables.
+        """Provide motion/RGB records while keeping the keyframe catalog."""
 
-        Camera enumeration remains camera enumeration after this upgrade.
-        Existing poses, calibration, annotations, and decoded images are reused.
-        """
         if self._sweep_indexes_ready:
+            return
+        if self._metadata_index is not None:
+            self._sample_data = self._metadata_index.sample_data
+            self._data_by_scene = _IndexedSceneRecords(self, "records")
+            self._lidar_sweeps_by_scene = _IndexedSceneRecords(self, "lidar")
+            self._cameras_by_scene = _IndexedSceneRecords(self, "cameras")
+            self._sweep_indexes_ready = True
             return
         sample_data = self._index_table("sample_data")
         for token, previous in self._sample_data.items():
             if sample_data.get(token) != previous:
                 raise DatasetError(f"nuScenes sample_data keyframe {token!r} changed after it was indexed.")
+        data_by_scene, lidar_by_scene, cameras_by_scene = self._group_sweeps(sample_data.values())
+        # Commit only after indexing succeeds; optional preparation is atomic.
+        self._sample_data = sample_data
+        self._data_by_scene = data_by_scene
+        self._lidar_sweeps_by_scene = lidar_by_scene
+        self._cameras_by_scene = cameras_by_scene
+        self._sweep_indexes_ready = True
+
+    def _group_sweeps(self, sample_data):
         data_by_scene: dict[str, list[dict[str, Any]]] = defaultdict(list)
         lidar_by_scene: dict[str, list[dict[str, Any]]] = defaultdict(list)
         cameras_by_scene: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
-        for data in sample_data.values():
+        for data in sample_data:
             scene_token = self._sample_scene_tokens.get(data.get("sample_token"))
             if scene_token is None:
                 continue
@@ -378,12 +468,24 @@ class NuScenesReader:
         for channels in cameras_by_scene.values():
             for observations in channels.values():
                 observations.sort(key=lambda record: _timestamp(record.get("timestamp")) or 0)
-        # Commit only after indexing succeeds; optional preparation is atomic.
-        self._sample_data = sample_data
-        self._data_by_scene = data_by_scene
-        self._lidar_sweeps_by_scene = lidar_by_scene
-        self._cameras_by_scene = cameras_by_scene
-        self._sweep_indexes_ready = True
+        return data_by_scene, lidar_by_scene, cameras_by_scene
+
+    def _indexed_scene(self, scene_token):
+        if scene_token not in self._indexed_scenes:
+            records, lidar, cameras = self._group_sweeps(self._metadata_index.scene_sample_data(scene_token))
+            self._indexed_scenes[scene_token] = _SceneSweeps(records[scene_token], lidar[scene_token], cameras[scene_token])
+            if len(self._indexed_scenes) > 2:
+                self._indexed_scenes.popitem(last=False)
+        self._indexed_scenes.move_to_end(scene_token)
+        return self._indexed_scenes[scene_token]
+
+    def close(self) -> None:
+        """Release cached scene data and the local metadata reader."""
+        self._image_cache.clear()
+        self._trajectories.clear()
+        self._indexed_scenes.clear()
+        if self._metadata_index is not None:
+            self._metadata_index.close()
 
     def _read_table(self, name: str, *, optional: bool = False) -> list[dict[str, Any]]:
         path = self.table_root / f"{name}.json"
@@ -426,6 +528,8 @@ class NuScenesReader:
 
     @property
     def supports_camera_rgb(self) -> bool:
+        if self._metadata_index is not None:
+            return self.supports_point_timing and self._has_camera_data
         return self.supports_point_timing and any(self._cameras_by_scene.values())
 
     def list_scenes(self) -> tuple[SceneInfo, ...]:
@@ -496,6 +600,41 @@ class NuScenesReader:
             raise DataUnavailableError(f"nuScenes frame {frame_id!r} has no {modality.value} observation.")
         return frames[frame_id]
 
+    def lidar_scan_token(self, frame_id: str) -> str:
+        self._frame_info(frame_id, Modality.POINT_CLOUD)
+        return self._lidar_by_sample[frame_id]["token"]
+
+    def load_lidarseg_ground_truth(self, frame: PointCloudFrame) -> LidarSegmentation:
+        token = self.lidar_scan_token(frame.info.frame_id)
+        if frame.reference_frame_id != f"sensor:LIDAR_TOP:{token}" or frame.source_id != _POINT_SOURCE:
+            raise DatasetValidationError("The cloud does not match the dataset's original LIDAR_TOP scan.")
+        if self.version.endswith("test"):
+            raise DataUnavailableError("Ground-truth LiDAR segmentation is withheld for the nuScenes test release.")
+        if self._lidarseg_by_scan is None:
+            if not (self.table_root / "lidarseg.json").is_file():
+                raise DataUnavailableError(f"Install nuScenes lidarseg for {self.version} to view ground truth.")
+            metadata = self._index_table("lidarseg")
+            mapping = native_to_evaluation(self._lidarseg_categories)
+            self._lidarseg_by_scan, self._lidarseg_mapping = metadata, mapping
+        row = self._lidarseg_by_scan.get(token)
+        if row is None:
+            raise DataUnavailableError(f"There are no ground-truth labels for LIDAR_TOP scan {token}.")
+        if row.get("sample_data_token", token) != token:
+            raise DatasetValidationError(f"Ground-truth metadata refers to a different LIDAR_TOP scan than {token}.")
+        filename = row.get("filename")
+        if not isinstance(filename, str) or not filename or Path(filename).is_absolute() or ".." in Path(filename).parts:
+            raise DatasetValidationError(f"Invalid ground-truth lidarseg filename {filename!r} for scan {token}.")
+        candidates = (root / filename for root in self._data_roots)
+        path = next((path for path in candidates if path.is_file()), None)
+        if path is None:
+            raise DataUnavailableError(f"The ground-truth lidarseg file is missing: {filename}.")
+        point_count = len(frame.points)
+        native = validate_labels(
+            read_label_file(path, point_count), point_count,
+            context=path.name, maximum=len(self._lidarseg_mapping) - 1,
+        )
+        return LidarSegmentation(token, self._lidarseg_mapping[native], native)
+
     def load_frame(self, frame_token: str) -> PointCloudFrame:
         frame_info = self._frame_info(frame_token, Modality.POINT_CLOUD)
         data = self._lidar_by_sample[frame_token]
@@ -543,7 +682,11 @@ class NuScenesReader:
             attributes["ring"] = np.ascontiguousarray(scan[:, 4], dtype=np.int32)
         reference = f"sensor:LIDAR_TOP:{data['token']}"
         end = _timestamp(data.get("timestamp"))
-        start = self._lidar_sweep_start_us.get(data["token"])
+        if self._metadata_index is None:
+            start = self._lidar_sweep_start_us.get(data["token"])
+        else:
+            previous = self._metadata_index.sample_data.get(data.get("prev"), {})
+            start = _timestamp(previous.get("timestamp"))
         if start is not None and (end is None or start >= end):
             start = None
         return PointCloudFrame(
@@ -557,7 +700,9 @@ class NuScenesReader:
 
     def _world_boxes(self, frame_token: str) -> tuple[Box3D, ...]:
         boxes = []
-        for annotation, class_name in self._annotations.get(frame_token, ()):
+        annotations = (self._annotations.get(frame_token, ()) if self._metadata_index is None
+                       else self._metadata_index.annotations(frame_token))
+        for annotation, class_name in annotations:
             token = annotation.get("token", "")
             size = _vector(annotation.get("size"), 3, f"box {token!r} size")
             if np.any(size <= 0):

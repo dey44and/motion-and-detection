@@ -71,7 +71,7 @@ def test_camera_only_provider_is_closed_once_with_actionable_error(monkeypatch):
             super().close()
 
     loader = Cameras()
-    monkeypatch.setattr(factory, "create_loader", lambda name, config: loader)
+    monkeypatch.setattr(factory, "create_loader", lambda name, config, *, progress=None: loader)
     with pytest.raises(UnsupportedCapabilityError, match="point-cloud"):
         factory.create_dataset("camera-only")
     assert loader.close_calls == 1

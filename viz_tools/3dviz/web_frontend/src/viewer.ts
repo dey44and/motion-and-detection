@@ -4,11 +4,12 @@ import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { absolute, rotationAngles, rotationQuaternion } from './camera';
-import type { CameraView, DatasetClass, FramePacket, Scheme, Vec3 } from './types';
+import type { Box, CameraView, FramePacket, Scheme, SemanticClass, Vec3 } from './types';
 
 const EDGES = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
 export interface ClassStyle {visible: boolean; color: string}
 export interface PointStyle {scheme: Scheme; size: number; maxDistance: number}
+export interface BoxStyle {width: number; groundTruth: boolean; predictions: boolean; groundTruthColor: string | null; predictionColor: string}
 export class Viewer {
   readonly renderer: THREE.WebGLRenderer;
   readonly scene = new THREE.Scene();
@@ -17,8 +18,10 @@ export class Viewer {
   readonly origin = new THREE.Vector3();
   private points: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.ShaderMaterial> | null = null;
   private readonly boxes = new Map<string, LineSegments2>();
+  private readonly predictions = new Map<string, LineSegments2>();
   private readonly axes: LineSegments2;
   private readonly textures = new Map<string, THREE.DataTexture>();
+  private readonly semanticPalette = new THREE.DataTexture(new Uint8Array(256 * 4), 256, 1);
   private bounds = new THREE.Box3(new THREE.Vector3(-10,-10,-2), new THREE.Vector3(10,10,2));
   private animation: number | null = null;
   private axesEnabled = true;
@@ -39,6 +42,8 @@ export class Viewer {
     this.controls.minDistance = 0.1;
     this.controls.maxDistance = 100000;
     this.controls.addEventListener('change', () => {this.invalidate(); this.onCameraChange?.();});
+    this.semanticPalette.magFilter = this.semanticPalette.minFilter = THREE.NearestFilter;
+    this.setSemanticClasses([], new Set());
     for (const [key, values] of Object.entries(palettes)) {
       if (values.length !== 256 || values.some(row => row.length !== 3 || row.some(v => !Number.isFinite(v) || v < 0 || v > 1))) throw new Error(`Invalid ${key} palette from the server.`);
       const data = new Float32Array(values.flatMap(row => [...row, 1]));
@@ -62,13 +67,14 @@ export class Viewer {
     if (this.points) this.points.material.uniforms.viewportHeight.value = this.renderer.domElement.height;
     this.axes.material.resolution.set(width, height);
     for (const line of this.boxes.values()) line.material.resolution.set(width, height);
+    for (const line of this.predictions.values()) line.material.resolution.set(width, height);
     this.invalidate();
   }
   private invalidate() {
     if (this.animation !== null) return;
     this.animation = requestAnimationFrame(() => {this.animation = null; this.renderer.render(this.scene, this.camera);});
   }
-  setFrame(packet: FramePacket, classes: DatasetClass[], styles: Map<string, ClassStyle>, reset: boolean) {
+  setFrame(packet: FramePacket, reset: boolean) {
     const oldView = this.captureCamera();
     const {header, positions, distance, rgb, rgbMask} = packet;
     const origin = new THREE.Vector3(...header.origin);
@@ -83,12 +89,13 @@ export class Viewer {
     geometry.setAttribute('distanceFromOrigin', new THREE.InstancedBufferAttribute(distance, 1));
     geometry.setAttribute('cameraRgb', new THREE.InstancedBufferAttribute(rgb ?? new Uint8Array(header.count * 3), 3, true));
     geometry.setAttribute('cameraValid', new THREE.InstancedBufferAttribute(rgbMask ?? new Uint8Array(header.count), 1));
+    geometry.setAttribute('semanticId', new THREE.InstancedBufferAttribute(new Uint8Array(header.count).fill(255), 1));
     const material = new THREE.ShaderMaterial({
-      uniforms: {pointSize: {value: this.style.size * this.renderer.getPixelRatio()}, viewportHeight: {value: this.renderer.domElement.height}, maxDistance: {value: this.style.maxDistance}, colorMode: {value: 0}, palette: {value: this.textures.get('viridis')}},
-      vertexShader: `attribute vec3 pointCenter; attribute float distanceFromOrigin; attribute vec3 cameraRgb; attribute float cameraValid;
+      uniforms: {pointSize: {value: this.style.size * this.renderer.getPixelRatio()}, viewportHeight: {value: this.renderer.domElement.height}, maxDistance: {value: this.style.maxDistance}, colorMode: {value: 0}, palette: {value: this.textures.get('viridis')}, semanticPalette: {value: this.semanticPalette}},
+      vertexShader: `attribute vec3 pointCenter; attribute float distanceFromOrigin; attribute vec3 cameraRgb; attribute float cameraValid; attribute float semanticId;
         uniform float pointSize; uniform float viewportHeight;
-        varying float vDistance; varying vec3 vRgb; varying float vValid; varying vec3 vNormal;
-        void main(){ vDistance=distanceFromOrigin; vRgb=cameraRgb; vValid=cameraValid;
+        varying float vDistance; varying vec3 vRgb; varying float vValid; varying vec3 vNormal; varying float vSemantic;
+        void main(){ vDistance=distanceFromOrigin; vRgb=cameraRgb; vValid=cameraValid; vSemantic=semanticId;
           vec4 center=modelViewMatrix*vec4(pointCenter,1.0);
           vNormal=normalMatrix*normal;
           if(center.z>=0.0){gl_Position=vec4(2.0,2.0,2.0,1.0);return;}
@@ -103,42 +110,77 @@ export class Viewer {
           offset.x*=projectionMatrix[0][0]/projectionMatrix[1][1];
           clipVertex.xy=(clipCenter.xy/clipCenter.w+offset)*clipVertex.w;
           gl_Position=clipVertex; }`,
-      fragmentShader: `precision highp float; uniform float maxDistance; uniform int colorMode; uniform sampler2D palette;
-        varying float vDistance; varying vec3 vRgb; varying float vValid; varying vec3 vNormal;
+      fragmentShader: `precision highp float; uniform float maxDistance; uniform int colorMode; uniform sampler2D palette; uniform sampler2D semanticPalette;
+        varying float vDistance; varying vec3 vRgb; varying float vValid; varying vec3 vNormal; varying float vSemantic;
         void main(){float t=clamp(vDistance/maxDistance,0.0,1.0); vec3 gray=vec3(0.12+0.6*t);
           float index=min(floor(t*256.0),255.0); vec3 mapped=texture2D(palette,vec2((index+0.5)/256.0,0.5)).rgb;
           vec3 rgb=colorMode==0?gray:(colorMode==2?(vValid>0.5?vRgb:gray):mapped);
+          if(colorMode==3){vec4 semantic=texture2D(semanticPalette,vec2((vSemantic+0.5)/256.0,0.5));
+            if(semantic.a<0.5) discard;
+            rgb=semantic.rgb;}
           float light=0.72+0.28*max(dot(normalize(vNormal),normalize(vec3(-0.4,0.6,1.0))),0.0);
           gl_FragColor=vec4(rgb*light,1.0);}`,
     });
     const points = new THREE.Mesh(geometry, material);
     // Centers and pixel-sized radii are applied in the shader, outside the base shape's bounds.
     points.frustumCulled = false;
-    const newBoxes = new Map<string, LineSegments2>();
-    const grouped = new Map<string, number[]>();
-    for (const box of header.boxes) {
-      const coordinates = grouped.get(box.class_id) ?? [];
-      for (const [a,b] of EDGES) for (const index of [a,b]) for (let axis = 0; axis < 3; axis++) coordinates.push(box.corners[index][axis] - header.origin[axis]);
-      grouped.set(box.class_id, coordinates);
-    }
-    for (const [id, coordinates] of grouped) {
-      const definition = classes.find(c => c.id === id);
-      const color = styles.get(id)?.color;
-      const lineMaterial = new LineMaterial({linewidth: 2, color: color ?? new THREE.Color().setRGB(...(definition?.color ?? [0.1,0.35,0.75]), THREE.SRGBColorSpace)});
-      const line = new LineSegments2(new LineSegmentsGeometry().setPositions(coordinates), lineMaterial);
-      newBoxes.set(id, line);
-    }
     if (this.points) {this.scene.remove(this.points); this.points.geometry.dispose(); this.points.material.dispose();}
-    for (const line of this.boxes.values()) {this.scene.remove(line); line.geometry.dispose(); line.material.dispose();}
-    this.boxes.clear(); this.points = points; this.scene.add(points);
-    for (const [id, line] of newBoxes) {this.boxes.set(id, line); this.scene.add(line);}
+    this.points = points; this.scene.add(points);
     this.origin.copy(origin);
+    this.replaceBoxes(this.boxes, header.boxes, false);
+    this.replaceBoxes(this.predictions, [], true);
     this.axes.position.copy(origin).negate();
     this.axes.visible = this.axesEnabled;
     this.bounds.set(new THREE.Vector3(...header.bounds.min).sub(origin), new THREE.Vector3(...header.bounds.max).sub(origin));
-    this.setPointStyle(this.style); this.setBoxStyle(styles, 2);
+    this.setPointStyle(this.style);
     if (reset) this.resetCamera(); else this.applyCamera(oldView);
     this.resize(); this.invalidate();
+  }
+  private replaceBoxes(layer: Map<string, LineSegments2>, boxes: readonly Box[], dashed: boolean) {
+    for (const line of layer.values()) {this.scene.remove(line); line.geometry.dispose(); line.material.dispose();}
+    layer.clear();
+    const grouped = new Map<string, number[]>();
+    for (const box of boxes) {
+      const coordinates = grouped.get(box.class_id) ?? [];
+      for (const [a,b] of EDGES) for (const index of [a,b]) {
+        const [x, y, z] = box.corners[index];
+        coordinates.push(x - this.origin.x, y - this.origin.y, z - this.origin.z);
+      }
+      grouped.set(box.class_id, coordinates);
+    }
+    const resolution = this.renderer.getSize(new THREE.Vector2());
+    for (const [id, coordinates] of grouped) {
+      const material = new LineMaterial({dashed, dashSize: .6, gapSize: .34});
+      material.resolution.copy(resolution);
+      const line = new LineSegments2(new LineSegmentsGeometry().setPositions(coordinates), material);
+      if (dashed) line.computeLineDistances();
+      layer.set(id, line);
+      this.scene.add(line);
+    }
+  }
+  setPredictionBoxes(boxes: readonly Box[]) {
+    this.replaceBoxes(this.predictions, boxes, true);
+    this.invalidate();
+  }
+  setSemanticLabels(labels: Uint8Array | null) {
+    if (!this.points) return;
+    const attribute = this.points.geometry.getAttribute('semanticId');
+    const target = attribute.array as Uint8Array;
+    if (labels && labels.length === target.length) target.set(labels);
+    else target.fill(255);
+    attribute.needsUpdate = true;
+    this.invalidate();
+  }
+  setSemanticClasses(classes: readonly SemanticClass[], hidden: ReadonlySet<number>) {
+    const colors = this.semanticPalette.image.data as Uint8Array;
+    for (let index = 0; index < 256; index++) colors.set([120, 124, 133, 255], index * 4);
+    for (const item of classes) colors.set([...item.color.map(c => Math.round(c * 255)), hidden.has(item.id) ? 0 : 255], item.id * 4);
+    this.semanticPalette.needsUpdate = true;
+    this.invalidate();
+  }
+  showPoints(visible: boolean) {
+    if (this.points) this.points.visible = visible;
+    this.invalidate();
   }
   setPointStyle(style: PointStyle) {
     this.style = {...style};
@@ -146,25 +188,31 @@ export class Viewer {
       const uniforms = this.points.material.uniforms;
       uniforms.pointSize.value = style.size * this.renderer.getPixelRatio();
       uniforms.maxDistance.value = style.maxDistance;
-      uniforms.colorMode.value = style.scheme === 'gray' ? 0 : style.scheme === 'rgb' ? 2 : 1;
+      uniforms.colorMode.value = {gray: 0, viridis: 1, concerto: 1, rgb: 2, semantic: 3}[style.scheme];
       uniforms.palette.value = this.textures.get(style.scheme === 'concerto' ? 'concerto' : 'viridis');
     }
     this.invalidate();
   }
-  setBoxStyle(styles: Map<string, ClassStyle>, width: number) {
+  setBoxStyle(styles: Map<string, ClassStyle>, appearance: BoxStyle) {
     for (const [id, line] of this.boxes) {
       const style = styles.get(id);
-      line.visible = style?.visible ?? true;
-      if (style) line.material.color.set(style.color);
-      line.material.linewidth = width;
+      line.visible = appearance.groundTruth && (style?.visible ?? true);
+      line.material.color.set(appearance.groundTruthColor ?? style?.color ?? '#1959bf');
+      line.material.linewidth = appearance.width;
+    }
+    for (const [id, line] of this.predictions) {
+      line.visible = appearance.predictions && (styles.get(id)?.visible ?? true);
+      line.material.color.set(appearance.predictionColor);
+      line.material.linewidth = appearance.width;
     }
     this.invalidate();
   }
   showAxes(value: boolean) {this.axesEnabled = value; this.axes.visible = Boolean(this.points) && value; this.invalidate();}
   clearFrame() {
     if (this.points) {this.scene.remove(this.points); this.points.geometry.dispose(); this.points.material.dispose(); this.points = null;}
-    for (const line of this.boxes.values()) {this.scene.remove(line); line.geometry.dispose(); line.material.dispose();}
-    this.boxes.clear(); this.axes.visible = false; this.invalidate();
+    this.replaceBoxes(this.boxes, [], false);
+    this.replaceBoxes(this.predictions, [], true);
+    this.axes.visible = false; this.invalidate();
   }
   resetCamera() {
     const center = this.bounds.getCenter(new THREE.Vector3());
@@ -197,8 +245,10 @@ export class Viewer {
     if (this.animation !== null) cancelAnimationFrame(this.animation);
     this.points?.geometry.dispose(); this.points?.material.dispose();
     for (const line of this.boxes.values()) {line.geometry.dispose(); line.material.dispose();}
+    for (const line of this.predictions.values()) {line.geometry.dispose(); line.material.dispose();}
     this.axes.geometry.dispose(); this.axes.material.dispose();
     for (const texture of this.textures.values()) texture.dispose();
+    this.semanticPalette.dispose();
     this.renderer.dispose(); this.renderer.domElement.remove();
   }
 }

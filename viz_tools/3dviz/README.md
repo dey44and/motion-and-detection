@@ -1,14 +1,13 @@
 # ☁️ 3dviz
 
-Inspect autonomous-driving point clouds, 3D ground truth and camera-derived
-colors in a standalone desktop or local browser viewer. Browse scenes and frames, adjust their
-appearance, and inspect acquisition geometry where the dataset supports it.
+Inspect autonomous-driving point clouds, 3D ground truth, predicted detections,
+camera-derived point colors, and nuScenes LiDAR segmentation in one local
+browser workspace.
 
 Dataset reading belongs to [`visual-utils`](../../visual_utils/README.md).
-Its `DatasetLoader` and canonical observations are shared with research scripts,
-[2dcameraviz](../2dcameraviz/README.md) and [3ddetviz](../3ddetviz/README.md).
-This package provides point colors, box geometry, camera navigation and
-asynchronous controls. Desktop remains the default; browser mode is optional.
+Its `DatasetLoader` and canonical observations are shared with research scripts
+and [2dcameraviz](../2dcameraviz/README.md). This package provides point colors,
+box geometry, detection filters, camera navigation, and asynchronous controls.
 
 **[Quick start](#install-and-launch)** · **[Data and configuration](#dataset-sources)** · **[Controls and interpretation](#controls-and-scientific-interpretation)** · **[Research and extensions](#research-api-and-extension-boundary)** · **[Validation](#validation)**
 
@@ -16,101 +15,86 @@ asynchronous controls. Desktop remains the default; browser mode is optional.
 
 ## 🚀 Quick start
 
-Use Python 3.10–3.12 with an OpenGL-capable desktop. From the repository root,
+Use Python 3.10–3.12 and a browser with WebGL 2. From the repository root,
 install the shared library and viewer, then open the deterministic demo:
 
 ```bash
-python -m pip install -e './visual_utils' -e './viz_tools/3dviz[dev]'
+python -m pip install -e './visual_utils' -e './viz_tools/3dviz'
 3dviz --demo
 ```
 
-The demo needs no dataset files. Running `3dviz` without a root leaves the
-connection form ready for input. To explore the command-line options:
+The server opens [http://localhost:8080](http://localhost:8080) in your browser.
+Use `--no-open-browser` to start just the server, `--port` to choose a different
+port, and Ctrl+C to stop it. The demo generates its own observations. Running
+`3dviz` without a root opens **Sources** for dataset selection. To list the
+command-line options:
 
 ```bash
 python -m threedviz --help
 ```
 
-CLI help imports neither the renderer nor native dataset readers. The viewer
-runs independently of OpenPCDet, CUDA, TensorFlow and dataset SDKs. Opening a
-window requires a display and working OpenGL drivers, while dataset reading,
-geometry and color utilities remain usable without a desktop.
+The workspace keeps dataset, split, and scene selectors above the viewport,
+with the frame scrubber, step controls, and frame jump below it. The collapsible
+inspector has **Scene**, **Detection**, and **LiDAR segmentation** tabs. Switch
+tabs to inspect the same frame and camera view. **Sources** holds dataset settings
+and prediction attachments. The camera panel supports editable JSON and preserves
+unapplied drafts while you navigate the viewport.
 
-### 🌐 Browser mode on localhost
+Dataset roots and configuration paths refer to the machine running the server.
+`--dataset-config` fixes the connection settings for that launch. Ordinary
+launches can change the dataset connection in the page.
 
-Install the optional web dependencies and start a local server:
-
-```bash
-python -m pip install -e './visual_utils' -e './viz_tools/3dviz[web]'
-3dviz --web --demo --port 8080
-```
-
-Open **http://localhost:8080**. Add `--open-browser` to open the URL automatically.
-Choose another port with `--port`; stop the server with Ctrl+C. The ordinary
-`3dviz --demo` command continues to open the desktop viewer.
-
-The browser provides a white, full-page 3D viewport, translucent glass
-**Scene controls** on the left, and a compact floating navigation bar for dataset,
-split, scene and frame selection. The frame scrubber stays in the navigation bar
-when source settings are collapsed. Minimize the left panel from its Scene controls
-header; the header stays available to expand it again. Dataset paths and scene descriptions remain
-visible in the source section. Point size, box line width and color range support
-both sliders and direct numeric entry. A separate camera panel at the top right
-keeps editable camera JSON visible and preserves unapplied drafts while navigating
-the viewport or copying them. A thin animated loading strip spans
-the navigation bar while loading or preparing a frame. Stage messages describe
-the current work; dataset readers do not expose percentage progress.
-
-The same dataset arguments work in browser mode:
-
-```bash
-3dviz --web --dataset nuscenes --root /datasets/nuscenes --version v1.0-mini --split val
-3dviz --web --dataset waymo --root /datasets/waymo --split val --port 8081
-3dviz --web --dataset waymo --dataset-config /datasets/waymo.json
-```
-
-Dataset roots and configuration paths refer to the machine running the Python
-server. Data is read there, rather than uploaded through the browser. A launch
-using `--dataset-config` keeps its connection settings fixed, just as desktop
-mode does. Ordinary launches can change the dataset connection in the page.
-
-Browser mode uses the same dataset providers, RGB projection, acquisition
-geometry and color palettes as desktop mode. Point size, distance colors, box
-styles and camera navigation update locally in the browser. Camera RGB
-preparation stays in Python, preserving the same coverage mask and gray
-fallback. Camera view JSON can be copied, pasted and applied using reference
-coordinates, including position, rotation, pivot, field of view and clipping.
+Point size, distance colors, box styles, and camera navigation update in the
+browser. The dataset provider prepares camera RGB with a coverage mask. Camera
+view JSON stores position, rotation, pivot, field of view, and clipping in
+reference coordinates.
 
 Browser points use instanced 20-face icosahedrons with subtle face lighting.
-Point size sets their screen diameter in pixels; distance palettes and camera
-RGB supply the base colors before lighting.
+Point size sets their screen diameter in pixels. The selected point colors
+supply the base colors before lighting.
 
-JavaScript, styles and the Inter font are bundled in the Python package; using the viewer
-requires neither Node.js nor a CDN connection. The browser needs working WebGL 2.
-The web server does not initialize an Open3D window, so it can run without a
-desktop display. Open3D remains an installation dependency for compatibility
-with the default desktop mode and detection viewer.
+The Python package bundles JavaScript, styles, and Source Sans Pro for offline
+use. The server runs without a display and independently of OpenPCDet, CUDA,
+TensorFlow, and dataset SDKs.
 
-### 🛠️ Startup troubleshooting
+### Detection and LiDAR segmentation
 
-If importing Open3D fails with `numpy.dtype size changed`, check NumPy and pandas
-in the environment used by the `3dviz` command. Older pandas wheels cannot run
-with NumPy 2. This package requires pandas 2.2.2 or later within the 2.x series.
-Upgrade pandas in that same environment, for example:
+In **Sources**, attach a nuScenes results JSON or OpenPCDet NumPy pickle as the
+detection export. You can also attach one at launch:
 
 ```bash
-uv pip install --python .venv/bin/python 'pandas>=2.2.2,<3'
+3dviz --dataset nuscenes --root /datasets/nuscenes --version v1.0-trainval \
+  --split val --predictions /results/result.pkl
 ```
 
-Use the path to your viewer environment if it differs from `.venv`.
+`--prediction-format` overrides extension-based detection with `nuscenes_json`,
+`pcdet_pickle`, or a registered format. `--cache-dir` sets the directory for
+indexed detection exports. The default continues to use existing caches in
+`$XDG_CACHE_HOME/3ddetviz/predictions` or `~/.cache/3ddetviz/predictions`.
 
-On Linux, a Conda-based interpreter can also load an older C++ runtime than the
-system Mesa driver needs. If imports succeed but creating a window crashes,
-select the system runtime for that launch, using its path on your machine:
+In **Detection**, switch the solid ground-truth and dashed prediction layers
+independently. Confidence is available directly. Under **Advanced**, set
+per-class confidence overrides, XY and Z limits, candidate and output limits,
+and BEV NMS. The stage counts follow confidence, spatial filtering, pre-NMS
+limit, NMS, and output limit. Import or export JSON presets to share review
+settings, including existing 3ddetviz presets. The viewer distinguishes an
+absent prediction frame, an empty result, and a result filtered to zero.
 
-```bash
-LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 .venv/bin/3dviz --demo
-```
+For nuScenes LiDAR segmentation, install the official labels alongside the
+dataset. Ground truth uses `<root>/<release>/lidarseg.json` and the label files
+under `<root>/lidarseg/<release>/`. To review predictions, attach a Sonata
+pickle such as `result_lidarseg.pkl`, or a nuScenes submission folder or ZIP.
+Select **Ground truth** or **Prediction** in the **LiDAR segmentation** tab.
+Both use the same evaluation-class palette and show ignored points separately.
+Each label file must match the exact LiDAR scan and contain one ID per original
+point row. When labels are unavailable or invalid, the viewer keeps the cloud
+visible in neutral colors and reports the reason. Export fields, coordinate
+conventions, and custom readers are documented in the
+[prediction contract](docs/prediction_contract.md).
+
+Existing `3dviz --web` commands still serve the workspace and retain explicit
+browser opening via `--open-browser`. Launch detection review with `3dviz`
+using the prediction flags shown above.
 
 <a id="dataset-sources"></a>
 
@@ -120,14 +104,18 @@ Connect directly to nuScenes or Waymo with a dataset root:
 
 ```bash
 3dviz --dataset nuscenes --root /datasets/nuscenes --version v1.0-mini --split val
+3dviz --dataset nuscenes --root /datasets/nuscenes --version v1.0-trainval --split val
 3dviz --dataset waymo --root /datasets/waymo --split val
 ```
 
 **nuScenes** accepts the extracted dataset root or a metadata version directory.
 Install `samples/LIDAR_TOP` to view keyframes. Optional RGB coloring also needs
-the referenced `samples/CAM_*` and `sweeps/CAM_*` images. The reader uses native
-JSON tables directly, without devkit preprocessing. It transforms boxes into
-the LiDAR reference frame and uses local length, width and height for dimensions.
+the referenced `samples/CAM_*` and `sweeps/CAM_*` images. The reader transforms
+boxes into the LiDAR reference frame and uses local length, width and height
+for dimensions. On trainval and test, the first connection builds a local
+metadata index. Later connections reuse it, with sensor files and label
+blobs still read from the dataset. See the cache location, disk space, and
+configuration options in the [native reader guide](../../visual_utils/docs/dataset_readers.md#cache-nuscenes-metadata).
 
 **Waymo** accepts native TFRecords or an OpenPCDet processed workspace. Automatic
 selection prefers processed clouds when both representations are present.
@@ -143,7 +131,7 @@ Use these options to choose the initial view:
 | --- | --- |
 | `--root`, `--dataroot` | Equivalent paths to the dataset source. |
 | `--version` | Dataset release, with `v1.0-mini` as the nuScenes default. |
-| `--split` | Dataset-defined split, defaulting to `all`. The connected dataset supplies the sidebar choices. |
+| `--split` | Dataset-defined split. By default, nuScenes and demo launches with `--predictions` select `val`. Other launches select `all`. |
 | `--scene` | Initial scene ID or display name. |
 | `--frame` | Zero-based display index within the selected scene. |
 
@@ -173,14 +161,14 @@ Relative paths resolve against the JSON file's directory. When `root` is
 supplied, that root anchors relative named sources instead. `--dataset-config`
 replaces `--root` and `--version`, and combining them reports an error. The
 connection fields stay fixed for this launch, while splits, scenes and frames
-remain selectable. All three viewers accept the same configuration.
+remain selectable. Both viewers accept the same configuration.
 
 <a id="controls-and-scientific-interpretation"></a>
 
 ## 🎛️ Controls and scientific interpretation
 
-Use the sidebar to choose observations and appearance, then navigate the cloud
-in the viewport:
+Choose observations using the dataset, scene, and frame controls. Adjust the
+display in the inspector and navigate the cloud in the viewport.
 
 | Control | Behavior |
 | --- | --- |
@@ -190,7 +178,7 @@ in the viewport:
 | Undo ego motion compensation | Display complete acquisition geometry when available. Boxes retain their reference-time pose. |
 | Boxes and points | Filter boxes by class, change their colors and line width, and adjust point size. |
 | Camera navigation | Drag to rotate, right-drag to pan, scroll to zoom, or reset the camera. |
-| Coordinate axes | Toggle fixed 3-metre axes: X red, Y green and Z blue. Toggling preserves the viewpoint, and axes do not affect camera fitting. |
+| Coordinate axes | Toggle fixed 3-metre axes with X in red, Y in green and Z in blue. Toggling preserves the viewpoint and leaves camera fitting unchanged. |
 
 Distance colors use Euclidean distance from the displayed point-cloud reference
 origin, which need not be the ego origin. The scale defaults to 0–80 metres.
@@ -227,8 +215,8 @@ Install a provider exposing a `visual_utils.loaders` entry point to use it with
 before launching the viewer in the same process. The [custom dataset guide](../../visual_utils/docs/custom_datasets.md)
 walks through both approaches.
 
-The viewer factory returns the shared loader directly, so a research script can
-read and prepare the same observations as the desktop application:
+The viewer factory returns the shared loader directly. Research scripts can read
+and prepare the same observations as the browser workspace:
 
 ```python
 from visual_utils import DatasetConfig, Modality, PointCloudPreparation
@@ -250,30 +238,25 @@ class IDs remain in boxes, and an explicit display-label map controls grouping
 and styling. Providers own correspondence and preserve baseline rows and
 existing features during preparation.
 
-The window serializes loading and preparation on one worker. Stale results
-cannot replace a newer selection. Replaced datasets and datasets returned after
-window closure are closed after pending reads finish. Programmatic clients
-should also serialize reads and cleanup, using a context manager to own the
-loader.
+Each browser tab owns a session that serializes loading and preparation on
+one worker. Failed loads retain the current frame. The session closes replaced
+datasets and cleans up after pending reads finish. In Python, serialize reads
+and use a context manager to own the loader.
 
 The package follows that boundary:
 
 ```text
 src/threedviz/
   dataloader/       dataset selection and canonical synthetic demo
+  detection/       prediction readers, detection filters and review presets
   processing/      dataset-independent geometry and colors
-  visualization/   Open3D rendering of canonical observations
-  ui/              controls and loading worker
   web/             local API, background jobs, binary frames and bundled browser UI
-  cli.py           arguments and lazy desktop/browser launch
+  cli.py           arguments and local server launch
 ```
 
-The browser API consumes the same canonical observations. Each browser tab owns
-a session whose dataset operations are serialized; failed loads retain the
-previous observation. Point positions and optional colors travel as binary
-arrays. Rendering positions are rebased before conversion to float32, while
-source observations remain unchanged. The browser renderer and desktop renderer
-remain separate, allowing `3ddetviz` to retain its current desktop interface.
+Point positions, optional colors, and segmentation labels travel as binary
+arrays. The server rebases rendering positions before conversion to float32
+and retains the source coordinates in canonical observations.
 
 To develop the browser frontend, use the checked-in npm lockfile:
 
@@ -289,31 +272,24 @@ together. Frontend dependencies are needed only for development.
 
 <a id="validation"></a>
 
-## ✅ Validation and next steps
+## ✅ Validation
 
 From the repository root, run the viewer tests:
 
 ```bash
+python -m pip install -e './visual_utils' -e './viz_tools/3dviz[dev]'
 python -m pytest viz_tools/3dviz/tests
 ```
 
-Install `./viz_tools/3dviz[web,dev]` to include API and background-job checks.
-The optional browser integration test additionally uses Playwright and Chrome;
-see its module for the opt-in command.
-
-Tests cover deterministic demo data, shared-provider selection, geometry, colors,
-canonical rendering and box layers. With Xvfb and working OpenGL, opt into the
-native window test:
+Tests cover shared-provider selection, geometry, detection filters and presets,
+segmentation alignment, and data transfer to the browser. With Playwright and
+Chrome or Chromium installed, run the browser integration suite:
 
 ```bash
-THREEDVIZ_DESKTOP_TESTS=1 xvfb-run -a python -m pytest viz_tools/3dviz/tests/test_desktop.py
+THREEDVIZ_BROWSER_TESTS=1 python -m pytest viz_tools/3dviz/tests/test_web_browser.py
 ```
 
-The native test covers navigation, styles, camera axes, optional preparation,
-error recovery and configured sources. Also check real nuScenes or Waymo data
-and the installed display driver before using a scientific result based on
-visual alignment.
-
-Continue with the [custom dataset guide](../../visual_utils/docs/custom_datasets.md)
-to add a provider, [3ddetviz](../3ddetviz/README.md) to compare predictions, or the
-[contribution guide](../../CONTRIBUTING.md) for repository-wide validation.
+Use `THREEDVIZ_BROWSER_BINARY` if Chrome or Chromium is outside your PATH.
+See the [custom dataset guide](../../visual_utils/docs/custom_datasets.md)
+for provider development and the [contribution guide](../../CONTRIBUTING.md)
+for repository-wide validation.

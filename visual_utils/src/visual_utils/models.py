@@ -1,4 +1,4 @@
-"""Shared geometry and sensor records used directly by all three viewers."""
+"""Shared geometry and sensor records for viewers and research tools."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ class Capability(str, Enum):
     POINT_CLOUD = "point_cloud"
     CAMERAS = "cameras"
     BOXES_3D = "boxes_3d"
+    LIDAR_SEGMENTATION = "lidar_segmentation"
     RGB_COLORING = "rgb_coloring"
     POINT_TIMESTAMPS = "point_timestamps"
     ACQUISITION_GEOMETRY = "acquisition_geometry"
@@ -93,7 +94,10 @@ class DatasetMetadata:
         capabilities = frozenset(_enum(Capability, cap) for cap in self.capabilities)
         if not capabilities.intersection((Capability.POINT_CLOUD, Capability.CAMERAS)):
             raise DatasetValidationError("A dataset must offer point clouds or cameras.")
-        derived = {Capability.RGB_COLORING, Capability.POINT_TIMESTAMPS, Capability.ACQUISITION_GEOMETRY}
+        derived = {
+            Capability.RGB_COLORING, Capability.POINT_TIMESTAMPS,
+            Capability.ACQUISITION_GEOMETRY, Capability.LIDAR_SEGMENTATION,
+        }
         if capabilities.intersection(derived) and Capability.POINT_CLOUD not in capabilities:
             raise DatasetValidationError("Derived point capabilities require POINT_CLOUD.")
         for name, kind, key in (("classes", ClassInfo, "class_id"), ("sensors", SensorInfo, "sensor_id")):
@@ -300,6 +304,23 @@ class PointCloudPreparation:
     def __post_init__(self):
         if any(type(getattr(self, key)) is not bool for key in ("rgb", "timestamps", "acquisition_geometry")):
             raise DatasetValidationError("Preparation flags must be booleans.")
+
+
+@dataclass(frozen=True, eq=False)
+class LidarSegmentation:
+    """Point labels in the original row order of a single identified scan."""
+
+    scan_token: str
+    labels: np.ndarray
+    native_labels: np.ndarray
+
+    def __post_init__(self):
+        _text(self.scan_token, "LiDAR scan token")
+        labels = np.asarray(self.labels)
+        if labels.ndim != 1 or labels.dtype != np.uint8 or np.asarray(self.native_labels).dtype != np.uint8:
+            raise DatasetValidationError("LiDAR segmentation requires one-dimensional uint8 label arrays.")
+        object.__setattr__(self, "labels", _array(labels, labels.shape, "evaluation labels", dtype=np.uint8))
+        object.__setattr__(self, "native_labels", _array(self.native_labels, labels.shape, "native labels", dtype=np.uint8))
 
 
 @dataclass(frozen=True, eq=False)

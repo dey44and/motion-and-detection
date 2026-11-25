@@ -1,4 +1,4 @@
-"""Command-line entry point; graphical dependencies are loaded only on launch."""
+"""Command-line entry point for the local browser viewer."""
 
 from __future__ import annotations
 
@@ -33,10 +33,10 @@ def _port(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build a parser without importing Open3D or starting the desktop app."""
+    """Build a parser without starting the local server."""
     parser = argparse.ArgumentParser(
         prog="3dviz",
-        description="Explore autonomous driving point clouds and 3D ground truth boxes.",
+        description="Review point clouds, 3D detections and LiDAR segmentation in a local browser.",
     )
     parser.add_argument("--dataset", choices=available_datasets(), default="nuscenes")
     parser.add_argument(
@@ -48,23 +48,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset-config", type=Path,
         help="DatasetConfig JSON; paths are relative to this file; excludes --root/--version",
     )
-    parser.add_argument("--split", help="dataset split, such as val, train or train_1of16 (default: all)")
+    parser.add_argument("--split", help="dataset split (defaults to val for nuScenes or demo with predictions, otherwise all)")
     parser.add_argument("--scene", help="initial scene name or token")
     parser.add_argument("--frame", type=_nonnegative_int, default=0, help="initial frame index (default: 0)")
     parser.add_argument("--demo", action="store_true", help="open a synthetic example without dataset files")
-    parser.add_argument("--web", action="store_true", help="serve the browser viewer on localhost instead of opening a desktop window")
-    parser.add_argument("--port", type=_port, help="localhost port for --web (default: 8080)")
-    parser.add_argument("--open-browser", action="store_true", help="open the localhost URL in your browser with --web")
+    parser.add_argument("--predictions", type=Path, help="detection export to attach when opening the dataset")
+    parser.add_argument("--prediction-format", default="auto", help="registered detection format (default: infer from filename)")
+    parser.add_argument("--cache-dir", type=Path, help="directory for per-frame detection indexes")
+    parser.add_argument("--web", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--port", type=_port, help="localhost port (default: 8080)")
+    parser.add_argument("--open-browser", action=argparse.BooleanOptionalAction,
+                        help="open the localhost URL in your browser (enabled by default)")
     parser.add_argument("--app-version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Launch the window, or display CLI help without loading the renderer."""
+    """Serve the viewer or display CLI help."""
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not args.web and (args.port is not None or args.open_browser):
-        parser.error("--port and --open-browser require --web")
     dataset = "demo" if args.demo else args.dataset
     config = None
     if args.dataset_config is not None:
@@ -76,6 +78,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             config = load_dataset_config(args.dataset_config)
         except DatasetError as error:
             parser.error(str(error))
+    split = args.split
+    if split is None and args.predictions is not None and dataset in {"nuscenes", "demo"}:
+        split = "val"
     launch_options = dict(
         dataset=dataset,
         root=args.root,
@@ -83,33 +88,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         scene=args.scene,
         frame=args.frame,
         autoload=dataset == "demo" or args.root is not None or config is not None,
-        **({"split": args.split} if args.split is not None else {}),
+        **({"split": split} if split is not None else {}),
         **({"config": config} if config is not None else {}),
     )
     try:
-        if args.web:
-            from .web.server import run_server
+        from .detection.predictions import available_prediction_formats
+        from .web.server import run_server
 
-            run_server(port=args.port or 8080, open_browser=args.open_browser, **launch_options)
-        else:
-            from .ui.app import run_app
-
-            run_app(**launch_options)
+        formats = available_prediction_formats()
+        if args.prediction_format not in ("auto", *formats):
+            parser.error(f"Unknown prediction format {args.prediction_format!r}. Choose from auto, {', '.join(formats)}.")
+        open_browser = not args.web if args.open_browser is None else args.open_browser
+        run_server(
+            port=args.port or 8080, open_browser=open_browser, predictions=args.predictions,
+            prediction_format=args.prediction_format, cache_dir=args.cache_dir, **launch_options,
+        )
     except ModuleNotFoundError as exc:
-        if args.web:
-            if exc.name not in {"fastapi", "uvicorn"}:
-                raise
-            parser.exit(
-                1,
-                "3dviz: Browser mode requires the web dependencies. "
-                "Install them with: pip install -e './viz_tools/3dviz[web]'\n",
-            )
-        if exc.name != "open3d":
+        if exc.name not in {"fastapi", "uvicorn", "ijson"}:
             raise
         parser.exit(
             1,
-            "3dviz: Open3D is required to open the viewer. "
-            "Install the package with: pip install -e './viz_tools/3dviz[dev]'\n",
+            "3dviz: Install the viewer dependencies with "
+            "pip install -e './visual_utils' -e './viz_tools/3dviz'.\n",
         )
 
     return 0

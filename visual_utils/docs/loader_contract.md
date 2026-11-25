@@ -31,6 +31,8 @@ def _load_cameras(self, frame_id: str) -> CameraFrameSet: ...
 
 # Optional:
 def _prepare_point_cloud(self, frame, *, request: PointCloudPreparation): ...
+def _lidar_scan_token(self, frame_id: str) -> str: ...
+def _load_lidarseg_ground_truth(self, frame: PointCloudFrame) -> LidarSegmentation: ...
 def _close(self) -> None: ...
 ```
 
@@ -52,6 +54,7 @@ serialize reads and wait for pending work before closing. The
 | `SceneInfo` | Stable scene ID, display name and optional per-modality frame counts. |
 | `FrameInfo` | Stable frame ID, scene ID, zero-based display index, optional timestamp and modalities. |
 | `PointCloudFrame` | XYZ points, attributes, annotations, spatial reference and optional prepared data. |
+| `LidarSegmentation` | Exact LiDAR scan token, evaluation IDs, and original native IDs for each point. |
 | `CameraFrameSet` | Ordered RGB observations, annotations and their shared spatial reference. |
 | `Box3D` | Annotation/class IDs, center, LWH size and full rotation. |
 
@@ -118,6 +121,16 @@ semantics, while read-only arrays communicate the snapshot's intended use.
 Processed/native point pairing still verifies actual correspondence before
 attaching colors or acquisition geometry. Equal point counts alone are
 insufficient because colors and geometry must describe the same physical points.
+
+`LIDAR_SEGMENTATION` indicates a provider can identify the exact native scan
+with `lidar_scan_token(frame_id)`. The scan token can differ from the catalog
+frame ID. `load_lidarseg_ground_truth(frame)` receives the unchanged cloud
+from that provider and returns one native and one evaluation ID per original
+point row. Raise `DataUnavailableError` for withheld or missing labels and
+`DatasetValidationError` for a wrong scan, wrong row count, or invalid IDs.
+The nuScenes provider uses its 16 challenge classes plus ignored ID `0` for
+evaluation and retains the full 32-class native IDs. Prediction runs attach
+through the viewer and are matched to the scan token at review time.
 
 <a id="configuration-registration-and-errors"></a>
 ## ⚙️ Configure and register a loader

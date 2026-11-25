@@ -21,7 +21,6 @@ python -m pip install -e './visual_utils/examples/custom_dataset'
 python -m research_dataset.generate /tmp/research-dataset-example
 2dcameraviz --dataset research --root /tmp/research-dataset-example --split review
 3dviz --dataset research --root /tmp/research-dataset-example --split review
-3ddetviz --dataset research --root /tmp/research-dataset-example --split review
 ```
 
 Use a new output directory, as the generator refuses to overwrite an existing one.
@@ -138,15 +137,14 @@ Then run any of:
 ```bash
 2dcameraviz --dataset research --dataset-config /tmp/research-view.json --split review
 3dviz --dataset research --dataset-config /tmp/research-view.json --split review
-3ddetviz --dataset research --dataset-config /tmp/research-view.json --split review
 ```
 
 The root resolves relative to the JSON file. Named sources resolve relative to
 that root, or to the file directory when root is absent. Allowed top-level keys
 are exactly `root`, `release`, `storage_format`, `source_paths` and `options`.
 Duplicate keys, non-finite option numbers and unknown fields are errors.
-Do not also pass `--root` or `--version`. Configured source controls stay fixed
-for the desktop session, while scene/frame/split navigation remains available.
+Pass `--dataset-config` on its own. Configured source controls stay fixed for
+that launch. Split, scene, and frame navigation remain available.
 
 ### 🐍 Load the same data in Python
 
@@ -161,18 +159,18 @@ with create_loader("research", load_dataset_config("/tmp/research-view.json")) a
     print(cloud.points.shape, camera_set.cameras[0].image.shape)
 ```
 
-Applicable viewers can also be launched in the same process after registering
-a provider. Each `run_app` accepts `dataset=`, `config=`, `split=` and
-`autoload=True`. The [viewer guides](../../viz_tools/README.md) provide imports
-and launch examples.
+After registering a provider in the current process, launch the 3D viewer with
+`threedviz.web.server.run_server` or the camera viewer with
+`cameraviz.ui.app.run_app`. Both accept `dataset=`, `config=`, `split=`, and
+`autoload=True`.
 
 ## 🎯 Add predictions independently
 
-`3ddetviz` joins predictions by the exact normalized frame ID. Its built-in
-OpenPCDet and nuScenes readers are file adapters, not required dataset formats.
+`3dviz` joins predictions by the exact normalized frame ID. Its built-in
+OpenPCDet and nuScenes prediction readers load experimental exports.
 For your own outputs, implement a `PredictionSource` or use
 `InMemoryPredictionSource`, as shown in the
-[prediction-source guide](../../viz_tools/3ddetviz/docs/prediction_contract.md).
+[prediction-source guide](../../viz_tools/3dviz/docs/prediction_contract.md).
 Predictions already expressed in the cloud reference use the historical
 coordinate label `lidar`, even when that reference is not physically a LiDAR.
 World predictions require the loader's real world transform. Missing world
@@ -182,7 +180,7 @@ poses must never be replaced with identity transforms to make an overlay appear.
 
 The [cross-package example tests](../../tests/visualization/test_custom_dataset.py)
 demonstrate lazy catalog access, sparse IDs, error categories, immutable payload
-lifetimes and using one shared provider for all three viewers. Extend that pattern
+lifetimes and using one shared provider for both viewers. Extend that pattern
 with nonidentity transforms, asynchronous cameras, unknown times, empty scenes,
 withheld annotations and your own sensor edge cases. Check numerical projection
 against independently known calibration points before relying on visual alignment.

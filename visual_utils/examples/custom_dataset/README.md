@@ -3,7 +3,7 @@
 Try a complete `DatasetLoader` extension with NPZ point clouds, PNG camera
 images, and a JSON manifest. It exposes the `research` loader through the
 `visual_utils.loaders` entry-point group, so the same data can be opened by
-all three viewers.
+both viewers.
 
 **[Step-by-step tutorial](../../docs/custom_datasets.md)** ·
 **[Interface reference](../../docs/loader_contract.md)** ·
@@ -28,7 +28,7 @@ and geometric overlays.
 ## 🧭 Adapt it to your data
 
 The example package depends only on the shared dataset package. Install
-`2dcameraviz` or `3ddetviz` as needed to inspect the same observations in another
+`2dcameraviz` as needed to inspect the same observations in another
 viewer. The [custom dataset tutorial](../../docs/custom_datasets.md) explains
 the file schema, scientific assumptions, provider implementation, and all
 three launch commands.

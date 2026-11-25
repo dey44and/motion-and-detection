@@ -1,6 +1,7 @@
 """Conformance tests for normalized nuScenes observations and preparation."""
 
 import json
+from pathlib import Path
 import shutil
 
 import numpy as np
@@ -86,6 +87,23 @@ def contract_root(tmp_path):
     return root
 
 
+@pytest.fixture(params=[False, True], ids=["json", "sqlite"])
+def open_loader(contract_root, tmp_path, monkeypatch, request):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    loaders = []
+
+    def open_native(*, root=contract_root, **config):
+        loader = NuScenesLoader(DatasetConfig(
+            root=root, options={"metadata_cache": request.param}, **config,
+        ))
+        loaders.append(loader)
+        return loader
+
+    yield open_native
+    for loader in loaders:
+        loader.close()
+
+
 def update(root, name, transform):
     path = root / "v1.0-mini" / f"{name}.json"
     records = json.loads(path.read_text())
@@ -93,12 +111,14 @@ def update(root, name, transform):
     path.write_text(json.dumps(records))
 
 
-def test_metadata_and_modality_catalog_are_lazy_native_and_dense(contract_root, monkeypatch):
+def test_metadata_and_modality_catalog_are_lazy_native_and_dense(contract_root, tmp_path, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("Metadata must not decode sensor payloads.")
 
     monkeypatch.setattr(Image, "open", forbidden)
     monkeypatch.setattr(np, "fromfile", forbidden)
+    cache_home = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
     loader = NuScenesLoader(DatasetConfig(root=contract_root))
     assert not loader._readers
     metadata = loader.metadata
@@ -120,12 +140,40 @@ def test_metadata_and_modality_catalog_are_lazy_native_and_dense(contract_root, 
     assert loader.list_scenes(split="train") == ()
     with pytest.raises(DatasetConfigurationError):
         loader.list_scenes(split="not-a-split")
+    assert not cache_home.exists()
 
 
-def test_native_box_identity_anchored_geometry_and_pinhole_projection(contract_root):
+def test_lidarseg_ground_truth_matches_scan_and_preserves_native_rows(contract_root, open_loader):
+    path = contract_root / "lidarseg/v1.0-mini/lidar-data_lidarseg.bin"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(bytes([31, 17]))
+    (contract_root / "v1.0-mini/lidarseg.json").write_text(json.dumps([
+        {"token": "lidar-data", "sample_data_token": "lidar-data", "filename": str(path.relative_to(contract_root))},
+    ]))
+    loader = open_loader()
+    frame = loader.load_point_cloud("both")
+    assert loader.lidar_scan_token("both") == "lidar-data"
+    labels = loader.load_lidarseg_ground_truth(frame)
+    np.testing.assert_array_equal(labels.native_labels, [31, 17])
+    np.testing.assert_array_equal(labels.labels, [0, 4])
+    assert not labels.native_labels.flags.writeable
+    with pytest.raises(DataUnavailableError, match="no ground-truth labels"):
+        loader.load_lidarseg_ground_truth(loader.load_point_cloud("lidar-only"))
+    path.write_bytes(bytes([17]))
+    with pytest.raises(DatasetValidationError, match="2 uint8 labels"):
+        loader.load_lidarseg_ground_truth(frame)
+    path.write_bytes(bytes([17, 32]))
+    with pytest.raises(DatasetValidationError, match="integer class IDs"):
+        loader.load_lidarseg_ground_truth(frame)
+    path.unlink()
+    with pytest.raises(DataUnavailableError, match="lidarseg file is missing"):
+        loader.load_lidarseg_ground_truth(frame)
+
+
+def test_native_box_identity_anchored_geometry_and_pinhole_projection(contract_root, open_loader):
     s = float(np.sqrt(.5))
     update(contract_root, "calibrated_sensor", lambda rows: rows[0].update(rotation=[s, 0, 0, s], translation=[1, 2, 3]))
-    loader = NuScenesLoader(DatasetConfig(root=contract_root))
+    loader = open_loader()
     cloud = loader.load_point_cloud("both")
     cameras = loader.load_cameras("both")
     assert cloud.reference_frame_id == "sensor:LIDAR_TOP:lidar-data"
@@ -152,9 +200,9 @@ def test_native_box_identity_anchored_geometry_and_pinhole_projection(contract_r
     assert not cloud.attributes["intensity"].flags.writeable
 
 
-def test_payload_indices_belong_to_their_own_modality_list(contract_root):
+def test_payload_indices_belong_to_their_own_modality_list(contract_root, open_loader):
     update(contract_root, "sample", lambda rows: rows[1].update(timestamp=500_100))
-    loader = NuScenesLoader(DatasetConfig(root=contract_root))
+    loader = open_loader()
     camera_info = loader.list_frames("scene", modality=Modality.CAMERAS)[1]
     point_info = loader.list_frames("scene", modality=Modality.POINT_CLOUD)[0]
     assert camera_info.frame_id == point_info.frame_id == "both"
@@ -165,7 +213,7 @@ def test_payload_indices_belong_to_their_own_modality_list(contract_root):
 
 
 @pytest.mark.parametrize("state", ["zero", "absent", "withheld"])
-def test_annotation_availability_distinguishes_zero_absent_and_withheld(contract_root, state):
+def test_annotation_availability_distinguishes_zero_absent_and_withheld(contract_root, open_loader, state):
     release = "v1.0-mini"
     if state == "zero":
         update(contract_root, "sample_annotation", lambda rows: rows.clear())
@@ -177,7 +225,7 @@ def test_annotation_availability_distinguishes_zero_absent_and_withheld(contract
         release = "v1.0-test"
         (contract_root / "v1.0-mini").rename(contract_root / release)
         expected = AnnotationStatus.WITHHELD
-    loader = NuScenesLoader(DatasetConfig(root=contract_root, release=release))
+    loader = open_loader(release=release)
     cloud = loader.load_point_cloud("both")
     camera = loader.load_cameras("both")
     assert cloud.annotations.status == camera.annotations.status == expected
@@ -185,8 +233,8 @@ def test_annotation_availability_distinguishes_zero_absent_and_withheld(contract
     assert (Capability.BOXES_3D in loader.metadata.capabilities) == (state == "zero")
 
 
-def test_optional_preparation_estimated_atomic_and_preserves_valid_black(contract_root):
-    loader = NuScenesLoader(DatasetConfig(root=contract_root))
+def test_optional_preparation_estimated_atomic_and_preserves_valid_black(open_loader):
+    loader = open_loader()
     cloud = loader.load_point_cloud("both")
     assert loader.prepare_point_cloud(cloud, request=PointCloudPreparation()) is cloud
     prepared = loader.prepare_point_cloud(cloud, request=PointCloudPreparation(rgb=True, timestamps=True, acquisition_geometry=True))
@@ -208,8 +256,8 @@ def test_optional_preparation_estimated_atomic_and_preserves_valid_black(contrac
     assert loader.prepare_point_cloud(prepared, request=PointCloudPreparation(rgb=True)) is prepared
 
 
-def test_known_absence_missing_file_and_corruption_are_distinct(contract_root):
-    loader = NuScenesLoader(DatasetConfig(root=contract_root))
+def test_known_absence_missing_file_and_corruption_are_distinct(contract_root, open_loader):
+    loader = open_loader()
     with pytest.raises(UnknownIdentifierError):
         loader.load_point_cloud("unknown")
     with pytest.raises(DataUnavailableError):
@@ -224,12 +272,16 @@ def test_known_absence_missing_file_and_corruption_are_distinct(contract_root):
     with pytest.raises(DatasetIOError):
         loader.prepare_point_cloud(cloud, request=PointCloudPreparation(rgb=True))
     assert cloud.rgb is cloud.timing is cloud.acquisition is None
-    (contract_root / "samples/LIDAR_TOP/points.bin").write_bytes(b"broken")
+    scan = contract_root / "samples/LIDAR_TOP/points.bin"
+    scan.write_bytes(b"broken")
     with pytest.raises(DatasetValidationError, match="20 bytes"):
+        loader.load_point_cloud("both")
+    scan.unlink()
+    with pytest.raises(DatasetIOError, match="lidar file is missing"):
         loader.load_point_cloud("both")
 
 
-def test_uncalibrated_images_are_valid_and_missing_pose_time_stays_unknown(contract_root):
+def test_uncalibrated_images_are_valid_and_missing_pose_time_stays_unknown(contract_root, open_loader):
     def remove_calibration(rows):
         rows[1].pop("camera_intrinsic")
         rows[1].pop("rotation")
@@ -237,7 +289,7 @@ def test_uncalibrated_images_are_valid_and_missing_pose_time_stays_unknown(contr
 
     update(contract_root, "calibrated_sensor", remove_calibration)
     update(contract_root, "sample_data", lambda rows: rows[3].pop("ego_pose_token"))
-    loader = NuScenesLoader(DatasetConfig(root=contract_root))
+    loader = open_loader()
     camera = loader.load_cameras("both").cameras[0]
     assert camera.intrinsics is camera.T_reference_from_camera is camera.projection_model is None
     assert camera.pose_timestamp_us is None
@@ -249,9 +301,9 @@ def test_uncalibrated_images_are_valid_and_missing_pose_time_stays_unknown(contr
     assert cloud.scan_end_us is None
 
 
-def test_per_frame_missing_timing_and_no_camera_records_are_not_fabricated(contract_root):
+def test_per_frame_missing_timing_and_no_camera_records_are_not_fabricated(contract_root, open_loader):
     update(contract_root, "sample_data", lambda rows: rows.__setitem__(slice(None), [row for row in rows if row["calibrated_sensor_token"] != "camera-cal"]))
-    loader = NuScenesLoader(DatasetConfig(root=contract_root))
+    loader = open_loader()
     assert Capability.RGB_COLORING not in loader.metadata.capabilities
     assert Capability.POINT_TIMESTAMPS in loader.metadata.capabilities
     cloud = loader.load_point_cloud("lidar-only")
@@ -262,13 +314,13 @@ def test_per_frame_missing_timing_and_no_camera_records_are_not_fabricated(contr
         loader.load_cameras("both")
 
 
-def test_profiles_relocate_stably_and_lifecycle_preserves_records(contract_root, tmp_path):
-    loader = NuScenesLoader(DatasetConfig(root=contract_root))
+def test_profiles_relocate_stably_and_lifecycle_preserves_records(contract_root, tmp_path, open_loader):
+    loader = open_loader()
     cloud = loader.load_point_cloud("both")
     camera = loader.load_cameras("both").cameras[0]
     relocated = tmp_path / "relocated"
     shutil.copytree(contract_root, relocated)
-    other = NuScenesLoader(DatasetConfig(root=tmp_path, source_paths={"native": relocated}))
+    other = open_loader(root=tmp_path, source_paths={"native": relocated})
     assert other.metadata.dataset_id == loader.metadata.dataset_id
     assert other.load_point_cloud("both").source_id == cloud.source_id
     assert other.load_point_cloud("both").reference_frame_id == cloud.reference_frame_id
@@ -288,6 +340,7 @@ def test_profiles_relocate_stably_and_lifecycle_preserves_records(contract_root,
 @pytest.mark.parametrize("kwargs", [
     {"release": "unknown"}, {"storage_format": "pickle"},
     {"options": {"ignored": True}}, {"source_paths": {"typo": "."}},
+    {"options": {"metadata_cache": "true"}}, {"options": {"metadata_cache": 1}},
 ])
 def test_unknown_provider_configuration_rejected(contract_root, kwargs):
     with pytest.raises(DatasetConfigurationError):
@@ -295,11 +348,59 @@ def test_unknown_provider_configuration_rejected(contract_root, kwargs):
 
 
 @pytest.mark.parametrize("active,bad_token", [(Modality.POINT_CLOUD, "camera-only"), (Modality.CAMERAS, "lidar-only")])
-def test_bad_inactive_frame_time_does_not_block_active_contract_view(contract_root, active, bad_token):
+def test_bad_inactive_frame_time_does_not_block_active_contract_view(contract_root, open_loader, active, bad_token):
     update(contract_root, "sample", lambda rows: next(row for row in rows if row["token"] == bad_token).update(timestamp=True))
-    loader = NuScenesLoader(DatasetConfig(root=contract_root))
+    loader = open_loader()
     assert len(loader.list_frames("scene", modality=active)) == 2
     if active == Modality.POINT_CLOUD:
         assert loader.load_point_cloud("both").points.shape == (2, 3)
     else:
         assert loader.load_cameras("both").cameras
+
+
+@pytest.mark.parametrize("release", ["v1.0-trainval", "v1.0-test"])
+def test_full_release_warm_open_and_preparation_use_local_index(contract_root, tmp_path, monkeypatch, release):
+    tables = contract_root / release
+    (contract_root / "v1.0-mini").rename(tables)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    config = DatasetConfig(root=contract_root, release=release)
+    json_config = DatasetConfig(root=contract_root, release=release, options={"metadata_cache": False})
+    request = PointCloudPreparation(rgb=True, timestamps=True, acquisition_geometry=True)
+    with NuScenesLoader(json_config) as loader:
+        metadata = loader.metadata
+        scenes = loader.list_scenes()
+        frames = loader.list_frames("scene", modality=Modality.POINT_CLOUD)
+        json_cloud = loader.load_point_cloud("both")
+        json_prepared = loader.prepare_point_cloud(json_cloud, request=request)
+        json_camera = loader.load_cameras("both").cameras[0]
+
+    with NuScenesLoader(config) as loader:
+        assert loader.list_scenes() == scenes
+
+    open_path = Path.open
+    heavy_tables = {tables / name for name in ("sample_data.json", "ego_pose.json", "sample_annotation.json")}
+
+    def forbid_heavy_reads(path, *args, **kwargs):
+        if path in heavy_tables:
+            pytest.fail(f"Warm nuScenes reads must use indexed metadata for {path.name}.")
+        return open_path(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", forbid_heavy_reads)
+    with NuScenesLoader(config) as loader:
+        assert loader.metadata == metadata
+        assert loader.list_scenes() == scenes
+        assert loader.list_frames("scene", modality=Modality.POINT_CLOUD) == frames
+        cloud = loader.load_point_cloud("both")
+        camera = loader.load_cameras("both").cameras[0]
+        prepared = loader.prepare_point_cloud(cloud, request=request)
+        assert cloud.info == json_cloud.info
+        assert cloud.annotations.status == json_cloud.annotations.status
+        assert [box.annotation_id for box in cloud.annotations.boxes] == [
+            box.annotation_id for box in json_cloud.annotations.boxes
+        ]
+        np.testing.assert_array_equal(cloud.points, json_cloud.points)
+        np.testing.assert_array_equal(camera.image, json_camera.image)
+        np.testing.assert_array_equal(prepared.timing.timestamps_us, json_prepared.timing.timestamps_us)
+        np.testing.assert_array_equal(prepared.acquisition.points, json_prepared.acquisition.points)
+        np.testing.assert_array_equal(prepared.rgb.values, json_prepared.rgb.values)
+        np.testing.assert_array_equal(prepared.rgb.valid_mask, json_prepared.rgb.valid_mask)

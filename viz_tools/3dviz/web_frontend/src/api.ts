@@ -37,3 +37,11 @@ export async function fetchFrame(session: string, revision: number) {
   if (packet.header.revision !== revision) throw new Error('The scene changed during the point-cloud transfer. Please retry.');
   return packet;
 }
+
+export async function fetchSegmentation(session: string, revision: number, generation: number, count: number) {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(session)}/segmentation.bin?revision=${revision}&generation=${generation}`);
+  if (!response.ok) throw new Error(`Point labels could not be transferred (${response.status}).`);
+  const labels = new Uint8Array(await response.arrayBuffer());
+  if (labels.length !== count || labels.some(label => label > 16)) throw new Error('The point labels do not match this LiDAR scan.');
+  return labels;
+}

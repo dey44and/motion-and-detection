@@ -1,7 +1,7 @@
 # 🧩 visual-utils
 
-Load a dataset once and use it across the camera, point-cloud, and detection
-viewers. `visual_utils` translates nuScenes, Waymo, or your own storage into
+Load a dataset once and use it in the camera viewer or the browser workspace
+for point clouds and detection review. `visual_utils` translates nuScenes, Waymo, or your own storage into
 shared Python records, with explicit calibration, coordinate references, and
 timing. It works in scripts and notebooks without importing a GUI.
 
@@ -48,8 +48,7 @@ package.
 | Tool | Use it for |
 | --- | --- |
 | [2dcameraviz](../viz_tools/2dcameraviz/README.md) | Camera images and projected 3D ground truth. |
-| [3dviz](../viz_tools/3dviz/README.md) | Point clouds, boxes, colors, and acquisition geometry. |
-| [3ddetviz](../viz_tools/3ddetviz/README.md) | Predictions, confidence filters, and geometric NMS. |
+| [3dviz](../viz_tools/3dviz/README.md) | Point clouds, colors, acquisition geometry, ground-truth and predicted boxes, and LiDAR segmentation. |
 
 For example, install and launch the point-cloud viewer:
 
@@ -58,9 +57,8 @@ python -m pip install -e './viz_tools/3dviz'
 3dviz --demo
 ```
 
-Detection review reuses the 3D renderer, which is why its installation includes
-`3dviz`. Each viewer guide provides its installation command, and all three use
-the same dataset records.
+Both viewers use the same dataset records. The `3dviz` workspace reads
+experimental predictions through an independent source.
 
 ## 📂 Configure your data
 
@@ -69,8 +67,13 @@ layout that match your data:
 
 | Provider | Storage formats | Named sources | Provider options |
 | --- | --- | --- | --- |
-| `nuscenes` | `auto`, `native` | `native` | None. Select `v1.0-mini`, `v1.0-trainval`, or `v1.0-test` with `release`. |
+| `nuscenes` | `auto`, `native` | `native` | `metadata_cache` (boolean). Select `v1.0-mini`, `v1.0-trainval`, or `v1.0-test` with `release`. |
 | `waymo` | `auto`, `native`, `openpcdet` | `native`, `processed` | `processed_tag`, `additional_classes`. Release may be omitted or set to `1.4.2` / `v1.4.2`. |
+
+nuScenes trainval and test releases reuse a local SQLite metadata index by
+default. Set `metadata_cache` to `true` in the dataset configuration's `options`
+object to enable it for mini. See how the first build and later lookups work in the
+[native reader guide](docs/dataset_readers.md#cache-nuscenes-metadata).
 
 Waymo can discover native and processed directories automatically. When they
 live separately, provide both paths through `source_paths`. The

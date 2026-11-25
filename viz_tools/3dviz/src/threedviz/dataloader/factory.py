@@ -1,5 +1,6 @@
 """Select a shared dataset loader or the local synthetic demonstration."""
 
+from collections.abc import Callable
 from pathlib import Path
 
 from visual_utils import (
@@ -18,7 +19,7 @@ def available_datasets() -> tuple[str, ...]:
 
 def create_dataset(
     name: str, root: str | Path | None = None, version: str = "v1.0-mini", *,
-    config: DatasetConfig | None = None,
+    config: DatasetConfig | None = None, progress: Callable[[str], None] | None = None,
 ) -> DatasetLoader:
     """Open a point-cloud loader; the caller owns and closes the result."""
     if not isinstance(name, str) or not name.strip():
@@ -33,13 +34,16 @@ def create_dataset(
         from .demo import DemoLoader
         return DemoLoader(DatasetConfig())
     release = None if version in (None, "", "v1.0-mini") else version
-    loader = create_loader(key, config if config is not None else DatasetConfig(root=root, release=release))
-    if Capability.POINT_CLOUD not in loader.metadata.capabilities:
-        error = UnsupportedCapabilityError("The selected dataset does not provide point-cloud observations.")
+    source = config if config is not None else DatasetConfig(root=root, release=release)
+    loader = create_loader(key, source, progress=progress)
+    try:
+        if Capability.POINT_CLOUD not in loader.metadata.capabilities:
+            raise UnsupportedCapabilityError("The selected dataset does not provide point-cloud observations.")
+    except Exception as error:
         try:
             loader.close()
         except Exception as cleanup_error:
             if hasattr(error, "add_note"):
                 error.add_note(f"Provider cleanup also failed: {cleanup_error}")
-        raise error
+        raise
     return loader

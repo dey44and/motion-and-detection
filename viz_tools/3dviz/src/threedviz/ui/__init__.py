@@ -1,2 +1,0 @@
-"""Native desktop user interface."""
-

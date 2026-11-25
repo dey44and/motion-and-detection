@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 
 from .config import DatasetConfig
 from .errors import DatasetClosedError, DatasetConfigurationError, DatasetIOError, UnsupportedCapabilityError
 from .models import (
-    CameraFrameSet, Capability, DatasetMetadata, FrameInfo, Modality,
+    CameraFrameSet, Capability, DatasetMetadata, FrameInfo, LidarSegmentation, Modality,
     PointCloudFrame, PointCloudPreparation, SceneInfo,
 )
 
@@ -28,6 +29,14 @@ class DatasetLoader(ABC):
     @abstractmethod
     def metadata(self) -> DatasetMetadata:
         """Classes, ordered sensors, splits and features of this installation."""
+
+    def prepare_catalog(self, *, progress: Callable[[str], None] | None = None) -> DatasetMetadata:
+        """Load metadata, with optional stage messages from indexing providers.
+
+        A progress callback may raise to cancel catalog preparation.
+        """
+        self._ensure_open()
+        return self.metadata
 
     def list_scenes(self, *, split: str = "all") -> tuple[SceneInfo, ...]:
         self._ensure_open()
@@ -57,6 +66,25 @@ class DatasetLoader(ABC):
 
     def _load_point_cloud(self, frame_id: str) -> PointCloudFrame:
         raise UnsupportedCapabilityError("This dataset does not implement point-cloud loading.")
+
+    def lidar_scan_token(self, frame_id: str) -> str:
+        """Identify the native scan whose raw point rows a segmentation labels."""
+        self._require(Capability.LIDAR_SEGMENTATION)
+        return self._lidar_scan_token(frame_id)
+
+    def _lidar_scan_token(self, frame_id: str) -> str:
+        raise UnsupportedCapabilityError("This dataset does not expose LiDAR scan tokens.")
+
+    def load_lidarseg_ground_truth(self, frame: PointCloudFrame) -> LidarSegmentation:
+        """Load ground-truth labels aligned with this loader's baseline cloud."""
+        self._require(Capability.LIDAR_SEGMENTATION)
+        try:
+            return self._load_lidarseg_ground_truth(frame)
+        except OSError as error:
+            raise DatasetIOError(f"Cannot read segmentation for {frame.info.frame_id}: {error}") from error
+
+    def _load_lidarseg_ground_truth(self, frame: PointCloudFrame) -> LidarSegmentation:
+        raise UnsupportedCapabilityError("This dataset does not implement LiDAR segmentation ground truth.")
 
     def load_cameras(self, frame_id: str) -> CameraFrameSet:
         self._require(Capability.CAMERAS)

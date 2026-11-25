@@ -1,3 +1,5 @@
+recursive-include docs *.md
+include docs/prediction_contract.md
 recursive-include web_frontend *.json *.ts *.html *.css *.md
 recursive-include web_frontend/src/fonts *.woff2 *.txt
 recursive-include web_frontend/src/assets *.png

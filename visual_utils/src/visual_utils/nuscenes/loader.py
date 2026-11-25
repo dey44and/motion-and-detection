@@ -14,7 +14,7 @@ from typing import Callable, TypeVar
 from ..config import DatasetConfig
 from ..dataset import DatasetLoader
 from ..models import (
-    CameraFrameSet, Capability, ClassInfo, DatasetMetadata, FrameInfo, Modality,
+    CameraFrameSet, Capability, ClassInfo, DatasetMetadata, FrameInfo, LidarSegmentation, Modality,
     PointCloudFrame, PointCloudPreparation, SceneInfo, SensorInfo,
 )
 from ..errors import (
@@ -41,7 +41,8 @@ class NuScenesLoader(DatasetLoader):
     """Shared point-cloud/camera contract for native nuScenes releases.
 
     Accepted storage formats are ``auto`` and ``native``. ``source_paths``
-    optionally selects an explicit ``native`` root; no provider options exist.
+    optionally selects an explicit ``native`` root. The ``metadata_cache``
+    boolean defaults to true for full releases and false for mini.
     Attributes ``intensity`` and ``ring`` preserve the native intensity values
     and zero-based HDL-32E laser-ring identifiers respectively.
     """
@@ -56,8 +57,12 @@ class NuScenesLoader(DatasetLoader):
         unknown_sources = set(config.source_paths).difference({"native"})
         if unknown_sources:
             raise DatasetConfigurationError(f"Unknown nuScenes source names: {sorted(unknown_sources)}; only 'native' is supported.")
-        if config.options:
-            raise DatasetConfigurationError(f"Unknown nuScenes options: {sorted(config.options)}; this provider defines no options.")
+        unknown_options = set(config.options).difference({"metadata_cache"})
+        if unknown_options:
+            raise DatasetConfigurationError(f"Unknown nuScenes options: {sorted(unknown_options)}.")
+        self._metadata_cache = config.options.get("metadata_cache", self._release != "v1.0-mini")
+        if type(self._metadata_cache) is not bool:
+            raise DatasetConfigurationError("nuScenes metadata_cache must be a boolean.")
         self._root = config.source_paths.get("native", config.root)
         if self._root is None:
             raise DatasetConfigurationError("nuScenes requires a dataset root or an explicit 'native' source path.")
@@ -93,7 +98,7 @@ class NuScenesLoader(DatasetLoader):
                 raise DataUnavailableError(message) from exc
             raise DatasetValidationError(message) from exc
 
-    def _reader_for(self, modality: Modality) -> NuScenesReader:
+    def _reader_for(self, modality: Modality, *, progress: Callable[[str], None] | None = None) -> NuScenesReader:
         try:
             modality = Modality(modality)
         except (TypeError, ValueError) as exc:
@@ -103,7 +108,7 @@ class NuScenesLoader(DatasetLoader):
             if reader is None:
                 reader = self._call(
                     NuScenesReader, root=self._root, version=self._release, sensor="camera", configuration=True,
-                    _validate_active_frames=False,
+                    metadata_cache=self._metadata_cache, progress=progress, _validate_active_frames=False,
                 )
             self._readers[modality] = reader
         return self._readers[modality]
@@ -115,8 +120,12 @@ class NuScenesLoader(DatasetLoader):
 
     @property
     def metadata(self) -> DatasetMetadata:
+        return self._metadata if self._metadata is not None else self.prepare_catalog()
+
+    def prepare_catalog(self, *, progress: Callable[[str], None] | None = None) -> DatasetMetadata:
+        self._ensure_open()
         if self._metadata is None:
-            reader = next(iter(self._readers.values()), None) or self._reader_for(Modality.CAMERAS)
+            reader = next(iter(self._readers.values()), None) or self._reader_for(Modality.CAMERAS, progress=progress)
             sensors = []
             native_sensors = set(reader._sensor_channels)
             if ("LIDAR_TOP", "lidar") in native_sensors or reader._lidar_by_sample:
@@ -135,7 +144,7 @@ class NuScenesLoader(DatasetLoader):
                     ))
             capabilities = set()
             if any(sensor.modality == Modality.POINT_CLOUD for sensor in sensors):
-                capabilities.add(Capability.POINT_CLOUD)
+                capabilities.update({Capability.POINT_CLOUD, Capability.LIDAR_SEGMENTATION})
             if any(sensor.modality == Modality.CAMERAS for sensor in sensors):
                 capabilities.add(Capability.CAMERAS)
             if (reader.table_root / "sample_annotation.json").is_file() and not self._release.endswith("test"):
@@ -193,6 +202,12 @@ class NuScenesLoader(DatasetLoader):
         reader = self._reader_for(Modality.POINT_CLOUD)
         return self._call(reader.load_frame, frame_id)
 
+    def _lidar_scan_token(self, frame_id: str) -> str:
+        return self._call(self._reader_for(Modality.POINT_CLOUD).lidar_scan_token, frame_id)
+
+    def _load_lidarseg_ground_truth(self, frame: PointCloudFrame) -> LidarSegmentation:
+        return self._call(self._reader_for(Modality.POINT_CLOUD).load_lidarseg_ground_truth, frame)
+
     def _load_cameras(self, frame_id: str) -> CameraFrameSet:
         reader = self._reader_for(Modality.CAMERAS)
         return self._call(reader.load_camera_frame, frame_id)
@@ -205,6 +220,5 @@ class NuScenesLoader(DatasetLoader):
 
     def _close(self) -> None:
         for reader in set(self._readers.values()):
-            reader._image_cache.clear()
-            reader._trajectories.clear()
+            reader.close()
         self._readers.clear()

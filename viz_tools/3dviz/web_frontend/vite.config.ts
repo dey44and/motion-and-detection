@@ -10,7 +10,7 @@ export default defineConfig({
         fileName: 'THIRD_PARTY.txt',
         source: 'This application bundles Three.js and its add-on modules.\n\n'
           + readFileSync(new URL('./node_modules/three/LICENSE', import.meta.url), 'utf8')
-          + '\n\nThis application bundles the Inter variable font.\n\n'
+          + '\n\nThis application bundles the Source Sans Pro variable font from Adobe (2.045R).\n\n'
           + readFileSync(new URL('./src/fonts/OFL.txt', import.meta.url), 'utf8'),
       });
     },

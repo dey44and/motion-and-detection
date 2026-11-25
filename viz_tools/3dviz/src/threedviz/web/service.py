@@ -1,4 +1,4 @@
-"""Session-owned dataset workers, independent of HTTP and desktop rendering.
+"""Session-owned dataset and prediction workers.
 
 Each tab has one serial worker and one committed frame/packet. Jobs prepare a
 replacement completely before committing it. Failed loads retain the prior
@@ -10,24 +10,29 @@ from __future__ import annotations
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 from pathlib import Path
 import secrets
 from threading import Event, RLock
 import time
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 
 from visual_utils import (
     Capability, DatasetConfig, DatasetConfigurationError, DatasetLoader,
-    Modality, PointCloudPreparation, UnsupportedCapabilityError, load_dataset_config,
+    Modality, PointCloudFrame, PointCloudPreparation, UnsupportedCapabilityError, load_dataset_config,
 )
 from threedviz.dataloader import available_datasets, create_dataset
+from threedviz.detection.predictions import PredictionError, available_prediction_formats
 from threedviz.processing import COLOR_SCHEMES, class_color, colorize_points
 
+from .detection import DetectionReview
 from .wire import encode_frame
+
+if TYPE_CHECKING:
+    from .segmentation import FrameSegmentation, PredictionRun
 
 
 _LOG = logging.getLogger(__name__)
@@ -50,6 +55,9 @@ class LaunchOptions:
     autoload: bool = False
     config: DatasetConfig | None = None
     config_path: str | Path | None = None
+    predictions: str | Path | None = None
+    prediction_format: str = "auto"
+    cache_dir: str | Path | None = None
 
     def public(self):
         root = self.config.root if self.config is not None else self.root
@@ -61,10 +69,36 @@ class LaunchOptions:
             "autoload": self.autoload,
             "config_path": None if self.config_path is None else str(self.config_path),
             "configured": self.config is not None,
+            "prediction_path": None if self.predictions is None else str(self.predictions),
+            "prediction_format": self.prediction_format,
         }
 
 
-@dataclass
+@dataclass(frozen=True)
+class _Segmentation:
+    mode: str = "off"
+    run: PredictionRun | None = None
+    result: FrameSegmentation | None = None
+    generation: int = 0
+
+    def for_frame(self, loader, frame):
+        from .segmentation import frame_segmentation
+
+        result = frame_segmentation(loader, frame, self.mode, self.run)
+        return replace(self, result=result)
+
+    def public(self, metadata):
+        state = self.result.public()
+        return {
+            **state, "message": state["reason"] or "",
+            "available": Capability.LIDAR_SEGMENTATION in metadata.capabilities,
+            "mode": self.mode, "path": None if self.run is None else str(self.run.path),
+            "format": "auto" if self.run is None else self.run.format, "generation": self.generation,
+            "run": None if self.run is None else self.run.public(),
+        }
+
+
+@dataclass(frozen=True)
 class _Connection:
     loader: DatasetLoader
     dataset: dict
@@ -73,11 +107,13 @@ class _Connection:
     scene_id: str
     frames: tuple
     frame_index: int
-    frame: object
+    frame: PointCloudFrame
     rgb: bool
     raw: bool
     revision: int
     packet: bytes
+    detection: DetectionReview
+    segmentation: _Segmentation
 
 
 def _supports_raw(metadata):
@@ -121,15 +157,26 @@ def _state(connection):
         ],
         "frame_index": connection.frame_index, "revision": connection.revision,
         "has_frame": True, "display": {"rgb": connection.rgb, "raw": connection.raw},
+        "detection": connection.detection.public(metadata),
+        "segmentation": connection.segmentation.public(metadata),
     }
 
 
-def _close_loader(loader):
-    if loader is not None:
+def _close_resource(resource):
+    if resource is not None:
         try:
-            loader.close()
+            resource.close()
         except Exception:
-            _LOG.exception("Dataset cleanup failed")
+            _LOG.exception("Viewer resource cleanup failed")
+
+
+def _close_replaced(connection, retained=None):
+    if connection is None:
+        return
+    if retained is None or connection.detection.source is not retained.detection.source:
+        _close_resource(connection.detection.source)
+    if retained is None or connection.loader is not retained.loader:
+        _close_resource(connection.loader)
 
 
 class BrowserSession:
@@ -173,22 +220,43 @@ class BrowserSession:
                 raise BrowserError(409, "The requested frame revision is no longer current.")
             return self._connection.packet
 
+    def semantic_labels(self, revision: int, generation: int, *, native: bool = False):
+        with self._lock:
+            self._check_open()
+            connection = self._connection
+            if connection is None or connection.revision != revision or connection.segmentation.generation != generation:
+                raise BrowserError(409, "The requested LiDAR labels are no longer current.")
+            result = connection.segmentation.result
+            labels = result.native_labels if native else result.labels
+            if labels is None:
+                raise BrowserError(404, "The requested LiDAR labels are unavailable for this scan.")
+            return labels.tobytes()
+
     def start(self, values: dict):
         values = dict(values)
         op = values.get("op")
-        if op not in {"connect", "select", "prepare"}:
+        operations = {
+            "connect": {"dataset", "root", "version", "config_path", "split", "scene_id", "frame_index", "rgb", "raw"},
+            "select": {"split", "scene_id", "frame_index", "rgb", "raw"},
+            "prepare": {"rgb", "raw"},
+            "detection": {"revision", "prediction_path", "prediction_format", "filters"},
+            "segmentation": {"revision", "segmentation_mode", "segmentation_path", "segmentation_format"},
+        }
+        if op not in operations:
             raise BrowserError(422, "Unknown browser operation.")
-        common = {"op", "rgb", "raw"}
-        allowed = common | ({"dataset", "root", "version", "config_path", "split", "scene_id", "frame_index"}
-                            if op == "connect" else {"split", "scene_id", "frame_index"} if op == "select" else set())
-        if values.keys() - allowed:
+        if values.keys() - (operations[op] | {"op"}):
             raise BrowserError(422, "This operation contains fields belonging to a different operation.")
         with self._lock:
             self._check_open()
             if self._active_job is not None:
                 raise BrowserError(409, "This session is already loading. Wait for the current operation.")
             if op != "connect" and self._connection is None:
-                raise BrowserError(409, "Connect a dataset before selecting or preparing a frame.")
+                raise BrowserError(409, "Connect a dataset before changing the view.")
+            if op in {"detection", "segmentation"}:
+                if "revision" not in values:
+                    raise BrowserError(422, "An overlay operation requires a frame revision.")
+                if values["revision"] != self._connection.revision:
+                    raise BrowserError(409, "The requested frame revision is no longer current.")
             job_id = secrets.token_urlsafe(18)
             self._jobs[job_id] = {"id": job_id, "status": "running", "stage": "Queued"}
             while len(self._jobs) > self._history_limit:
@@ -218,6 +286,10 @@ class BrowserSession:
         try:
             if values["op"] == "connect":
                 candidate = self._connect(job_id, values)
+            elif values["op"] == "detection":
+                candidate = self._detection(job_id, values, previous)
+            elif values["op"] == "segmentation":
+                candidate = self._segmentation(job_id, values, previous)
             else:
                 candidate = self._select_or_prepare(job_id, values, previous)
             state = _state(candidate)
@@ -228,8 +300,7 @@ class BrowserSession:
                 self._revision = candidate.revision
                 self._jobs[job_id].update(status="done", stage="Ready", state=state)
                 self._active_job = None
-            if previous is not None and previous.loader is not candidate.loader:
-                _close_loader(previous.loader)
+            _close_replaced(previous, candidate)
         except Exception as error:
             with self._lock:
                 if not self._closed:
@@ -237,8 +308,7 @@ class BrowserSession:
                     self._active_job = None
         finally:
             if candidate is not None and candidate is not self._connection:
-                if previous is None or candidate.loader is not previous.loader:
-                    _close_loader(candidate.loader)
+                _close_replaced(candidate, previous)
             with self._lock:
                 if self._active_job == job_id:
                     self._active_job = None
@@ -268,7 +338,10 @@ class BrowserSession:
     def _connect(self, job_id, values):
         self._stage(job_id, "Opening dataset")
         name, config, version, root = self._source(values)
-        loader = self._factory(name, config=config) if config is not None else self._factory(name, root=root, version=version)
+        source = {"config": config} if config is not None else {"root": root, "version": version}
+        if self._factory is create_dataset:
+            source["progress"] = lambda message: self._stage(job_id, message)
+        loader = self._factory(name, **source)
         try:
             metadata = loader.metadata
             if Capability.POINT_CLOUD not in metadata.capabilities:
@@ -289,9 +362,21 @@ class BrowserSession:
             dataset = {"name": name, "root": str(loader.config.root or ""),
                        "version": (config.release or "") if config is not None else metadata.release or loader.config.release or "",
                        "configured": config is not None}
-            return self._candidate(job_id, loader, dataset, split, scenes, selected.scene_id, frames, index, frame, rgb, raw)
+            detection = DetectionReview.initial(frame, demo=name == "demo")
+            segmentation = _Segmentation().for_frame(loader, frame)
+            candidate = self._candidate(job_id, loader, dataset, split, scenes, selected.scene_id, frames, index, frame,
+                                        rgb, raw, detection, segmentation)
+            if self._connection is None and name == self.options.dataset and self.options.predictions is not None:
+                try:
+                    detection = self._attach_detections(
+                        job_id, detection, frame, self.options.predictions, self.options.prediction_format,
+                    )
+                except PredictionError as error:
+                    detection = replace(detection, review=None, error=str(error))
+                candidate = replace(candidate, detection=detection)
+            return candidate
         except Exception:
-            _close_loader(loader)
+            _close_resource(loader)
             raise
 
     @staticmethod
@@ -367,15 +452,68 @@ class BrowserSession:
                 self._stage(job_id, "Reading point cloud")
                 frame = loader.load_point_cloud(info.frame_id)
         frame = self._prepare(job_id, loader, frame, rgb, raw)
-        return self._candidate(job_id, loader, connection.dataset, split, scenes, scene_id, frames, index, frame, rgb, raw)
+        detection, segmentation = connection.detection, connection.segmentation
+        if frame.info.frame_id != connection.frame.info.frame_id:
+            if detection.source is not None:
+                self._stage(job_id, "Reading detections")
+            detection = detection.for_frame(frame)
+            if segmentation.mode != "off":
+                self._stage(job_id, "Reading LiDAR labels")
+            segmentation = segmentation.for_frame(loader, frame)
+        return self._candidate(job_id, loader, connection.dataset, split, scenes, scene_id, frames, index, frame,
+                               rgb, raw, detection, segmentation)
 
-    def _candidate(self, job_id, loader, dataset, split, scenes, scene_id, frames, index, frame, rgb, raw):
+    def _detection(self, job_id, values, connection):
+        detection = connection.detection
+        if "filters" in values:
+            self._stage(job_id, "Filtering detections")
+            detection = detection.with_filters(values["filters"])
+        if "prediction_path" in values:
+            detection = self._attach_detections(
+                job_id, detection, connection.frame, values["prediction_path"].strip(),
+                values.get("prediction_format", "auto"),
+            )
+        return replace(connection, detection=detection)
+
+    def _attach_detections(self, job_id, detection, frame, path, format):
+        self._stage(job_id, "Opening detection export")
+        return detection.with_source(
+            frame, path, format, cache_dir=self.options.cache_dir,
+            progress=lambda _fraction, message: self._stage(job_id, message),
+            cancelled=lambda: self._closed,
+        )
+
+    def _segmentation(self, job_id, values, connection):
+        from .segmentation import load_prediction_run
+
+        loader = connection.loader
+        segmentation = connection.segmentation
+        if Capability.LIDAR_SEGMENTATION not in loader.metadata.capabilities:
+            raise UnsupportedCapabilityError("LiDAR segmentation is unavailable for this dataset.")
+        if "segmentation_path" in values:
+            path = values["segmentation_path"].strip()
+            self._stage(job_id, "Opening LiDAR segmentation export")
+            run = None if not path else load_prediction_run(
+                path, release=loader.metadata.release or loader.config.release,
+                format=values.get("segmentation_format", "auto"),
+            )
+            segmentation = replace(segmentation, run=run)
+        self._stage(job_id, "Reading LiDAR labels")
+        segmentation = replace(
+            segmentation, mode=values.get("segmentation_mode", segmentation.mode),
+            generation=segmentation.generation + 1,
+        ).for_frame(loader, connection.frame)
+        return replace(connection, segmentation=segmentation)
+
+    def _candidate(self, job_id, loader, dataset, split, scenes, scene_id, frames, index, frame,
+                   rgb, raw, detection, segmentation):
         if frame.info.frame_id != frames[index].frame_id or frame.info.scene_id != scene_id:
             raise ValueError("The dataset returned a point cloud for a different observation.")
         revision = self._revision + 1
         self._stage(job_id, "Transferring geometry")
         packet = encode_frame(frame, revision, rgb=rgb, raw=raw, class_groups=_groups(loader.metadata))
-        return _Connection(loader, dataset, split, scenes, scene_id, frames, index, frame, rgb, raw, revision, packet)
+        return _Connection(loader, dataset, split, scenes, scene_id, frames, index, frame, rgb, raw, revision, packet,
+                           detection, segmentation)
 
     def close(self, *, wait=False):
         with self._lock:
@@ -389,8 +527,7 @@ class BrowserSession:
         with self._lock:
             connection, self._connection = self._connection, None
             self._jobs.clear()
-        if connection is not None:
-            _close_loader(connection.loader)
+        _close_replaced(connection)
         self._disposed.set()
 
 
@@ -412,6 +549,7 @@ class SessionManager:
     def bootstrap(self):
         samples = np.column_stack((np.linspace(0, 1, 256), np.zeros((256, 2))))
         return {"datasets": list(self._catalog()), "initial": self.options.public(),
+                "prediction_formats": list(available_prediction_formats()),
                 "palettes": {name: colorize_points(samples, name, 1.0).tolist() for name in COLOR_SCHEMES}}
 
     def create(self):
