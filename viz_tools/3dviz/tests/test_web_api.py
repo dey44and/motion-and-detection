@@ -23,7 +23,11 @@ def client():
 
 
 def _connect(client, sid, **values):
-    response = client.post(f"/api/sessions/{sid}/jobs", json={"op": "connect", "dataset": "demo", **values})
+    return _job(client, sid, op="connect", dataset="demo", **values)
+
+
+def _job(client, sid, **values):
+    response = client.post(f"/api/sessions/{sid}/jobs", json=values)
     assert response.status_code == 202, response.text
     job = response.json()["id"]
     deadline = time.monotonic() + 5
@@ -34,7 +38,7 @@ def _connect(client, sid, **values):
             assert result["status"] == "done", result
             return result["state"]
         time.sleep(.005)
-    pytest.fail("demo connect job did not finish")
+    pytest.fail("Browser job did not finish")
 
 
 def test_http_demo_end_to_end_and_revision_guard(client):
@@ -73,12 +77,98 @@ def test_http_sessions_are_isolated_and_invalid_identifiers_are_bounded(client):
     assert client.get(f"/api/sessions/{first}/frame.bin?revision=0").status_code == 422
 
 
+@pytest.mark.parametrize("format", ["nuscenes_json", "pcdet_pickle"])
+def test_browser_detection_edits_only_boxes_and_matches_review_pipeline(client, tmp_path, monkeypatch, format):
+    import pickle
+    import numpy as np
+
+    from threedviz.dataloader import DemoLoader
+    from threedviz.detection.controller import compose_review
+    from threedviz.detection.predictions import open_predictions
+    from threedviz.detection.processing.filters import FilterConfig
+    from threedviz.processing import box_corners
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    sid = client.post("/api/sessions").json()["id"]
+    state = _connect(client, sid)
+    revision = state["revision"]
+    token, empty_token = (row["id"] for row in state["frames"][:2])
+    if format == "nuscenes_json":
+        path = tmp_path / "predictions.json"
+        box = {"sample_token": token, "translation": [10, 20, 3], "size": [2, 4, 1.5],
+               "rotation": [1, 0, 0, 0], "detection_name": "car", "velocity": [0, 0]}
+        path.write_text(json.dumps({"results": {
+            token: [dict(box, detection_score=0.8), dict(box, detection_score=0.6)], empty_token: [],
+        }}))
+    else:
+        path = tmp_path / "predictions.pkl"
+        path.write_bytes(pickle.dumps([
+            {"metadata": {"token": token}, "name": ["car", "car"], "score": [0.8, 0.6],
+             "boxes_lidar": [[10, 20, 3, 4, 2, 1.5, 0]] * 2},
+            {"metadata": {"token": empty_token}, "score": [], "boxes_lidar": np.empty((0, 7))},
+        ]))
+
+    frame_url = f"/api/sessions/{sid}/frame.bin?revision={revision}"
+    original_cloud = client.get(frame_url).content
+    filters = {"nms_mode": "class", "nms_iou_threshold": 0.2}
+    state = _job(client, sid, op="detection", revision=revision, prediction_path=str(path), filters=filters)
+    assert state["revision"] == revision and client.get(frame_url).content == original_cloud
+    layer = state["detection"]
+    with DemoLoader() as loader, open_predictions(path) as predictions:
+        reference = compose_review(loader.load_point_cloud(token), source=predictions, config=FilterConfig(**filters))
+    assert layer["status"] == "ready" and layer["source"]["format"] == format
+    assert layer["counts"] == {"loaded": 2, "score": 2, "spatial": 2, "pre_nms": 2, "nms": 1, "output": 1}
+    assert [item["id"] for item in layer["boxes"]] == [item.identifier for item in reference.filtered.detections]
+    np.testing.assert_allclose(layer["boxes"][0]["corners"], box_corners(reference.filtered.detections[0].box))
+    state = _job(client, sid, op="detection", revision=revision, filters={"max_detections": 0})
+    assert state["detection"]["status"] == "filtered" and client.get(frame_url).content == original_cloud
+    state = _job(client, sid, op="select", frame_index=1)
+    assert state["detection"]["status"] == "empty"
+    assert client.post(f"/api/sessions/{sid}/jobs", json={
+        "op": "detection", "revision": revision, "filters": {"score_threshold": 0},
+    }).status_code == 409
+    state = _job(client, sid, op="select", frame_index=2)
+    assert state["detection"]["status"] == "missing"
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_launch_export_and_cache_are_used_when_connecting(valid, tmp_path):
+    path = tmp_path / "prediction.export"
+    cache = tmp_path / "indexes"
+    if valid:
+        path.write_text(json.dumps({"results": {"demo-urban-000": [], "demo-urban-001": []}}))
+    with TestClient(create_app(dataset="demo", predictions=path, prediction_format="nuscenes_json",
+                               cache_dir=cache)) as client:
+        boot = client.get("/api/bootstrap").json()
+        assert boot["initial"]["prediction_path"] == str(path)
+        assert boot["initial"]["prediction_format"] == "nuscenes_json"
+        assert {"nuscenes_json", "pcdet_pickle"} <= set(boot["prediction_formats"])
+        sid = client.post("/api/sessions").json()["id"]
+        state = _connect(client, sid)
+        assert state["detection"]["available"]
+        assert state["detection"]["status"] == ("empty" if valid else "invalid")
+        if valid:
+            assert state["detection"]["source"]["path"] == str(path)
+            assert list(cache.rglob("*.sqlite3"))
+        else:
+            assert state["detection"]["source"] is None
+            assert str(path) in state["detection"]["message"]
+        packet = client.get(f"/api/sessions/{sid}/frame.bin", params={"revision": state["revision"]})
+        assert packet.status_code == 200
+        state = _job(client, sid, op="select", frame_index=1)
+        assert state["detection"]["status"] == ("empty" if valid else "invalid")
+        reconnected = _connect(client, sid)
+        assert reconnected["detection"]["source"]["format"] == "demo"
+
+
 @pytest.mark.parametrize("values", [
     {"op": "other"}, {"op": "connect", "frame_index": -1},
     {"op": "connect", "frame_index": 1.5}, {"op": "connect", "frame_index": True},
     {"op": "connect", "rgb": "false"}, {"op": "connect", "raw": 1},
     {"op": "connect", "dataset": ["demo"]}, {"op": "connect", "extra": "ignored?"},
     {"op": "prepare", "scene_id": "anything"},
+    {"op": "segmentation", "revision": 1, "segmentation_mode": "other"},
+    {"op": "detection", "revision": True}, {"op": "connect", "prediction_path": "/data"},
 ])
 def test_http_strict_input_validation(client, values):
     sid = client.post("/api/sessions").json()["id"]
@@ -127,7 +217,8 @@ def test_web_transport_imports_without_desktop_or_dataset_backends():
 import sys
 from threedviz.web.server import create_app
 assert create_app(dataset="demo")
-for prefix in ("open3d", "glfw", "tensorflow", "visual_utils.nuscenes", "visual_utils.waymo"):
+for prefix in ("open3d", "glfw", "pandas", "detviz", "tkinter", "tensorflow",
+               "visual_utils.nuscenes", "visual_utils.waymo"):
     assert not any(name == prefix or name.startswith(prefix + ".") for name in sys.modules), prefix
 '''
     subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)

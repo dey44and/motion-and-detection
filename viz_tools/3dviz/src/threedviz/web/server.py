@@ -1,4 +1,4 @@
-"""Loopback-only HTTP transport for the optional 3dviz browser frontend."""
+"""Loopback-only HTTP transport for the 3dviz browser frontend."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class JobRequest(BaseModel):
     """Reject coercion and accidental options instead of silently ignoring them."""
 
     model_config = ConfigDict(extra="forbid")
-    op: Literal["connect", "select", "prepare"]
+    op: Literal["connect", "select", "prepare", "detection", "segmentation"]
     dataset: Annotated[StrictStr, Field(max_length=256)] | None = None
     root: Annotated[StrictStr, Field(max_length=8192)] | None = None
     version: Annotated[StrictStr, Field(max_length=256)] | None = None
@@ -33,6 +33,13 @@ class JobRequest(BaseModel):
     frame_index: Annotated[StrictInt, Field(ge=0)] | None = None
     rgb: StrictBool | None = None
     raw: StrictBool | None = None
+    revision: Annotated[StrictInt, Field(ge=1)] | None = None
+    prediction_path: Annotated[StrictStr, Field(max_length=8192)] | None = None
+    prediction_format: Annotated[StrictStr, Field(max_length=256)] | None = None
+    filters: dict | None = None
+    segmentation_mode: Literal["off", "ground_truth", "prediction"] | None = None
+    segmentation_path: Annotated[StrictStr, Field(max_length=8192)] | None = None
+    segmentation_format: Literal["auto", "official", "sonata"] | None = None
 
 
 def _local_host(host: str, *, tests=False) -> bool:
@@ -137,6 +144,12 @@ def create_app(*, manager: SessionManager | None = None, factory=None, **launch_
     @app.get("/api/sessions/{session_id}/frame.bin")
     def frame_packet(session_id: str, revision: Annotated[int, Query(ge=1)]):
         return Response(manager.get(session_id).packet(revision), media_type="application/octet-stream")
+
+    @app.get("/api/sessions/{session_id}/segmentation.bin")
+    def semantic_packet(session_id: str, revision: Annotated[int, Query(ge=1)],
+                        generation: Annotated[int, Query(ge=0)], native: bool = False):
+        labels = manager.get(session_id).semantic_labels(revision, generation, native=native)
+        return Response(labels, media_type="application/octet-stream")
 
     # Only bundled assets are served. Dataset paths are never mounted.
     static = Path(__file__).with_name("static")

@@ -76,16 +76,31 @@ def native_root(tmp_path):
     return root
 
 
+@pytest.fixture(params=[False, True], ids=["json", "sqlite"])
+def open_reader(native_root, tmp_path, monkeypatch, request):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    readers = []
+
+    def open_native(**options):
+        reader = NuScenesReader(root=native_root, metadata_cache=request.param, **options)
+        readers.append(reader)
+        return reader
+
+    yield open_native
+    for reader in readers:
+        reader.close()
+
+
 @pytest.mark.parametrize("sensor,tokens", [
     ("lidar", ["both", "lidar-only"]), ("camera", ["both", "camera-only"]),
 ])
-def test_mode_selects_keyframe_index_without_loading_payloads(native_root, monkeypatch, sensor, tokens):
+def test_mode_selects_keyframe_index_without_loading_payloads(open_reader, monkeypatch, sensor, tokens):
     def forbidden(*args, **kwargs):
         raise AssertionError("Enumerating sensor metadata must not read payloads.")
 
     monkeypatch.setattr(Image, "open", forbidden)
     monkeypatch.setattr(np, "fromfile", forbidden)
-    reader = NuScenesReader(root=native_root, sensor=sensor)
+    reader = open_reader(sensor=sensor)
     assert reader.list_scenes()[0].frame_counts[Modality.POINT_CLOUD if sensor == "lidar" else Modality.CAMERAS] == 2
     frames = reader.list_frames("scene")
     assert [frame.frame_id for frame in frames] == tokens
@@ -126,8 +141,8 @@ def test_both_modalities_share_tables_and_keep_their_coordinate_frames(native_ro
 
 
 @pytest.mark.parametrize("sensor", ["camera", "lidar"])
-def test_wrong_modality_and_unknown_tokens_raise_shared_error(native_root, sensor):
-    reader = NuScenesReader(root=native_root, sensor=sensor)
+def test_wrong_modality_and_unknown_tokens_raise_shared_error(open_reader, sensor):
+    reader = open_reader(sensor=sensor)
     with pytest.raises(DataUnavailableError, match="has no point_cloud observation"):
         reader.load_frame("camera-only")
     with pytest.raises(DataUnavailableError, match="has no cameras observation"):
@@ -139,7 +154,7 @@ def test_wrong_modality_and_unknown_tokens_raise_shared_error(native_root, senso
     assert reader.load_frame("lidar-only").points.shape == (2, 3)
 
 
-def test_camera_only_extract_ignores_unavailable_lidar_payload_and_pose(native_root):
+def test_camera_only_extract_ignores_unavailable_lidar_payload_and_pose(native_root, open_reader):
     for path in (native_root / "samples/LIDAR_TOP").iterdir():
         path.unlink()
     metadata = native_root / "v1.0-mini/sample_data.json"
@@ -148,7 +163,7 @@ def test_camera_only_extract_ignores_unavailable_lidar_payload_and_pose(native_r
         if data["calibrated_sensor_token"] == "lidar-cal":
             data.pop("ego_pose_token", None)
     metadata.write_text(json.dumps(records))
-    reader = NuScenesReader(root=native_root, sensor="camera")
+    reader = open_reader(sensor="camera")
     assert len(reader.list_frames("scene")) == 2
     assert reader.load_camera_frame("both").cameras
 
@@ -170,18 +185,33 @@ def test_invalid_sensor_is_actionable(native_root):
         NuScenesReader(root=native_root, sensor="radar")
 
 
+def test_unavailable_metadata_cache_falls_back_to_native_tables(native_root, tmp_path, monkeypatch):
+    blocked_cache = tmp_path / "cache-is-a-file"
+    blocked_cache.touch()
+    monkeypatch.setenv("XDG_CACHE_HOME", str(blocked_cache))
+    progress = []
+
+    reader = NuScenesReader(root=native_root, metadata_cache=True, progress=progress.append)
+    try:
+        assert reader.load_frame("both").points.shape == (2, 3)
+        assert reader.load_camera_frame("both").cameras
+        assert any("cache unavailable" in stage for stage in progress)
+    finally:
+        reader.close()
+
+
 @pytest.mark.parametrize("active,inactive,bad_token,bad_timestamp", [
     ("lidar", "camera", "camera-only", "invalid"),
     ("camera", "lidar", "lidar-only", True),
 ])
 def test_inactive_modality_timestamp_error_is_deferred_to_cross_read(
-    native_root, active, inactive, bad_token, bad_timestamp
+    native_root, open_reader, active, inactive, bad_token, bad_timestamp
 ):
     path = native_root / "v1.0-mini/sample.json"
     records = json.loads(path.read_text())
     next(sample for sample in records if sample["token"] == bad_token)["timestamp"] = bad_timestamp
     path.write_text(json.dumps(records))
-    reader = NuScenesReader(root=native_root, sensor=active)
+    reader = open_reader(sensor=active)
     assert reader.list_scenes()[0].frame_counts[Modality.POINT_CLOUD if active == "lidar" else Modality.CAMERAS] == 2
     assert len(reader.list_frames("scene")) == 2
     active_load = reader.load_frame if active == "lidar" else reader.load_camera_frame
@@ -192,7 +222,7 @@ def test_inactive_modality_timestamp_error_is_deferred_to_cross_read(
     # The same invalid metadata remains an eager error when selected for
     # enumeration, rather than silently losing a frame from the active view.
     with pytest.raises(DatasetError, match=f"Invalid {inactive} sample timestamps"):
-        NuScenesReader(root=native_root, sensor=inactive)
+        open_reader(sensor=inactive)
 
 
 def test_camera_view_retains_keyframes_and_prepares_full_sweeps_only_on_request(native_root, monkeypatch):

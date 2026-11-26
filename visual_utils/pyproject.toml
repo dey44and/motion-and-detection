@@ -13,6 +13,7 @@ dependencies = [
     "Pillow>=10,<13",
     "protobuf>=4.25,<7",
     "google-crc32c>=1.5,<2",
+    "ijson>=3.2,<4",
 ]
 
 [project.optional-dependencies]

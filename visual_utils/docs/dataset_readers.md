@@ -14,15 +14,16 @@ geometry, and processing assumptions.
 <a id="nuscenes"></a>
 ## 🚗 Read nuScenes
 
-`NuScenesReader` reads native JSON tables directly, without the nuScenes SDK.
-Point it at an extracted dataset root containing `v1.0-mini`, `v1.0-trainval`,
+`NuScenesReader` reads native metadata without the nuScenes SDK. Point it at an
+extracted dataset root containing `v1.0-mini`, `v1.0-trainval`,
 or `v1.0-test`, or at the metadata version directory itself. Sensor files may
 remain under the dataset root or version directory.
 
 Select `sensor="lidar"` to enumerate `LIDAR_TOP` keyframes, or `sensor="camera"`
 to enumerate camera keyframes, including camera-only extracts. Both payload
-methods remain available regardless of the enumeration mode. Camera mode keeps
-keyframe metadata and loads full sweep indexes only when LiDAR timing or RGB
+methods remain available regardless of the enumeration mode. The default
+direct reader parses JSON. In this mode, camera enumeration keeps keyframe
+metadata and defers the full sweep indexes until LiDAR timing or RGB
 preparation is requested.
 
 ```python
@@ -33,10 +34,12 @@ scene = lidar.list_scenes_for_split("val")[0]
 info = lidar.list_frames(scene.scene_id)[0]
 cloud = lidar.load_frame(info.frame_id)
 colored = lidar.prepare_frame(cloud, camera_rgb=True)
+lidar.close()
 
 cameras = NuScenesReader(root="/datasets/nuscenes", version="v1.0-mini", sensor="camera")
 camera_info = cameras.list_frames(scene.scene_id)[0]
 camera_set = cameras.load_camera_frame(camera_info.frame_id)
+cameras.close()
 ```
 
 Scene and frame catalogs expose official offline split membership. On mini,
@@ -52,6 +55,43 @@ The reader returns the shared records directly:
 | `PointCloudFrame` | Points and annotations in the reference sensor coordinates, LWH box dimensions, and `T_world_from_reference` for the LiDAR pose. |
 | `CameraFrameSet` | World-reference annotations, RGB images, and explicit camera poses and projection models. |
 | Optional point fields | `rgb`, `timing`, and `acquisition`, with masks and provenance. |
+
+<a id="cache-nuscenes-metadata"></a>
+### Cache nuScenes metadata
+
+The shared nuScenes loader uses a local SQLite index for `v1.0-trainval` and
+`v1.0-test` by default. The first connection streams the large sample-data,
+ego-pose, and annotation tables into this index. That build can take several
+minutes on network storage. Subsequent connections reuse the index while the
+source metadata match. Frame loads read the selected observations, and timing
+and camera RGB preparation look up the required sweep metadata for the scene.
+
+The cache lives at `$XDG_CACHE_HOME/visual-utils/nuscenes` or
+`~/.cache/visual-utils/nuscenes` when `XDG_CACHE_HOME` is unset. Allow space
+for gigabytes of metadata on large releases, with additional room during a
+build or rebuild. Keep this directory on local storage for faster lookups.
+You can delete an unused index with the viewers closed. The next connection
+builds it again from the native JSON tables. If the cache is unavailable, the
+loader reads those tables into memory, which can increase memory usage on full
+releases.
+
+Sensor data and LiDAR segmentation label files are read from the dataset when
+requested. No extra extraction or dataset-directory writes are required.
+Use the existing `--dataset-config` argument in either viewer to override the
+default. A mini configuration that enables the cache is:
+
+```json
+{
+  "root": "/datasets/nuscenes",
+  "release": "v1.0-mini",
+  "options": {"metadata_cache": true}
+}
+```
+
+Set `metadata_cache` to `false` to use direct JSON reads on any release. When
+calling `NuScenesReader` directly, pass `metadata_cache=True` to opt in.
+Call `close()` when you finish with a direct reader to release the index
+connection. A `DatasetLoader` context manager handles this cleanup automatically.
 
 ### 🕒 Interpret timing and RGB
 
@@ -189,9 +229,11 @@ and the two-frame cache. Length CRCs are checked during indexing and full payloa
 CRCs when a record is selected. The declared `google-crc32c` dependency provides
 a fast implementation, with a pure-Python fallback also available.
 
-nuScenes tests cover native table indexing, full quaternion and pose transforms,
-camera-only and annotation-free extracts, official splits, nominal point timing,
-and camera projection. Viewer tests cover their own integration and UI behavior.
+nuScenes tests exercise direct JSON and SQLite reads for catalog and payload
+access, box transforms, camera projection, timing and acquisition geometry,
+RGB colors, and LiDAR segmentation alignment. The warm-open test checks that
+full-release loading and preparation can reuse indexed tables without opening
+their source JSON. Viewer tests cover their own integration and UI behavior.
 
 A recorded real-data check on validation context
 `10203656353524179475_7625_000_7645_000` decoded 126,504 points in the same order

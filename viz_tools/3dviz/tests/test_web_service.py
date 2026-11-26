@@ -208,6 +208,38 @@ def test_closed_first_connection_never_commits_and_closes_new_loader(manager, fa
     assert loader.close_count == 1 and session._connection is None
 
 
+def test_default_factory_reports_catalog_progress_and_closes_on_cancel(monkeypatch):
+    from visual_utils import registry
+
+    class CatalogLoader(FixtureLoader):
+        def prepare_catalog(self, *, progress=None):
+            progress("Indexing fixture catalog")
+            self.entered.set()
+            if not self.release.wait(5):
+                raise TimeoutError("fixture catalog was not released")
+            progress("Finishing fixture catalog")
+            self.calls.append(("catalog ready", None, threading.current_thread().name))
+            return self.metadata
+
+    loader = CatalogLoader(DatasetConfig())
+    monkeypatch.setattr(registry, "_REGISTRY", {**registry._REGISTRY, "catalog-fixture": lambda config: loader})
+    manager = SessionManager()
+    try:
+        session = manager.create()
+        job = session.start({"op": "connect", "dataset": "catalog-fixture"})["id"]
+        assert loader.entered.wait(2)
+        assert session.job(job)["stage"] == "Indexing fixture catalog"
+        manager.delete(session.id)
+        loader.release.set()
+        session.close(wait=True)
+        assert session._connection is None
+        assert loader.close_count == 1
+        assert [call[0] for call in loader.calls] == ["close"]
+    finally:
+        loader.release.set()
+        manager.close()
+
+
 def test_done_jobs_keep_their_own_revision_and_old_packet_revisions_are_rejected(manager):
     session = manager.create()
     first = session.start({"op": "connect", "dataset": "fixture"})["id"]

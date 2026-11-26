@@ -76,7 +76,7 @@ def available_loaders() -> tuple[str, ...]:
     return tuple(sorted(set(_REGISTRY).union(_check_conflicts())))
 
 
-def create_loader(name: str, config: DatasetConfig) -> DatasetLoader:
+def create_loader(name: str, config: DatasetConfig, *, progress: Callable[[str], None] | None = None) -> DatasetLoader:
     """Construct and validate one provider, importing only the selected plugin."""
     key = _name(name)
     if not isinstance(config, DatasetConfig):
@@ -108,7 +108,7 @@ def create_loader(name: str, config: DatasetConfig) -> DatasetLoader:
     if not isinstance(loader, DatasetLoader):
         raise DatasetConfigurationError(f"Constructor for {key!r} must return DatasetLoader.")
     try:
-        metadata = loader.metadata
+        metadata = loader.prepare_catalog(progress=progress)
         if not isinstance(metadata, DatasetMetadata):
             raise DatasetConfigurationError(f"Dataset {key!r} must provide DatasetMetadata.")
         for capability, method in (("point_cloud", "_load_point_cloud"), ("cameras", "_load_cameras")):

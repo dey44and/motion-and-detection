@@ -46,7 +46,7 @@ def browser_viewer(tmp_path):
     base_url = f"http://127.0.0.1:{port}"
     with (tmp_path / "server.log").open("w+") as log:
         process = subprocess.Popen(
-            [sys.executable, "-m", "threedviz", "--web", "--demo", "--port", str(port)],
+            [sys.executable, "-m", "threedviz", "--demo", "--no-open-browser", "--port", str(port)],
             stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy(),
         )
         try:
@@ -344,7 +344,7 @@ def test_browser_demo_navigation_styling_camera_and_recovery(browser_viewer):
     assert announcement.get_attribute("role") == "status"
     assert "Frame 1 of 36" in announcement.inner_text()
     assert "loaded" in announcement.inner_text().lower()
-    assert page.locator("#box-total").inner_text() == "8"
+    assert page.locator("#box-section").is_hidden()
     assert page.locator("#scene option").count() == 2
     assert page.locator("#point-colors option").all_text_contents() == ["Gray", "Viridis", "Camera RGB", "Concerto"]
     assert page.locator('#point-colors option[value="rgb"]').is_disabled()
@@ -368,7 +368,7 @@ def test_browser_demo_navigation_styling_camera_and_recovery(browser_viewer):
     assert page.get_by_text("YOUR WORKSPACE", exact=True).count() == 0
     assert page.locator(".live-badge").count() == 0
     assert page.locator("#sidebar #camera-json").count() == 0
-    assert page.locator("#root").is_visible()
+    assert page.locator("#root").is_hidden()
     assert page.locator("#scene-description").is_visible()
     assert page.locator("#scene-description").inner_text().strip()
     assert page.locator("#camera-hint").is_hidden()
@@ -376,7 +376,7 @@ def test_browser_demo_navigation_styling_camera_and_recovery(browser_viewer):
         await document.fonts.ready;
         return [...document.fonts].filter(face => face.status === 'loaded').map(face => face.family);
     }""")
-    assert "Inter" in [family.strip("'\"") for family in loaded_fonts]
+    assert "Source Sans Pro" in [family.strip("'\"") for family in loaded_fonts]
     camera_panel = page.locator("#camera-panel")
     assert camera_panel.evaluate("element => element.open")
     camera_box = camera_panel.bounding_box()
@@ -415,6 +415,11 @@ def test_browser_demo_navigation_styling_camera_and_recovery(browser_viewer):
         assert page.locator("#max-distance-number").input_value() == "100"
         assert page.locator("#max-distance").input_value() == "100"
 
+    detection_tab = page.get_by_role("tab", name="Detection")
+    scene_tab = page.get_by_role("tab", name="Scene")
+    detection_tab.click()
+    assert page.locator("#box-section").is_visible()
+    assert page.locator("#box-total").inner_text() == "8"
     car = page.get_by_role("checkbox", name="Show car boxes", exact=True)
     before = _rendered_region(page)
     car.uncheck()
@@ -441,6 +446,7 @@ def test_browser_demo_navigation_styling_camera_and_recovery(browser_viewer):
     assert not page.locator("#classes input[type=checkbox]:checked").count()
     page.locator("#show-all").click()
     assert page.locator("#classes input[type=checkbox]:checked").count() == 10
+    scene_tab.click()
 
     menu_toggle = page.locator("#menu-toggle")
     sidebar_content = page.locator("#sidebar-content")
@@ -583,7 +589,9 @@ def test_browser_demo_navigation_styling_camera_and_recovery(browser_viewer):
     page.locator("#scene").select_option("demo-highway")
     _idle(page)
     assert page.locator("#frame-number").input_value() == "1"
+    detection_tab.click()
     assert page.locator("#box-total").inner_text() == "7"
+    scene_tab.click()
     page.locator("#scene").select_option("demo-urban")
     _idle(page)
     assert "30,000" in page.locator("#frame-stats").inner_text()
@@ -608,7 +616,9 @@ def test_browser_demo_navigation_styling_camera_and_recovery(browser_viewer):
 
     _input(page, "#point-size", 3)
     _input(page, "#max-distance", 80)
+    detection_tab.click()
     _input(page, "#box-width", 2)
+    scene_tab.click()
     page.locator("#point-colors").select_option("concerto")
     view_details.locator("summary").click()
     page.locator("#sidebar").evaluate("element => {element.scrollTop=0;}")
@@ -616,7 +626,10 @@ def test_browser_demo_navigation_styling_camera_and_recovery(browser_viewer):
     if screenshot:
         page.screenshot(path=str(Path(screenshot)), full_page=True)
     page.set_viewport_size({"width": 390, "height": 844})
-    page.wait_for_timeout(150)
+    page.wait_for_function("""() => {
+        const {width, height} = document.querySelector('#viewport canvas').getBoundingClientRect();
+        return width === 390 && height === 844;
+    }""")
     assert canvas.bounding_box() == {"x": 0, "y": 0, "width": 390, "height": 844}
     assert page.evaluate("document.documentElement.scrollWidth") == 390
     assert not camera_panel.evaluate("element => element.open")
@@ -654,7 +667,59 @@ def test_browser_demo_navigation_styling_camera_and_recovery(browser_viewer):
     assert any(
         urlsplit(requested).path.lower().endswith((".woff2", ".woff", ".ttf", ".otf"))
         for requested in requested_urls
-    ), "Inter must be loaded from the local viewer server"
+    ), "Source Sans Pro must be loaded from the local viewer server"
+    assert not errors, errors
+    assert not failed, failed
+
+
+def test_browser_detection_filters_preserve_the_point_cloud_and_camera(browser_viewer):
+    page, url, errors, failed = browser_viewer
+    frame_requests = []
+    page.on("request", lambda request: frame_requests.append(request.url) if "/frame.bin?" in request.url else None)
+    page.goto(url)
+    page.locator("#frame-stats").filter(has_text="30,000").wait_for()
+    _idle(page)
+    boxes = page.locator("#box-section")
+    detection_tab = page.get_by_role("tab", name="Detection")
+    assert boxes.is_hidden()
+    detection_tab.click()
+    assert boxes.is_visible()
+    score = page.locator("#confidence")
+    assert score.is_enabled()
+    camera = _camera(page)
+    count = page.locator('#detection-counts [data-count="output"]')
+    assert int(count.inner_text()) > 0
+    assert page.locator("#detection-run-name").inner_text() == "Demo predictions"
+    # The review pipeline receives the slider's committed threshold. No cloud job is needed.
+    score.evaluate("element => {element.value='1';element.dispatchEvent(new Event('change'));}")
+    _idle(page)
+    assert count.inner_text() == "0"
+    assert "removed by the current filters" in page.locator("#detection-status").inner_text()
+    assert len(frame_requests) == 1
+
+    page.locator("#advanced-detection > summary").click()
+    page.locator("#reset-filters").click()
+    _idle(page)
+    assert int(count.inner_text()) > 0
+    page.locator("#layer-predictions").uncheck()
+    _input(page, "#box-width", 4)
+    car = page.get_by_role("checkbox", name="Show car boxes", exact=True)
+    car.uncheck()
+    assert int(count.inner_text()) > 0
+    page.get_by_role("tab", name="LiDAR seg").click()
+    assert boxes.is_hidden()
+    assert page.locator("#labels-ground-truth").is_disabled()
+    page.get_by_role("tab", name="Scene").click()
+    assert boxes.is_hidden()
+    assert not page.locator("#layer-predictions").is_checked()
+    assert page.locator("#layer-gt").is_checked()
+    assert page.locator("#frame-number").input_value() == "1"
+    detection_tab.click()
+    assert boxes.is_visible()
+    assert page.locator("#box-width-number").input_value() == "4"
+    assert not car.is_checked()
+    assert _camera(page) == camera
+    assert len(frame_requests) == 1
     assert not errors, errors
     assert not failed, failed
 

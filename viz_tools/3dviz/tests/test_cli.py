@@ -1,4 +1,4 @@
-"""CLI behavior remains testable on machines without a graphical display."""
+"""The browser CLI forwards dataset and detection launch settings."""
 
 from __future__ import annotations
 
@@ -15,9 +15,9 @@ from threedviz import cli
 @pytest.fixture
 def launches(monkeypatch):
     calls = []
-    app = ModuleType("threedviz.ui.app")
-    app.run_app = lambda **kwargs: calls.append(kwargs)
-    monkeypatch.setitem(sys.modules, "threedviz.ui.app", app)
+    server = ModuleType("threedviz.web.server")
+    server.run_server = lambda **kwargs: calls.append(kwargs)
+    monkeypatch.setitem(sys.modules, "threedviz.web.server", server)
     return calls
 
 
@@ -26,6 +26,8 @@ def test_default_launch_waits_for_dataset_connection(launches):
     assert launches == [{
         "dataset": "nuscenes", "root": None, "version": "v1.0-mini",
         "scene": None, "frame": 0, "autoload": False,
+        "port": 8080, "open_browser": True, "predictions": None,
+        "prediction_format": "auto", "cache_dir": None,
     }]
 
 
@@ -38,6 +40,8 @@ def test_nuscenes_arguments_are_forwarded(root_option, launches, tmp_path):
     assert launches == [{
         "dataset": "nuscenes", "root": Path(tmp_path), "version": "v1.0-trainval",
         "scene": "scene-0001", "frame": 3, "autoload": True,
+        "port": 8080, "open_browser": True, "predictions": None,
+        "prediction_format": "auto", "cache_dir": None,
     }]
 
 
@@ -46,6 +50,8 @@ def test_waymo_and_explicit_split_are_forwarded(launches, tmp_path):
     assert launches == [{
         "dataset": "waymo", "root": tmp_path, "version": "v1.0-mini", "split": "val",
         "scene": None, "frame": 5, "autoload": True,
+        "port": 8080, "open_browser": True, "predictions": None,
+        "prediction_format": "auto", "cache_dir": None,
     }]
 
 
@@ -88,27 +94,7 @@ def test_help_does_not_import_graphical_dependencies(monkeypatch, capsys):
     assert "--dataroot" in output and "--split" in output and "waymo" in output
 
 
-@pytest.mark.parametrize("missing", ["open3d", "unrelated_dependency"])
-def test_only_missing_open3d_gets_install_guidance(missing, monkeypatch, capsys):
-    original_import = builtins.__import__
-
-    def missing_gui_import(name, *args, **kwargs):
-        if name in {"ui.app", "threedviz.ui.app"}:
-            raise ModuleNotFoundError(f"No module named '{missing}'", name=missing)
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", missing_gui_import)
-    if missing == "open3d":
-        with pytest.raises(SystemExit) as exc:
-            cli.main([])
-        assert exc.value.code == 1
-        assert "pip install" in capsys.readouterr().err
-    else:
-        with pytest.raises(ModuleNotFoundError, match=missing):
-            cli.main([])
-
-
-def test_dataset_config_is_resolved_and_forwarded_before_graphics_launch(launches, tmp_path):
+def test_dataset_config_is_resolved_and_forwarded_before_server_launch(launches, tmp_path):
     config_file = tmp_path / "sources.json"
     config_file.write_text('{"root": "dataset", "storage_format": "native"}', encoding="utf-8")
     assert cli.main(["--dataset", "waymo", "--dataset-config", str(config_file), "--split", "val"]) == 0
@@ -126,35 +112,46 @@ def test_dataset_config_rejects_ambiguous_or_demo_launches(conflicting, launches
     assert not launches
 
 
-def test_browser_mode_forwards_options_without_importing_desktop(monkeypatch, launches, tmp_path):
-    calls = []
-    server = ModuleType("threedviz.web.server")
-    server.run_server = lambda **kwargs: calls.append(kwargs)
-    monkeypatch.setitem(sys.modules, "threedviz.web.server", server)
-    assert cli.main(["--web", "--demo", "--port", "8097", "--open-browser", "--split", "val"]) == 0
-    assert not launches
-    assert calls == [{
+def test_browser_options_work_on_the_default_command(launches):
+    assert cli.main(["--demo", "--port", "8097", "--open-browser", "--split", "val"]) == 0
+    assert launches == [{
         "dataset": "demo", "root": None, "version": "v1.0-mini",
         "scene": None, "frame": 0, "autoload": True, "split": "val",
-        "port": 8097, "open_browser": True,
+        "port": 8097, "open_browser": True, "predictions": None,
+        "prediction_format": "auto", "cache_dir": None,
     }]
-    assert cli.main(["--web"]) == 0
-    assert calls[-1]["port"] == 8080 and not calls[-1]["open_browser"]
-    assert not calls[-1]["autoload"]
 
 
-@pytest.mark.parametrize("arguments", [["--port", "8080"], ["--open-browser"]])
-def test_browser_only_options_require_web(arguments, launches, capsys):
+@pytest.mark.parametrize("args", [["--web"], ["--no-open-browser"]])
+def test_browser_can_run_without_opening_a_tab(args, launches):
+    assert cli.main(args) == 0
+    assert not launches[0]["open_browser"]
+
+
+def test_prediction_launch_options_are_forwarded(launches, tmp_path):
+    export = tmp_path / "result.pkl"
+    cache = tmp_path / "indexes"
+    assert cli.main([
+        "--root", str(tmp_path), "--predictions", str(export),
+        "--prediction-format", "pcdet_pickle", "--cache-dir", str(cache),
+    ]) == 0
+    assert launches[0]["predictions"] == export
+    assert launches[0]["prediction_format"] == "pcdet_pickle"
+    assert launches[0]["cache_dir"] == cache
+    assert launches[0]["split"] == "val" and launches[0]["autoload"]
+
+
+def test_unknown_prediction_format_is_a_launch_error(launches, capsys):
     with pytest.raises(SystemExit) as error:
-        cli.main(arguments)
-    assert error.value.code == 2 and "require --web" in capsys.readouterr().err
+        cli.main(["--prediction-format", "unknown"])
+    assert error.value.code == 2 and "Choose from auto" in capsys.readouterr().err
     assert not launches
 
 
 @pytest.mark.parametrize("port", ["0", "65536", "-1", "bad"])
 def test_invalid_browser_ports_are_rejected(port, launches, capsys):
     with pytest.raises(SystemExit) as error:
-        cli.main(["--web", "--port", port])
+        cli.main(["--port", port])
     assert error.value.code == 2 and "between 1 and 65535" in capsys.readouterr().err
     assert not launches
 
@@ -171,14 +168,14 @@ def test_missing_browser_dependencies_have_specific_guidance(missing, monkeypatc
     monkeypatch.setattr(builtins, "__import__", missing_web_import)
     if missing == "unrelated_dependency":
         with pytest.raises(ModuleNotFoundError, match=missing):
-            cli.main(["--web"])
+            cli.main([])
     else:
         with pytest.raises(SystemExit) as error:
-            cli.main(["--web"])
-        assert error.value.code == 1 and "3dviz[web]" in capsys.readouterr().err
+            cli.main([])
+        assert error.value.code == 1 and "pip install" in capsys.readouterr().err
 
 
-def test_invalid_dataset_config_reports_cli_error_before_graphics_import(launches, tmp_path, capsys):
+def test_invalid_dataset_config_reports_cli_error_before_server_import(launches, tmp_path, capsys):
     config_file = tmp_path / "sources.json"
     config_file.write_text("{invalid}", encoding="utf-8")
     with pytest.raises(SystemExit) as error:

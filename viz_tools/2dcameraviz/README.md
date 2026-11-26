@@ -3,7 +3,7 @@
 Explore RGB camera rigs and projected 3D annotations in a desktop window.
 `2dcameraviz` runs with NumPy, Pillow and Tkinter, independently of Open3D and
 the training stack. It shares [`visual_utils`](../../visual_utils/README.md)
-records with the point-cloud and detection viewers.
+records with the [3dviz browser workspace](../3dviz/README.md).
 
 **[Quick start](#quick-start)** · **[Datasets](#open-a-dataset)** · **[Controls](#controls-and-interpretation)** · **[Extend](#use-your-own-dataset)** · **[Validate](#interpretation-and-validation)**
 
@@ -142,7 +142,7 @@ For an in-process script, call `visual_utils.register_loader` before launching.
 The shared registry makes a separate camera adapter unnecessary. The name
 `demo` is reserved by the viewer. Follow the
 [custom-dataset tutorial](../../visual_utils/docs/custom_datasets.md) for a
-runnable provider used by all three viewers.
+runnable provider used by both viewers.
 
 The same loader also supports Python processing without opening a window:
 

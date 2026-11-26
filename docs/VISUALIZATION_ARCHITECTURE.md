@@ -1,6 +1,6 @@
 # 🏗️ Visualization architecture
 
-One dataset adapter connects native storage to shared records. The three
+One dataset adapter connects native storage to shared records. Both
 viewers consume those records directly, while detection review adds an
 independent prediction source. This guide explains where each responsibility
 belongs when you extend the code.
@@ -17,13 +17,13 @@ nuScenes / Waymo / your storage
         DatasetLoader adapter
               |
          shared records
-         /     |      \
-  camera     cloud    detection review
-   viewer    viewer   (cloud + predictions)
+          /          \
+   Tk camera    browser workspace
+     viewer     (cloud + predictions + lidarseg)
 ```
 
-`DatasetLoader` is an Adapter: it translates native storage and scientific
-conventions into the records a viewer needs. Each dataset implements it once.
+`DatasetLoader` adapts native storage and scientific conventions into the
+records a viewer needs. Each dataset implements it once.
 The records carry scene, frame, and box information through to the renderer.
 
 ## 🗂️ Know where code belongs
@@ -35,8 +35,9 @@ The records carry scene, frame, and box information through to the renderer.
 | `visual_utils/nuscenes`, `waymo` | Native decoding, catalogs, calibration, pairing, RGB and acquisition processing. |
 | `visual_utils/config.py`, `registry.py` | Configuration and optional name-based construction. |
 | `cameraviz` | Camera slots, box projection/clipping, display styles and Tk navigation. |
-| `threedviz` | Point/box rendering, appearance and Open3D navigation. |
-| `detviz` | Prediction readers, coordinate normalization, pure filters/NMS and review UI. |
+| `threedviz.web` | Local sessions, frame transfer and the bundled Three.js workspace for point clouds, detections, and segmentation. |
+| `threedviz.detection` | Prediction readers, coordinate normalization, filters, BEV NMS, and review presets. |
+| `threedviz.processing` | Shared box geometry and point color palettes. |
 
 The nuScenes and processed Waymo readers return shared records directly.
 Waymo's format-specific TFRecord/range-image structures remain inside its
@@ -45,8 +46,8 @@ use the public records from `visual_utils`.
 
 Detection review composes an observation, predictions and a filter result.
 The observation remains the shared cloud record, and the caller owns the
-loader and prediction source separately. `detviz` reuses the 3D window
-and renderer, so its dependency on `threedviz` is intentional.
+loader and prediction source separately. Detection filter changes update
+the box layer without replacing the frame packet or camera view.
 
 ## 🛤️ Follow a frame through the code
 
@@ -57,8 +58,8 @@ and renderer, so its dependency on `threedviz` is intentional.
 5. Render the observation, resolving display labels and colors in the UI.
 
 The public methods call `_list_scenes`, `_list_frames`, `_load_point_cloud`,
-`_load_cameras` and optional `_prepare_point_cloud`. Calls are ordinary Python
-delegation. The base class handles closed state, splits, and capabilities,
+`_load_cameras`, `_load_lidar_segmentation`, and optional `_prepare_point_cloud`.
+The base class handles closed state, splits, and capabilities,
 leaving storage and scientific processing to the provider.
 
 Camera projection works directly in the camera set's declared reference.
@@ -100,10 +101,9 @@ It records the former Python interfaces for historical reference.
 ## 🔗 Read further
 
 - [Adapter pattern](https://refactoring.guru/design-patterns/adapter): translate native interfaces behind a small consumer-facing boundary.
-- [Open3D NumPy interface](https://www.open3d.org/docs/release/tutorial/geometry/working_with_numpy.html): keep numerical data separate from rendering objects.
 - [TFRecord format](https://www.tensorflow.org/tutorials/load_data/tfrecord): length and payload CRCs are storage-integrity checks.
 
 The [dataset interface](../visual_utils/docs/loader_contract.md) gives field
 conventions, and the [custom dataset tutorial](../visual_utils/docs/custom_datasets.md)
-shows a complete provider. The [prediction interface](../viz_tools/3ddetviz/docs/prediction_contract.md)
+shows a complete provider. The [prediction interface](../viz_tools/3dviz/docs/prediction_contract.md)
 covers independent result loading.
