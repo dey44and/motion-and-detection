@@ -1,7 +1,6 @@
 # 🔌 Add your own dataset
 
-Connect your storage by implementing `DatasetLoader` once. Every viewer that
-supports your dataset's modalities can then use it through the same interface.
+Connect your storage to `3dviz` and Python by implementing `DatasetLoader`.
 This tutorial starts with a runnable example, then explains how to adapt it to
 your own files and sensor conventions.
 
@@ -14,22 +13,20 @@ images, and a JSON catalog. It depends only on `visual_utils` and imports no vie
 
 ## 🚀 Run the example
 
-From the repository root, with the visualization packages installed:
+From the repository root, with `visual_utils` and `3dviz` installed:
 
 ```bash
 python -m pip install -e './visual_utils/examples/custom_dataset'
 python -m research_dataset.generate /tmp/research-dataset-example
-2dcameraviz --dataset research --root /tmp/research-dataset-example --split review
 3dviz --dataset research --root /tmp/research-dataset-example --split review
 ```
 
 Use a new output directory, as the generator refuses to overwrite an existing one.
 The generated data are synthetic and deterministic, with sparse frame IDs
 `scan-15` and `scan-39`, a calibrated camera, one annotated box per frame and
-1000 points per cloud. The camera image uses a flat background to illustrate
-file loading and geometric overlays. Detection review initially shows ground
-truth without predictions. You can add predictions separately after connecting
-the dataset.
+1000 points per cloud. Click the **Image** camera preview in the 3D scene to
+inspect the generated image and projected box. Detection review initially
+shows ground truth. You can attach predictions after connecting the dataset.
 
 ## 📦 Make the loader discoverable
 
@@ -40,12 +37,12 @@ Installation exposes this standard entry point:
 research = "research_dataset:ResearchDatasetLoader"
 ```
 
-All three viewer parsers discover the installed name automatically. Only the
-selected provider is imported. Entry points export a callable accepting one
-`DatasetConfig`. Their modules must not also call `register_loader` for that name.
-Names are case-normalized and collisions are errors. Avoid `demo`, which the
-viewer applications reserve for their generated examples. Restart a running
-process after installing or uninstalling a provider.
+`3dviz` discovers the installed name automatically and imports the selected
+provider. Entry points export a callable accepting one `DatasetConfig`. Their
+modules must not also call `register_loader` for that name. Names are
+case-normalized and collisions are errors. `demo` is reserved for the generated
+viewer example. Restart a running process after installing or uninstalling a
+provider.
 
 For a notebook, script, or uninstalled local module, explicit registration works
 in the current process instead:
@@ -76,9 +73,12 @@ alongside the [complete contract](loader_contract.md). Its structure is:
    Return tuples with stable opaque IDs and dense modality-specific display indices.
 4. Implement `_load_point_cloud` and/or `_load_cameras` for the advertised modalities.
    Use the shared immutable records, retaining optional data as `None` when unknown.
-5. Implement `_prepare_point_cloud` only for additional capabilities your data
+5. Implement `_camera_rig` for clickable camera previews in the 3D scene.
+   Return calibrated mount positions and image corner rays from metadata.
+   [Camera record conventions](loader_contract.md)
+6. Implement `_prepare_point_cloud` only for additional capabilities your data
    support. Preserve baseline rows and provide validity masks and provenance.
-6. Override `_close()` when files, databases or native resources remain open.
+7. Override `_close()` when files, databases or native resources remain open.
    Inherit `close()` so the shared lifecycle remains idempotent.
 
 Callers use the public methods without underscores. The base class delegates
@@ -101,7 +101,7 @@ The example catalog has these fields:
 Payload paths resolve against the dataset root. Every box uses the declared
 `object` class. Missing `boxes` means annotations were not provided, while
 `boxes: []` means they are available with zero objects. Images without
-`intrinsics` remain viewable without overlays.
+`intrinsics` remain accessible through `load_cameras`.
 
 ### 📏 Preserve sensor conventions
 
@@ -120,10 +120,10 @@ sensors, expose independent modality catalogs when appropriate. Supply your
 actual projection model for distortion or rolling shutter. Intrinsics alone do
 not justify a pinhole assumption.
 
-## ⚙️ Share a configuration across viewers
+## ⚙️ Reuse a dataset configuration
 
-Every viewer accepts the same strict JSON configuration. For example, place
-this in `/tmp/research-view.json`:
+`3dviz` and Python clients use the same JSON configuration. Save this example
+as `/tmp/research-view.json`.
 
 ```json
 {
@@ -132,10 +132,9 @@ this in `/tmp/research-view.json`:
 }
 ```
 
-Then run any of:
+Launch the workspace with the configuration file.
 
 ```bash
-2dcameraviz --dataset research --dataset-config /tmp/research-view.json --split review
 3dviz --dataset research --dataset-config /tmp/research-view.json --split review
 ```
 
@@ -159,9 +158,8 @@ with create_loader("research", load_dataset_config("/tmp/research-view.json")) a
     print(cloud.points.shape, camera_set.cameras[0].image.shape)
 ```
 
-After registering a provider in the current process, launch the 3D viewer with
-`threedviz.web.server.run_server` or the camera viewer with
-`cameraviz.ui.app.run_app`. Both accept `dataset=`, `config=`, `split=`, and
+After registering a provider in the current process, launch the workspace with
+`threedviz.web.server.run_server`. It accepts `dataset=`, `config=`, `split=`, and
 `autoload=True`.
 
 ## 🎯 Add predictions independently
@@ -178,14 +176,14 @@ poses must never be replaced with identity transforms to make an overlay appear.
 
 ## 🧪 Validate your interpretation
 
-The [cross-package example tests](../../tests/visualization/test_custom_dataset.py)
-demonstrate lazy catalog access, sparse IDs, error categories, immutable payload
-lifetimes and using one shared provider for both viewers. Extend that pattern
-with nonidentity transforms, asynchronous cameras, unknown times, empty scenes,
-withheld annotations and your own sensor edge cases. Check numerical projection
+The shared loader and browser registration tests exercise record validation,
+payload lifetimes, and registered providers. Extend those patterns with
+nonidentity transforms, asynchronous cameras, unknown times, empty scenes,
+withheld annotations, and your own sensor edge cases. Check numerical projection
 against independently known calibration points before relying on visual alignment.
+[Loader contract tests](../tests/test_contract.py) · [Viewer dataset tests](../../viz_tools/3dviz/tests/test_datasets.py)
 
 Providers are synchronous and need not support concurrent calls. Serialize
 operations per instance and wait for reads to finish before closing. Keep sensor
 caches bounded. A context manager owns the loader, and returned arrays remain
-usable after close. See [contribution checks](../../CONTRIBUTING.md) for test commands.
+usable after close. [Viewer test commands](../../viz_tools/3dviz/README.md#validation)

@@ -4,15 +4,13 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from visual_utils.waymo.camera import OPTICAL_TO_WAYMO, WaymoCameraProjection
-from visual_utils.waymo.models import NativeBox, NativeCamera, NativeFrame, NativeFrameHeader, NativeSequence
 from visual_utils import (
     AnnotationSet, AnnotationStatus, Box3D, CameraFrameSet, CameraObservation,
-    DatasetError, FrameInfo, Modality, ProjectionResult,
+    DatasetConfig, DatasetError, FrameInfo, Modality, ProjectionResult, create_loader,
 )
-from cameraviz.dataloader import create_dataset
-from cameraviz.visualization.layout import camera_layout
-from cameraviz.processing import project_box, project_boxes
+from visual_utils.box_projection import project_box, project_boxes
+from visual_utils.waymo.camera import OPTICAL_TO_WAYMO, WaymoCameraProjection
+from visual_utils.waymo.models import NativeBox, NativeCamera, NativeFrame, NativeFrameHeader, NativeSequence
 
 
 def native_camera(*, name=1, width=100, height=100, intrinsic=None, direction=5, velocity=None, pose=None, extrinsic=None, timestamp=.05):
@@ -187,7 +185,7 @@ def native_reader(monkeypatch, tmp_path):
 
 def test_native_adapter_indexes_only_selected_sequence_and_preserves_true_timestamps(native_reader):
     reader, native, root = native_reader
-    adapter = create_dataset("waymo", root=root)
+    adapter = create_loader("waymo", DatasetConfig(root=root))
     assert adapter.metadata.splits == ("all", "train", "val")
     assert len(adapter.list_scenes()) == 2
     assert reader.header_calls == reader.frame_calls == []
@@ -199,9 +197,9 @@ def test_native_adapter_indexes_only_selected_sequence_and_preserves_true_timest
     assert adapter.list_frames("validation-context", modality=Modality.CAMERAS) is frames
     loaded = adapter.load_cameras(frames[0].frame_id)
     assert reader.frame_calls == [("validation-context", 0, 1_000_003)]
-    assert [camera.sensor_id for camera in loaded.cameras] == [slot.sensor_id for slot in camera_layout(adapter.metadata.sensors)]
+    assert [camera.sensor_id for camera in loaded.cameras] == [sensor.sensor_id for sensor in adapter.metadata.sensors
+                                                            if sensor.modality == Modality.CAMERAS]
     assert "Sign" in [item.class_id for item in adapter.metadata.classes]
-    assert [(slot.row, slot.column) for slot in camera_layout(adapter.metadata.sensors)] == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 2)]
     np.testing.assert_allclose(loaded.annotations.boxes[0].center, native.boxes[0].center)
     front = next(camera for camera in loaded.cameras if camera.sensor_id == "CAM_FRONT")
     left = next(camera for camera in loaded.cameras if camera.sensor_id == "CAM_FRONT_LEFT")
@@ -221,9 +219,9 @@ def test_native_adapter_indexes_only_selected_sequence_and_preserves_true_timest
 
 def test_waymo_adapter_errors_are_contextual(native_reader):
     reader, _, root = native_reader
-    adapter = create_dataset("waymo", root=root)
+    adapter = create_loader("waymo", DatasetConfig(root=root))
     with pytest.raises(DatasetError, match="needs root"):
-        create_dataset("waymo", root=None)
+        create_loader("waymo", DatasetConfig())
     with pytest.raises(DatasetError, match="split"):
         adapter.list_scenes(split="mini_val")
     with pytest.raises(DatasetError, match="Unknown Waymo scene"):
@@ -238,7 +236,7 @@ def test_waymo_adapter_errors_are_contextual(native_reader):
 def test_sparse_reader_indices_are_distinct_from_display_frame_positions(native_reader):
     reader, _, root = native_reader
     reader.list_frame_headers = lambda context: (NativeFrameHeader(2, 1_000_003), NativeFrameHeader(5, 1_104_525))
-    adapter = create_dataset("waymo", root=root)
+    adapter = create_loader("waymo", DatasetConfig(root=root))
     frames = adapter.list_frames("validation-context", modality=Modality.CAMERAS)
     assert [frame.index for frame in frames] == [0, 1]
     assert frames[1].frame_id == "waymo:validation-context:1104525"

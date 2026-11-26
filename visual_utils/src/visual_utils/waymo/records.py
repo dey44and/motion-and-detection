@@ -49,6 +49,21 @@ class RecordOffset:
     length: int
 
 
+def _record_offset(stream, path, offset, file_size):
+    stream.seek(offset)
+    header = stream.read(12)
+    if len(header) != 12:
+        raise NativeWaymoError(f"Truncated TFRecord header at byte {offset} in {path}.")
+    length = struct.unpack_from("<Q", header)[0]
+    if struct.unpack_from("<I", header, 8)[0] != masked_crc32c(header[:8]):
+        raise NativeWaymoError(f"TFRecord length CRC mismatch at byte {offset} in {path}.")
+    if not 0 < length <= MAX_RECORD_BYTES:
+        raise NativeWaymoError(f"TFRecord length {length} exceeds the allowed record size.")
+    if offset + 16 + length > file_size:
+        raise NativeWaymoError(f"Truncated TFRecord payload at byte {offset} in {path}.")
+    return RecordOffset(offset, length)
+
+
 def index_records(path: str | Path) -> tuple[RecordOffset, ...]:
     path = Path(path)
     result = []
@@ -57,19 +72,9 @@ def index_records(path: str | Path) -> tuple[RecordOffset, ...]:
         with path.open("rb") as stream:
             offset = 0
             while offset < file_size:
-                stream.seek(offset)
-                header = stream.read(12)
-                if len(header) != 12:
-                    raise NativeWaymoError(f"Truncated TFRecord header at byte {offset} in {path}.")
-                length = struct.unpack_from("<Q", header)[0]
-                if struct.unpack_from("<I", header, 8)[0] != masked_crc32c(header[:8]):
-                    raise NativeWaymoError(f"TFRecord length CRC mismatch at byte {offset} in {path}.")
-                if not 0 < length <= MAX_RECORD_BYTES:
-                    raise NativeWaymoError(f"TFRecord length {length} exceeds the allowed record size.")
-                if offset + 16 + length > file_size:
-                    raise NativeWaymoError(f"Truncated TFRecord payload at byte {offset} in {path}.")
-                result.append(RecordOffset(offset, length))
-                offset += 16 + length
+                record = _record_offset(stream, path, offset, file_size)
+                result.append(record)
+                offset += 16 + record.length
     except OSError as exc:
         raise NativeWaymoError(f"Cannot index native TFRecord {path}: {exc}") from exc
     if not result:
@@ -120,9 +125,26 @@ def read_identity(stream, record: RecordOffset) -> tuple[str, int]:
     indexing checks length CRCs; this metadata pass reads only small identity
     fields and never decompresses images or range matrices.
     """
+    context, timestamp = _read_context(stream, record)
+    return context.name, timestamp
+
+
+def read_segment_context(path: Path):
+    """Read the shared Context from the first record while leaving payloads lazy."""
+    try:
+        file_size = path.stat().st_size
+        with path.open("rb") as stream:
+            record = _record_offset(stream, path, 0, file_size)
+            context, _ = _read_context(stream, record)
+            return context
+    except OSError as exc:
+        raise NativeWaymoError(f"Cannot read native sequence metadata {path}: {exc}") from exc
+
+
+def _read_context(stream, record: RecordOffset):
     position, end = record.offset + 12, record.offset + 12 + record.length
     stream.seek(position)
-    context_name, timestamp = None, None
+    context, timestamp = None, None
     for _ in range(10000):
         if stream.tell() >= end:
             break
@@ -146,7 +168,6 @@ def read_identity(stream, record: RecordOffset) -> tuple[str, int]:
                     context.ParseFromString(stream.read(size))
                 except DecodeError as exc:
                     raise NativeWaymoError(f"Invalid native context protobuf: {exc}") from exc
-                context_name = context.name
             else:
                 stream.seek(size, 1)
         elif wire in (1, 5):
@@ -156,8 +177,8 @@ def read_identity(stream, record: RecordOffset) -> tuple[str, int]:
             stream.seek(size, 1)
         else:
             raise NativeWaymoError(f"Unsupported native protobuf wire type {wire}.")
-        if context_name and timestamp is not None:
+        if context is not None and context.name and timestamp is not None:
             if timestamp >= 1 << 63:
                 raise NativeWaymoError("Native frame timestamp must be a nonnegative int64.")
-            return context_name, timestamp
+            return context, timestamp
     raise NativeWaymoError("Native Frame is missing context.name or timestamp_micros.")

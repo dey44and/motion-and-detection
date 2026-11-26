@@ -45,3 +45,32 @@ export async function fetchSegmentation(session: string, revision: number, gener
   if (labels.length !== count || labels.some(label => label > 16)) throw new Error('The point labels do not match this LiDAR scan.');
   return labels;
 }
+
+export async function fetchCameraPreviews(session: string, revision: number, signal: AbortSignal) {
+  const previews = await request<Record<string, string>>(
+    `/api/sessions/${encodeURIComponent(session)}/camera-previews?revision=${revision}`, {signal},
+  );
+  return Object.fromEntries(Object.entries(previews).map(([id, jpeg]) => [id, `data:image/jpeg;base64,${jpeg}`]));
+}
+
+function cameraUrl(session: string, revision: number, camera: string, resource: 'camera-image' | 'camera-points') {
+  return `/api/sessions/${encodeURIComponent(session)}/${resource}/${encodeURIComponent(camera)}?revision=${revision}`;
+}
+
+export function cameraImageUrl(session: string, revision: number, camera: string) {
+  return cameraUrl(session, revision, camera, 'camera-image');
+}
+
+export async function fetchCameraPoints(session: string, revision: number, camera: string, count: number, rows: number, signal: AbortSignal) {
+  const response = await fetch(cameraUrl(session, revision, camera, 'camera-points'), {signal});
+  if (!response.ok) throw new Error(`Projected points could not be transferred (${response.status}).`);
+  const buffer = await response.arrayBuffer();
+  if (buffer.byteLength !== count * 12) throw new Error('The projected point count does not match the camera response.');
+  const points = new DataView(buffer);
+  for (let offset = 0; offset < buffer.byteLength; offset += 12) {
+    if (!Number.isFinite(points.getFloat32(offset, true)) || !Number.isFinite(points.getFloat32(offset + 4, true)) || points.getUint32(offset + 8, true) >= rows) {
+      throw new Error('The projected points do not match the current LiDAR scan.');
+    }
+  }
+  return points;
+}

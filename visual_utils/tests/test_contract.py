@@ -7,7 +7,7 @@ import pytest
 
 from visual_utils import (
     AcquisitionGeometry, AnnotationAlignment, AnnotationSet, AnnotationStatus,
-    AnnotationTiming, Box3D, CameraFrameSet, CameraObservation, Capability,
+    AnnotationTiming, Box3D, CameraFrameSet, CameraObservation, CameraPose, Capability,
     DatasetClosedError, DatasetConfig,
     DatasetConfigurationError, DatasetIOError, DatasetLoader, DatasetMetadata,
     DatasetValidationError, FrameInfo, Modality, PinholeProjection,
@@ -240,6 +240,7 @@ def test_pinhole_projection_retains_signed_depth_and_outside_image_coordinates()
 def test_close_is_idempotent_and_guards_all_public_operations():
     loader = PointProvider(DatasetConfig())
     frame = loader.load_point_cloud("native-15")
+    assert loader.camera_rig(frame) == ()
     metadata = loader.metadata
     loader.close()
     loader.close()
@@ -249,11 +250,47 @@ def test_close_is_idempotent_and_guards_all_public_operations():
         lambda: loader.list_frames("scene", modality=Modality.POINT_CLOUD),
         lambda: loader.load_point_cloud("native-15"),
         lambda: loader.load_cameras("native-15"),
+        lambda: loader.camera_rig(frame),
         lambda: loader.prepare_point_cloud(frame, request=PointCloudPreparation()),
     ):
         with pytest.raises(DatasetClosedError):
             operation()
     np.testing.assert_array_equal(frame.points[0], [1, 0, 2])
+
+
+@pytest.mark.parametrize("position,forward,message", [
+    ([1, 2], [0, 0, 1], "position"),
+    ([1, 2, np.inf], [0, 0, 1], "finite"),
+    ([1, 2, 3], [0, 0, 0], "unit length"),
+    ([1, 2, 3], [0, 0, 2], "unit length"),
+])
+def test_camera_pose_requires_finite_vectors_and_unit_forward(position, forward, message):
+    with pytest.raises(DatasetValidationError, match=message):
+        CameraPose("CAM_FRONT", position, forward)
+
+
+def test_camera_pose_arrays_are_immutable_snapshots():
+    position, forward = np.array([1, 2, 3]), np.array([0, 0, 1])
+    rays = np.array([[-.2, -.1, 1], [.4, -.1, 1], [.4, .3, 1], [-.2, .3, 1]])
+    pose = CameraPose("CAM_FRONT", position, forward, corner_rays=rays)
+    position[:] = 0
+    forward[:] = 0
+    rays[:] = 0
+    np.testing.assert_array_equal(pose.position, [1, 2, 3])
+    np.testing.assert_array_equal(pose.forward, [0, 0, 1])
+    np.testing.assert_array_equal(pose.corner_rays @ pose.forward, [1, 1, 1, 1])
+    with pytest.raises(ValueError):
+        pose.corner_rays.setflags(write=True)
+
+
+@pytest.mark.parametrize("rays,message", [
+    (np.zeros((3, 3)), "shape"),
+    (np.full((4, 3), np.nan), "finite"),
+    (np.tile([0., 0., 2.], (4, 1)), "unit depth"),
+])
+def test_camera_pose_rejects_invalid_corner_rays(rays, message):
+    with pytest.raises(DatasetValidationError, match=message):
+        CameraPose("CAM_FRONT", [0, 0, 0], [0, 0, 1], corner_rays=rays)
 
 
 def test_keyword_preparation_is_the_same_public_api():

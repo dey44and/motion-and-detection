@@ -9,7 +9,7 @@ from .errors import (
 )
 from .models import (
     AcquisitionGeometry, AnnotationAlignment, AnnotationSet, AnnotationStatus,
-    AnnotationTiming, Box3D, CameraFrameSet, CameraObservation, Capability,
+    AnnotationTiming, Box3D, CameraFrameSet, CameraObservation, CameraPose, Capability,
     ClassInfo, DatasetMetadata, FrameInfo, LidarSegmentation, Modality, PointCloudFrame,
     PointCloudPreparation, PointColors, PointTiming, ProcessingProvenance,
     ProjectionModel, ProjectionResult, SceneInfo, SensorInfo, TimingQuality,
@@ -24,7 +24,7 @@ __all__ = [
     "DataUnavailableError", "DatasetClosedError", "DatasetConfigurationError", "DatasetError",
     "DatasetIOError", "DatasetValidationError", "UnknownIdentifierError", "UnsupportedCapabilityError",
     "AcquisitionGeometry", "AnnotationAlignment", "AnnotationSet", "AnnotationStatus", "AnnotationTiming",
-    "Box3D", "CameraFrameSet", "CameraObservation", "Capability", "ClassInfo", "DatasetMetadata", "FrameInfo",
+    "Box3D", "CameraFrameSet", "CameraObservation", "CameraPose", "Capability", "ClassInfo", "DatasetMetadata", "FrameInfo",
     "LidarSegmentation", "Modality", "PointCloudFrame", "PointCloudPreparation", "PointColors", "PointTiming", "ProcessingProvenance",
     "ProjectionModel", "ProjectionResult", "SceneInfo", "SensorInfo", "TimingQuality", "PinholeProjection",
 ]

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..projection import _image_corners
+
 
 # Waymo camera (forward, left, up) <- conventional optical (right, down, forward).
 OPTICAL_TO_WAYMO = np.array([[0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.]])
@@ -32,6 +34,50 @@ def _array(value, shape, name):
         raise ValueError(f"{name} must be finite with shape {shape}.")
     result.setflags(write=False)
     return result
+
+
+def _distortion(normalized, coefficients):
+    u, v = normalized.T
+    k1, k2, p1, p2, k3 = coefficients
+    r2 = u * u + v * v
+    radial = 1 + r2 * (k1 + r2 * (k2 + r2 * k3))
+    tangential = np.column_stack((
+        2 * p1 * u * v + p2 * (r2 + 2 * u * u),
+        p1 * (r2 + 2 * v * v) + 2 * p2 * u * v,
+    ))
+    return radial[:, None], tangential
+
+
+def _undistort_pixels(pixels, intrinsic):
+    target = (pixels - intrinsic[2:4]) / intrinsic[:2]
+    normalized = target.copy()
+    for _ in range(50):
+        radial, tangential = _distortion(normalized, intrinsic[4:])
+        following = (target - tangential) / radial
+        if np.max(np.abs(following - normalized)) < 1e-12:
+            return following
+        normalized = following
+    return normalized
+
+
+def _camera_corner_rays(intrinsic, width, height):
+    """Backproject the image bounds into optical coordinates at depth one."""
+    if width <= 0 or height <= 0:
+        return None
+    try:
+        intrinsic = _array(intrinsic, (9,), "Waymo camera intrinsic")
+    except ValueError:
+        return None
+    if np.any(intrinsic[:2] <= 0):
+        return None
+    pixels = _image_corners(width, height)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        normalized = _undistort_pixels(pixels, intrinsic)
+        radial, tangential = _distortion(normalized, intrinsic[4:])
+        projected = (normalized * radial + tangential) * intrinsic[:2] + intrinsic[2:4]
+    if not np.allclose(projected, pixels, rtol=0, atol=1e-3):
+        return None
+    return np.column_stack((normalized, np.ones(4)))
 
 
 class WaymoCameraProjection:
@@ -106,30 +152,13 @@ class WaymoCameraProjection:
             )
 
     def _undistort(self, pixels):
-        target = (pixels - self.intrinsic[2:4]) / self.intrinsic[:2]
-        normalized = target.copy()
-        k1, k2, p1, p2, k3 = self.intrinsic[4:]
-        for _ in range(50):
-            u, v = normalized.T
-            r2 = u * u + v * v
-            radial = 1 + r2 * (k1 + r2 * (k2 + r2 * k3))
-            tangential = np.column_stack((2 * p1 * u * v + p2 * (r2 + 2 * u * u), p1 * (r2 + 2 * v * v) + 2 * p2 * u * v))
-            following = (target - tangential) / radial[:, None]
-            if np.max(np.abs(following - normalized)) < 1e-12:
-                return following
-            normalized = following
-        return normalized
+        return _undistort_pixels(pixels, self.intrinsic)
 
     def _distort(self, normalized):
-        u, v = normalized.T
-        r2 = u * u + v * v
-        k1, k2, p1, p2, k3 = self.intrinsic[4:]
-        radial = 1 + r2 * (k1 + r2 * (k2 + r2 * k3))
-        distorted = np.column_stack((
-            u * radial + 2 * p1 * u * v + p2 * (r2 + 2 * u * u),
-            v * radial + p1 * (r2 + 2 * v * v) + 2 * p2 * u * v,
-        ))
+        radial, tangential = _distortion(normalized, self.intrinsic[4:])
+        distorted = normalized * radial + tangential
         pixels = distorted * self.intrinsic[:2] + self.intrinsic[2:4]
+        radial = radial[:, 0]
         excessive = (radial < .8) | (radial > 1.2)
         if np.any(excessive):
             directions = normalized[excessive]

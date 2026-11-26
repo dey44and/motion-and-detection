@@ -15,12 +15,17 @@ import numpy as np
 from PIL import Image
 
 from visual_utils import (
-    AnnotationSet, AnnotationStatus, Box3D, CameraFrameSet, CameraObservation,
+    AnnotationSet, AnnotationStatus, Box3D, CameraFrameSet, CameraObservation, CameraPose,
     Capability, ClassInfo, DataUnavailableError, DatasetConfig,
     DatasetConfigurationError, DatasetIOError, DatasetLoader, DatasetMetadata,
     DatasetValidationError, FrameInfo, Modality, PinholeProjection,
     PointCloudFrame, SceneInfo, SensorInfo, UnknownIdentifierError,
 )
+
+# Optical X-right/Y-down/Z-forward -> vehicle X-forward/Y-left/Z-up.
+_CAMERA_POSE = np.array([[0., 0., 1., 0.], [-1., 0., 0., 0.],
+                         [0., -1., 0., 0.], [0., 0., 0., 1.]])
+_CAMERA_POSE.setflags(write=False)
 
 
 def _read_manifest(path):
@@ -141,14 +146,30 @@ class ResearchDatasetLoader(DatasetLoader):
         record, info = self._record(frame_id, Modality.CAMERAS)
         with Image.open(self.config.root / record["image"]) as image:
             rgb = np.asarray(image.convert("RGB"))
-        # Optical X-right/Y-down/Z-forward -> vehicle X-forward/Y-left/Z-up.
-        # This is an explicit proper rotation, not an inferred camera model.
-        pose = np.array([[0., 0., 1., 0.], [-1., 0., 0., 0.],
-                         [0., -1., 0., 0.], [0., 0., 0., 1.]])
-        projection = None if self._intrinsics is None else PinholeProjection(self._intrinsics, pose)
+        projection = None if self._intrinsics is None else PinholeProjection(self._intrinsics, _CAMERA_POSE)
         camera = CameraObservation("image", rgb, timestamp_us=info.timestamp_us,
                                    timestamp_kind="synthetic simultaneous exposure" if info.timestamp_us is not None else None,
-                                   intrinsics=self._intrinsics, T_reference_from_camera=pose,
+                                   intrinsics=self._intrinsics, T_reference_from_camera=_CAMERA_POSE,
                                    projection_model=projection)
         return CameraFrameSet(info, "research:rgb-v1", f"vehicle:{frame_id}", (camera,),
                               self._annotations(frame_id, record))
+
+    def _camera_rig(self, frame: PointCloudFrame) -> tuple[CameraPose, ...]:
+        frame_id = frame.info.frame_id
+        if frame_id not in self._infos[Modality.CAMERAS] or frame.reference_frame_id != f"vehicle:{frame_id}":
+            return ()
+        position, forward = _CAMERA_POSE[:3, 3], _CAMERA_POSE[:3, 2]
+        if self._intrinsics is not None:
+            try:
+                # Pillow reads the image header here. Pixel decoding happens in _load_cameras.
+                record = self._records[frame_id]
+                with Image.open(self.config.root / record["image"]) as image:
+                    width, height = image.size
+                model = PinholeProjection(self._intrinsics, _CAMERA_POSE)
+                pixels = np.array([[0, 0, 1], [width, 0, 1], [width, height, 1], [0, height, 1]])
+                optical_rays = np.linalg.solve(model.intrinsics, pixels.T).T
+                rays = optical_rays @ _CAMERA_POSE[:3, :3].T
+                return (CameraPose("image", position, forward, corner_rays=rays),)
+            except (OSError, DatasetValidationError, np.linalg.LinAlgError):
+                pass
+        return (CameraPose("image", position, forward),)

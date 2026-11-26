@@ -8,7 +8,7 @@ from collections.abc import Callable
 from .config import DatasetConfig
 from .errors import DatasetClosedError, DatasetConfigurationError, DatasetIOError, UnsupportedCapabilityError
 from .models import (
-    CameraFrameSet, Capability, DatasetMetadata, FrameInfo, LidarSegmentation, Modality,
+    CameraFrameSet, CameraPose, Capability, DatasetMetadata, FrameInfo, LidarSegmentation, Modality,
     PointCloudFrame, PointCloudPreparation, SceneInfo,
 )
 
@@ -95,6 +95,19 @@ class DatasetLoader(ABC):
 
     def _load_cameras(self, frame_id: str) -> CameraFrameSet:
         raise UnsupportedCapabilityError("This dataset does not implement camera loading.")
+
+    def camera_rig(self, frame: PointCloudFrame) -> tuple[CameraPose, ...]:
+        """Return available rig markers in a baseline cloud's reference frame.
+
+        Pass the observation returned by this loader. Markers describe the
+        mounted sensors, independent of their exposure poses. Providers use
+        calibration metadata and return an empty tuple when it is unavailable.
+        """
+        self._ensure_open()
+        return self._camera_rig(frame)
+
+    def _camera_rig(self, frame: PointCloudFrame) -> tuple[CameraPose, ...]:
+        return ()
 
     def prepare_point_cloud(self, frame: PointCloudFrame, *, request: PointCloudPreparation) -> PointCloudFrame:
         """Add requested data, preserving baseline rows and existing fields.

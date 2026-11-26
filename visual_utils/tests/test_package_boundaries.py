@@ -8,7 +8,7 @@ import sys
 
 
 FORBIDDEN = {
-    "threedviz", "cameraviz", "detviz", "open3d", "tkinter", "matplotlib",
+    "threedviz", "detviz", "open3d", "tkinter", "matplotlib",
     "torch", "tensorflow", "waymo_open_dataset",
 }
 

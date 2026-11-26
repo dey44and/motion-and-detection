@@ -14,7 +14,7 @@ from typing import Callable, TypeVar
 from ..config import DatasetConfig
 from ..dataset import DatasetLoader
 from ..models import (
-    CameraFrameSet, Capability, ClassInfo, DatasetMetadata, FrameInfo, LidarSegmentation, Modality,
+    CameraFrameSet, CameraPose, Capability, ClassInfo, DatasetMetadata, FrameInfo, LidarSegmentation, Modality,
     PointCloudFrame, PointCloudPreparation, SceneInfo, SensorInfo,
 )
 from ..errors import (
@@ -211,6 +211,9 @@ class NuScenesLoader(DatasetLoader):
     def _load_cameras(self, frame_id: str) -> CameraFrameSet:
         reader = self._reader_for(Modality.CAMERAS)
         return self._call(reader.load_camera_frame, frame_id)
+
+    def _camera_rig(self, frame: PointCloudFrame) -> tuple[CameraPose, ...]:
+        return self._reader_for(Modality.POINT_CLOUD).camera_rig(frame)
 
     def _prepare_point_cloud(self, frame: PointCloudFrame, *, request: PointCloudPreparation) -> PointCloudFrame:
         return self._call(

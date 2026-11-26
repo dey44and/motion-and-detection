@@ -4,7 +4,8 @@ import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { absolute, rotationAngles, rotationQuaternion } from './camera';
-import type { Box, CameraView, FramePacket, Scheme, SemanticClass, Vec3 } from './types';
+import { CameraRig } from './camera-rig';
+import type { Box, CameraMarker, CameraView, FramePacket, Scheme, SemanticClass, Vec3 } from './types';
 
 const EDGES = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
 export interface ClassStyle {visible: boolean; color: string}
@@ -26,8 +27,10 @@ export class Viewer {
   private animation: number | null = null;
   private axesEnabled = true;
   private readonly observer: ResizeObserver;
+  private readonly rig: CameraRig;
   private style: PointStyle = {scheme: 'gray', size: 3, maxDistance: 80};
   onCameraChange: (() => void) | null = null;
+  onCameraSelect: ((id: string) => void) | null = null;
   constructor(readonly element: HTMLElement, palettes: Record<string, number[][]>) {
     this.renderer = new THREE.WebGLRenderer({antialias: true, alpha: false, powerPreference: 'high-performance'});
     this.renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
@@ -35,6 +38,7 @@ export class Viewer {
     this.renderer.domElement.setAttribute('aria-label', 'Interactive 3D point cloud. Drag to rotate, right-drag to pan, scroll to zoom.');
     this.renderer.domElement.setAttribute('tabindex', '0');
     this.element.append(this.renderer.domElement);
+    this.rig = new CameraRig(element, this.renderer.domElement, this.scene, id => this.onCameraSelect?.(id), () => this.invalidate());
     this.camera.up.set(0,0,1);
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = false;
@@ -72,8 +76,18 @@ export class Viewer {
   }
   private invalidate() {
     if (this.animation !== null) return;
-    this.animation = requestAnimationFrame(() => {this.animation = null; this.renderer.render(this.scene, this.camera);});
+    this.animation = requestAnimationFrame(() => {
+      this.animation = null;
+      this.rig.updateScale(this.camera);
+      this.renderer.render(this.scene, this.camera);
+      this.rig.render(this.camera);
+    });
   }
+  setCameraMarkers(markers: readonly CameraMarker[]) {
+    this.rig.setPoses(markers);
+    this.invalidate();
+  }
+  setCameraImages(images: Readonly<Record<string, string>>) {this.rig.setImages(images);}
   setFrame(packet: FramePacket, reset: boolean) {
     const oldView = this.captureCamera();
     const {header, positions, distance, rgb, rgbMask} = packet;
@@ -127,6 +141,8 @@ export class Viewer {
     if (this.points) {this.scene.remove(this.points); this.points.geometry.dispose(); this.points.material.dispose();}
     this.points = points; this.scene.add(points);
     this.origin.copy(origin);
+    this.rig.setPoses([]);
+    this.rig.setOrigin(origin);
     this.replaceBoxes(this.boxes, header.boxes, false);
     this.replaceBoxes(this.predictions, [], true);
     this.axes.position.copy(origin).negate();
@@ -210,6 +226,7 @@ export class Viewer {
   showAxes(value: boolean) {this.axesEnabled = value; this.axes.visible = Boolean(this.points) && value; this.invalidate();}
   clearFrame() {
     if (this.points) {this.scene.remove(this.points); this.points.geometry.dispose(); this.points.material.dispose(); this.points = null;}
+    this.rig.setPoses([]);
     this.replaceBoxes(this.boxes, [], false);
     this.replaceBoxes(this.predictions, [], true);
     this.axes.visible = false; this.invalidate();
@@ -241,6 +258,7 @@ export class Viewer {
     this.invalidate(); this.onCameraChange?.();
   }
   dispose() {
+    this.rig.dispose();
     this.observer.disconnect(); this.controls.dispose();
     if (this.animation !== null) cancelAnimationFrame(this.animation);
     this.points?.geometry.dispose(); this.points?.material.dispose();

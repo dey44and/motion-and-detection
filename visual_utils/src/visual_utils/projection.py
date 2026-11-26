@@ -10,6 +10,10 @@ from .models import ProjectionResult, _array, _transform
 from .errors import DatasetValidationError
 
 
+def _image_corners(width: int, height: int) -> np.ndarray:
+    return np.array([[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float64)
+
+
 @dataclass(frozen=True, eq=False)
 class PinholeProjection:
     intrinsics: np.ndarray

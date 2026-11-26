@@ -205,10 +205,53 @@ def test_processed_only_mode_requires_no_native_inputs(sources):
     loader = _loader(sources, native=False)
     assert Capability.CAMERAS not in loader.metadata.capabilities
     frame = loader.load_point_cloud(loader.list_frames("context", modality=Modality.POINT_CLOUD)[0].frame_id)
+    assert loader.camera_rig(frame) == ()
     with pytest.raises(UnsupportedCapabilityError):
         loader.prepare_point_cloud(frame, request=PointCloudPreparation(rgb=True))
     with pytest.raises(UnsupportedCapabilityError):
         loader.list_frames("context", modality=Modality.CAMERAS)
+
+
+@pytest.mark.parametrize("processed", [False, True], ids=["native", "paired"])
+def test_camera_rig_reads_only_the_segment_context(sources, monkeypatch, processed):
+    import visual_utils.waymo.reader as implementation
+
+    mount = np.array([[0., -1., 0., .5], [1., 0., 0., -.25], [0., 0., 1., 1.2], [0., 0., 0., 1.]])
+    frames = [_proto(index) for index in range(3)]
+    for frame in frames:
+        calibration = frame.context.camera_calibrations[0]
+        calibration.extrinsic.transform[:] = mount.ravel()
+        calibration.intrinsic[:] = [200, 175, 63, 70, .15, 0, 0, 0, 0]
+        calibration.width, calibration.height = 240, 120
+        frame.images[0].image = b"JPEG not needed for a rig marker"
+        incomplete = frame.context.camera_calibrations.add()
+        incomplete.name = 2
+        mount_only = frame.context.camera_calibrations.add()
+        mount_only.name = 3
+        _transform(mount_only.extrinsic)
+    path = sources[0] / "validation/segment-context_with_camera_labels.tfrecord"
+    path.write_bytes(b"".join(_record(frame) for frame in frames))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Rig markers must not read full frames, scan sequence offsets, or decode images.")
+
+    monkeypatch.setattr(Image, "open", forbidden)
+    with _loader(sources, processed=processed) as loader:
+        cloud = loader.load_point_cloud("waymo:context:1200000")
+        monkeypatch.setattr(implementation, "index_records", forbidden)
+        monkeypatch.setattr(implementation, "read_record", forbidden)
+        pose, mount_only = loader.camera_rig(cloud)
+        assert pose.sensor_id == "CAM_FRONT"
+        np.testing.assert_array_equal(pose.position, [.5, -.25, 1.2])
+        np.testing.assert_array_equal(pose.forward, [0., 1., 0.])
+        np.testing.assert_array_equal(pose.corner_rays @ pose.forward, np.ones(4))
+        normalized = pose.corner_rays[:, [0, 2]] * [1, -1]
+        radial = 1 + .15 * np.sum(np.square(normalized), axis=1, keepdims=True)
+        pixels = normalized * radial * [200, 175] + [63, 70]
+        np.testing.assert_allclose(pixels, [[0, 0], [240, 0], [240, 120], [0, 120]], atol=1e-8)
+        assert mount_only.sensor_id == "CAM_FRONT_RIGHT" and mount_only.corner_rays is None
+        monkeypatch.setattr(implementation, "read_segment_context", forbidden)
+        np.testing.assert_array_equal(loader.camera_rig(cloud)[0].position, pose.position)
 
 
 def test_wrong_native_row_order_is_rejected_without_partial_preparation(sources):

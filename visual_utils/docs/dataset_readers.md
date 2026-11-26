@@ -56,6 +56,11 @@ The reader returns the shared records directly:
 | `CameraFrameSet` | World-reference annotations, RGB images, and explicit camera poses and projection models. |
 | Optional point fields | `rgb`, `timing`, and `acquisition`, with masks and provenance. |
 
+The camera rig derives from the selected sample's `LIDAR_TOP` and camera
+calibrations. It uses the camera mounts in the cloud's LiDAR reference and
+backprojects the image bounds through the pinhole intrinsics to define the
+frusta. Image decoding stays in the payload reader.
+
 <a id="cache-nuscenes-metadata"></a>
 ### Cache nuScenes metadata
 
@@ -183,6 +188,13 @@ pose and corresponding `pose_timestamp_s`.
 geometry into an original image using native distortion and rolling shutter.
 Import it from `visual_utils.waymo`. Native camera axes are forward/left/up,
 and `OPTICAL_TO_WAYMO` converts conventional optical right/down/forward axes.
+
+The camera rig for native and paired OpenPCDet data uses camera-to-vehicle
+calibrations from the segment's first TFRecord. The metadata read leaves JPEGs
+and LiDAR payloads unopened. Calibrated frusta use inverse lens distortion at
+the four image corners. Projection of individual pixels uses the full camera
+model. The same Context describes every frame in the segment.
+[Waymo Frame schema](https://github.com/waymo-research/waymo-open-dataset/blob/v1.6.1/src/waymo_open_dataset/dataset.proto#L353-L372)
 
 ### 🌈 Preserve point order and camera RGB
 

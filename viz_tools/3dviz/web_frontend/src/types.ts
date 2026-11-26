@@ -49,6 +49,21 @@ export interface Bootstrap {
   palettes: Record<'gray' | 'viridis' | 'concerto', number[][]>;
 }
 export interface DatasetClass {id: string; name: string; group: string; color: Vec3}
+export interface CameraBox {
+  id: string; class_id: string; group: string;
+  segments: [number, number, number, number][];
+  score?: number;
+}
+export interface CameraObservationView {
+  id: string; name: string; role: string | null; width: number; height: number;
+  projection: boolean; ground_truth: CameraBox[]; predictions: CameraBox[];
+  point_count: number | null;
+}
+export interface CameraReviewState {revision: number; views: CameraObservationView[]}
+export interface CameraMarker {
+  id: string; name: string; position: Vec3; forward: Vec3;
+  corner_rays?: [Vec3, Vec3, Vec3, Vec3];
+}
 export interface ViewerState {
   dataset: {name: string; root: string; version: string; configured: boolean};
   metadata: {display_name: string; capabilities: string[]; feature_coverage: Record<string, string>; classes: DatasetClass[]; splits: string[]};
@@ -62,6 +77,8 @@ export interface ViewerState {
   display: {rgb: boolean; raw: boolean};
   detection?: DetectionState;
   segmentation?: SegmentationState;
+  camera_review?: CameraReviewState | null;
+  camera_rig?: CameraMarker[];
 }
 export interface Box {id: string; class_id: string; group: string; corners: Vec3[]}
 export interface FrameHeader {
@@ -86,5 +103,7 @@ export type ReviewJob = {
   op: 'detection'; prediction_path?: string; prediction_format?: string; filters?: Partial<DetectionFilters>;
 } | {
   op: 'segmentation'; segmentation_mode?: SegmentationMode; segmentation_path?: string; segmentation_format?: SegmentationFormat;
+} | {
+  op: 'cameras'; camera_points?: boolean;
 };
 export type JobRequest = FrameJob | (ReviewJob & {revision: number});

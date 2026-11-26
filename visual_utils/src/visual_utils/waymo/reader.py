@@ -11,12 +11,13 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from .camera import _camera_corner_rays
 from .models import (
     NativeBox, NativeCamera, NativeCameraLabels, NativeFrame, NativeFrameHeader,
     NativeLaser, NativeLaserCalibration, NativeRangeImage, NativeSequence, NativeWaymoError,
 )
 from .proto import parse_frame
-from .records import index_records, read_identity, read_record
+from .records import index_records, read_identity, read_record, read_segment_context
 
 _CLASSES = {1: "Vehicle", 2: "Pedestrian", 3: "Sign", 4: "Cyclist"}
 _SPLITS = {"train": "training", "val": "validation", "test": "testing", "all": None,
@@ -185,6 +186,7 @@ class NativeWaymoReader:
         self._sequences = sequences
         self._offsets = {}
         self._headers = {}
+        self._camera_mounts = {}
         self._frames = OrderedDict()
         self._lock = threading.RLock()
 
@@ -194,6 +196,7 @@ class NativeWaymoReader:
             self._frames.clear()
             self._headers.clear()
             self._offsets.clear()
+            self._camera_mounts.clear()
 
     def list_sequences(self):
         return tuple(self._sequences[name] for name in sorted(self._sequences))
@@ -231,6 +234,40 @@ class NativeWaymoReader:
 
     def list_frames(self, context_name):
         return self.list_frame_headers(context_name)
+
+    def camera_mounts(self, context_name):
+        """Return available camera-to-vehicle extrinsics from segment metadata."""
+        return tuple((name, transform) for name, transform, _ in self._camera_mount_data(context_name))
+
+    def _camera_mount_data(self, context_name):
+        with self._lock:
+            if context_name not in self._camera_mounts:
+                # Frame.context is shared by all frames in the driving segment.
+                context = read_segment_context(self._sequence(context_name).path)
+                if context.name != context_name:
+                    raise NativeWaymoError("TFRecord context disagrees with its filename/catalogue.")
+                mounts = {}
+                for calibration in context.camera_calibrations:
+                    name = int(calibration.name)
+                    if name not in range(1, 6):
+                        continue
+                    if name in mounts:
+                        mounts[name] = None
+                        continue
+                    try:
+                        transform = _transform(calibration.extrinsic.transform, f"Camera {name} extrinsic")
+                    except NativeWaymoError:
+                        mounts[name] = None
+                    else:
+                        transform.setflags(write=False)
+                        rays = _camera_corner_rays(calibration.intrinsic, calibration.width, calibration.height)
+                        if rays is not None:
+                            rays.setflags(write=False)
+                        mounts[name] = (name, transform, rays)
+                self._camera_mounts[context_name] = tuple(
+                    mount for mount in mounts.values() if mount is not None
+                )
+            return self._camera_mounts[context_name]
 
     def read_frame(self, context_name, frame_index, timestamp_us=None, *, include_points=True, include_cameras=True):
         with self._lock:

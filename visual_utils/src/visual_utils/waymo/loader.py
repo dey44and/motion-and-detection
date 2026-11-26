@@ -12,7 +12,7 @@ from ..config import DatasetConfig
 from ..dataset import DatasetLoader
 from ..models import (
     AcquisitionGeometry, AnnotationAlignment, AnnotationSet, AnnotationStatus,
-    AnnotationTiming, Box3D, CameraFrameSet, CameraObservation, Capability,
+    AnnotationTiming, Box3D, CameraFrameSet, CameraObservation, CameraPose, Capability,
     ClassInfo, DatasetMetadata, FrameInfo, Modality, PointCloudFrame,
     PointColors, ProcessingProvenance, ProjectionResult,
     SceneInfo, SensorInfo,
@@ -22,6 +22,7 @@ from ..errors import (
     DatasetIOError, DatasetValidationError, UnknownIdentifierError,
 )
 from .camera import OPTICAL_TO_WAYMO, WaymoCameraProjection
+from .models import NativeWaymoError
 from .processed import WAYMO_CLASSES, ProcessedWaymoReader, has_processed_layout
 from .range_image import colorize_points, decode_lidar
 from .reader import NativeWaymoReader, find_native_root
@@ -378,6 +379,29 @@ class WaymoLoader(DatasetLoader):
         return CameraFrameSet(info=info, source_id=_NATIVE_SOURCE, reference_frame_id=reference,
                               cameras=tuple(cameras), annotations=self._native_annotations(info, native),
                               world_frame_id=_world(info.scene_id), T_world_from_reference=native.vehicle_to_world)
+
+    def _camera_rig(self, frame: PointCloudFrame) -> tuple[CameraPose, ...]:
+        scene_id = frame.info.scene_id
+        source_id = self._processed.source_id if self._processed is not None else _NATIVE_SOURCE
+        if scene_id not in self._native_sequences or frame.source_id != source_id:
+            return ()
+        try:
+            mounts = {number: (transform, rays) for number, transform, rays in self._reader._camera_mount_data(scene_id)}
+        except NativeWaymoError:
+            return ()
+        poses = []
+        for number, sensor_id, _, _ in _CAMERAS:
+            if number not in mounts:
+                continue
+            transform, optical_rays = mounts[number]
+            mount = transform @ OPTICAL_TO_WAYMO
+            forward = mount[:3, 2] / np.linalg.norm(mount[:3, 2])
+            rays = None
+            if optical_rays is not None:
+                rays = optical_rays @ mount[:3, :3].T
+                rays /= (rays @ forward)[:, None]
+            poses.append(CameraPose(sensor_id, mount[:3, 3], forward, corner_rays=rays))
+        return tuple(poses)
 
     def _prepare_point_cloud(self, frame, *, request):
         if request.timestamps:

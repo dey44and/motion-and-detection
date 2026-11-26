@@ -12,7 +12,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from visual_utils import Box3D, CameraFrameSet, CameraObservation, PinholeProjection
+from .models import Box3D, CameraFrameSet, CameraObservation
+from .projection import PinholeProjection
+
+
+DEFAULT_NEAR_PLANE = 0.1
 
 
 _CORNER_SIGNS = np.array([
@@ -237,7 +241,7 @@ def _project_nonlinear_box(box, camera, reference, near, xmax, ymax):
     )
 
 
-def project_box(box: Box3D, camera: CameraObservation, *, near_plane: float = 0.1) -> ProjectedBox | None:
+def project_box(box: Box3D, camera: CameraObservation, *, near_plane: float = DEFAULT_NEAR_PLANE) -> ProjectedBox | None:
     """Project one box in the camera model's declared reference coordinates.
 
     Explicit pinhole models use exact near-plane and image clipping. Other
@@ -295,7 +299,7 @@ def project_box(box: Box3D, camera: CameraObservation, *, near_plane: float = 0.
     )
 
 
-def project_boxes(frame: CameraFrameSet, *, near_plane: float = 0.1) -> dict[str, tuple[ProjectedBox, ...]]:
+def project_boxes(frame: CameraFrameSet, *, near_plane: float = DEFAULT_NEAR_PLANE) -> dict[str, tuple[ProjectedBox, ...]]:
     """Project default or camera-specific annotations without changing records."""
     result = {}
     for camera in frame.cameras:

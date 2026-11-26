@@ -1,13 +1,13 @@
 # ☁️ 3dviz
 
 Inspect autonomous-driving point clouds, 3D ground truth, predicted detections,
-camera-derived point colors, and nuScenes LiDAR segmentation in one local
-browser workspace.
+camera images, projected overlays, and nuScenes LiDAR segmentation in one
+local browser workspace.
 
 Dataset reading belongs to [`visual-utils`](../../visual_utils/README.md).
-Its `DatasetLoader` and canonical observations are shared with research scripts
-and [2dcameraviz](../2dcameraviz/README.md). This package provides point colors,
-box geometry, detection filters, camera navigation, and asynchronous controls.
+The viewer and research scripts share its `DatasetLoader` and canonical
+observations. The browser provides point colors, box geometry, detection
+filters, camera navigation, and asynchronous controls.
 
 **[Quick start](#install-and-launch)** · **[Data and configuration](#dataset-sources)** · **[Controls and interpretation](#controls-and-scientific-interpretation)** · **[Research and extensions](#research-api-and-extension-boundary)** · **[Validation](#validation)**
 
@@ -91,6 +91,21 @@ point row. When labels are unavailable or invalid, the viewer keeps the cloud
 visible in neutral colors and reports the reason. Export fields, coordinate
 conventions, and custom readers are documented in the
 [prediction contract](docs/prediction_contract.md).
+
+### Camera images
+
+Each calibrated camera appears near the ego vehicle as a frustum with a preview
+of the current image. Click a frustum to open the camera overlay and highlight
+that view. nuScenes displays six camera views, and Waymo displays the cameras
+available in its native data. Full-size images load when you open the overlay.
+
+Use **Overlays** to show camera-native ground-truth cuboids in class colors.
+Turn on **Use one ground truth color** and click the swatch to choose a shared
+color for the camera images. You can also show the current filtered predictions
+as dashed cuboids or project the baseline LiDAR points into each calibrated
+image. Projected points use the 3D viewer’s distance scale and available point
+palettes. Camera RGB and semantic colors are available when the current 3D frame
+has those values. Close with **×** or Escape to return to your 3D viewpoint.
 
 Existing `3dviz --web` commands still serve the workspace and retain explicit
 browser opening via `--open-browser`. Launch detection review with `3dviz`

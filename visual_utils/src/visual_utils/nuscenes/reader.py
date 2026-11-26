@@ -23,11 +23,11 @@ import numpy as np
 from ..errors import DataUnavailableError, DatasetError, DatasetValidationError, UnknownIdentifierError
 from ..models import (
     AcquisitionGeometry, AnnotationAlignment, AnnotationSet, AnnotationStatus,
-    AnnotationTiming, Box3D, CameraFrameSet, CameraObservation, FrameInfo, LidarSegmentation,
+    AnnotationTiming, Box3D, CameraFrameSet, CameraObservation, CameraPose, FrameInfo, LidarSegmentation,
     Modality, PointCloudFrame, PointColors, PointTiming, ProcessingProvenance,
     SceneInfo, TimingQuality,
 )
-from ..projection import PinholeProjection
+from ..projection import PinholeProjection, _image_corners
 from .lidarseg import native_to_evaluation, read_label_file, validate_labels
 
 _POINT_SOURCE = "nuscenes:native:LIDAR_TOP:compensated-v1"
@@ -766,6 +766,48 @@ class NuScenesReader:
                 raise DatasetError(f"Camera image dimensions disagree with metadata for {data.get('filename')!r}.")
             dimensions.append(value)
         return dimensions[0], dimensions[1]
+
+    def _rig_corner_rays(self, data, calibration, channel, optical_to_lidar):
+        try:
+            width, height = self._camera_dimensions(data)
+            intrinsics = self._camera_intrinsics(calibration, channel)
+            pixels = np.column_stack((_image_corners(width, height), np.ones(4)))
+            optical_rays = np.linalg.solve(intrinsics, pixels.T).T
+        except (DatasetError, np.linalg.LinAlgError, OverflowError):
+            return None
+        rays = optical_rays @ optical_to_lidar.T
+        depth = rays @ optical_to_lidar[:, 2]
+        if not np.isfinite(rays).all() or not np.isfinite(depth).all() or np.any(depth <= 0):
+            return None
+        return rays / depth[:, None]
+
+    def camera_rig(self, frame: PointCloudFrame) -> tuple[CameraPose, ...]:
+        frame_id = frame.info.frame_id
+        lidar = self._lidar_by_sample.get(frame_id)
+        cameras = self._cameras_by_sample.get(frame_id)
+        if (lidar is None or not cameras or frame.source_id != _POINT_SOURCE
+                or frame.reference_frame_id != f"sensor:LIDAR_TOP:{lidar['token']}"):
+            return ()
+        lidar_mount = _transform(self._calibrations[lidar["calibrated_sensor_token"]], "LIDAR_TOP calibration")
+        lidar_from_ego = lidar_mount[:3, :3].T
+        markers = []
+        for channel in CAMERA_CHANNELS:
+            data = cameras.get(channel)
+            if data is None:
+                continue
+            calibration = self._calibrations[data["calibrated_sensor_token"]]
+            try:
+                mount = _transform(calibration, f"{channel} calibration")
+                optical_to_lidar = lidar_from_ego @ mount[:3, :3]
+                markers.append(CameraPose(
+                    sensor_id=channel,
+                    position=lidar_from_ego @ (mount[:3, 3] - lidar_mount[:3, 3]),
+                    forward=optical_to_lidar[:, 2],
+                    corner_rays=self._rig_corner_rays(data, calibration, channel, optical_to_lidar),
+                ))
+            except DatasetError:
+                continue
+        return tuple(markers)
 
     def load_camera_frame(self, frame_id: str) -> CameraFrameSet:
         info = self._frame_info(frame_id, Modality.CAMERAS)

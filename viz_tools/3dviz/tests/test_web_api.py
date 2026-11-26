@@ -161,6 +161,104 @@ def test_launch_export_and_cache_are_used_when_connecting(valid, tmp_path):
         assert reconnected["detection"]["source"]["format"] == "demo"
 
 
+def test_camera_previews_and_lazy_review_assets_match_frame_revision():
+    from base64 import b64decode
+    from dataclasses import replace
+    from io import BytesIO
+
+    import numpy as np
+    from PIL import Image
+    from threedviz.dataloader import DemoLoader
+    from visual_utils import (
+        CameraFrameSet, CameraObservation, CameraPose, Capability, Modality, PinholeProjection, SensorInfo,
+    )
+
+    pose = np.eye(4)
+    pose[:3, :3] = np.array([[0., 0., 1.], [-1., 0., 0.], [0., -1., 0.]])
+    pose[:3, 3] = [1.2, 0, -0.3]
+    intrinsics = np.array([[120., 0., 160.], [0., 120., 90.], [0., 0., 1.]])
+    corners = np.array([[1., 4 / 3, .75], [1., -4 / 3, .75], [1., -4 / 3, -.75], [1., 4 / 3, -.75]])
+
+    class CameraFixture(DemoLoader):
+        reads = 0
+
+        def __init__(self):
+            super().__init__()
+            self._metadata = replace(
+                self.metadata, capabilities=self.metadata.capabilities | {Capability.CAMERAS},
+                sensors=(*self.metadata.sensors, SensorInfo("rig/front", Modality.CAMERAS, "Front", "front")),
+            )
+
+        def _camera_rig(self, frame):
+            return (CameraPose("rig/front", pose[:3, 3], pose[:3, 2], corner_rays=corners),)
+
+        def _load_cameras(self, frame_id):
+            self.reads += 1
+            frame = self._load_point_cloud(frame_id)
+            info = replace(frame.info, modalities=frame.info.modalities | {Modality.CAMERAS})
+            camera = CameraObservation(
+                "rig/front", np.full((180, 320, 3), 99, dtype=np.uint8),
+                intrinsics=intrinsics, T_reference_from_camera=pose,
+                projection_model=PinholeProjection(intrinsics, pose),
+            )
+            return CameraFrameSet(
+                info, frame.source_id, frame.reference_frame_id, (camera,), frame.annotations,
+                world_frame_id=frame.world_frame_id, T_world_from_reference=frame.T_world_from_reference,
+            )
+
+    loader = CameraFixture()
+    with TestClient(create_app(factory=lambda *_args, **_kwargs: loader)) as client:
+        sid = client.post("/api/sessions").json()["id"]
+        base = f"/api/sessions/{sid}"
+        state = _connect(client, sid)
+        revision = state["revision"]
+        assert state["camera_review"] is None and loader.reads == 0
+        assert state["camera_rig"] == [{"id": "rig/front", "name": "Front",
+                                        "position": [1.2, 0, -0.3], "forward": [1., 0, 0],
+                                        "corner_rays": corners.tolist()}]
+        image_url = f"{base}/camera-image/rig%2Ffront?revision={revision}"
+        points_url = f"{base}/camera-points/rig%2Ffront?revision={revision}"
+        preview_url = f"{base}/camera-previews?revision={revision}"
+        cloud_url = f"{base}/frame.bin?revision={revision}"
+        original_cloud = client.get(cloud_url).content
+        assert client.get(image_url).status_code == 404
+        previews = client.get(preview_url)
+        assert previews.status_code == 200 and loader.reads == 1
+        assert list(previews.json()) == ["rig/front"]
+        with Image.open(BytesIO(b64decode(previews.json()["rig/front"]))) as preview:
+            assert preview.size == (256, 144)
+        assert client.get(preview_url).content == previews.content and loader.reads == 1
+        assert client.get(base).json()["camera_review"] is None and client.get(image_url).status_code == 404
+        state = _job(client, sid, op="cameras", revision=revision)
+        field = state["camera_review"]["views"][0]
+        assert state["revision"] == revision and field["point_count"] is None
+        assert field["id"] == "rig/front" and field["projection"]
+        assert field["ground_truth"] and field["predictions"]
+        response = client.get(image_url)
+        assert response.status_code == 200 and response.headers["content-type"] == "image/jpeg"
+        with Image.open(BytesIO(response.content)) as image:
+            assert image.size == (320, 180)
+        assert client.get(points_url).status_code == 404
+        state = _job(client, sid, op="cameras", revision=revision, camera_points=True)
+        points = client.get(points_url)
+        assert points.status_code == 200 and loader.reads == 2
+        rows = list(struct.iter_unpack("<ffI", points.content))
+        assert len(rows) == state["camera_review"]["views"][0]["point_count"] > 0
+        assert all(0 <= u < 320 and 0 <= v < 180 and row < 30000 for u, v, row in rows)
+        assert client.get(cloud_url).content == original_cloud
+        state = _job(client, sid, op="detection", revision=revision, filters={"max_detections": 0})
+        assert state["camera_review"] is None and client.get(image_url).status_code == 404
+        state = _job(client, sid, op="cameras", revision=revision, camera_points=True)
+        assert state["camera_review"]["views"][0]["predictions"] == [] and loader.reads == 2
+        assert client.get(points_url).content == points.content
+        state = _job(client, sid, op="select", frame_index=1)
+        assert state["camera_review"] is None
+        assert client.get(image_url).status_code == client.get(points_url).status_code == 409
+        assert client.get(preview_url).status_code == 409
+        assert client.get(f"{base}/camera-previews?revision={state['revision']}").status_code == 200
+        assert loader.reads == 3
+
+
 @pytest.mark.parametrize("values", [
     {"op": "other"}, {"op": "connect", "frame_index": -1},
     {"op": "connect", "frame_index": 1.5}, {"op": "connect", "frame_index": True},
@@ -169,6 +267,7 @@ def test_launch_export_and_cache_are_used_when_connecting(valid, tmp_path):
     {"op": "prepare", "scene_id": "anything"},
     {"op": "segmentation", "revision": 1, "segmentation_mode": "other"},
     {"op": "detection", "revision": True}, {"op": "connect", "prediction_path": "/data"},
+    {"op": "cameras", "revision": 1, "camera_points": "false"},
 ])
 def test_http_strict_input_validation(client, values):
     sid = client.post("/api/sessions").json()["id"]

@@ -23,7 +23,7 @@ class JobRequest(BaseModel):
     """Reject coercion and accidental options instead of silently ignoring them."""
 
     model_config = ConfigDict(extra="forbid")
-    op: Literal["connect", "select", "prepare", "detection", "segmentation"]
+    op: Literal["connect", "select", "prepare", "detection", "segmentation", "cameras"]
     dataset: Annotated[StrictStr, Field(max_length=256)] | None = None
     root: Annotated[StrictStr, Field(max_length=8192)] | None = None
     version: Annotated[StrictStr, Field(max_length=256)] | None = None
@@ -40,6 +40,7 @@ class JobRequest(BaseModel):
     segmentation_mode: Literal["off", "ground_truth", "prediction"] | None = None
     segmentation_path: Annotated[StrictStr, Field(max_length=8192)] | None = None
     segmentation_format: Literal["auto", "official", "sonata"] | None = None
+    camera_points: StrictBool | None = None
 
 
 def _local_host(host: str, *, tests=False) -> bool:
@@ -150,6 +151,20 @@ def create_app(*, manager: SessionManager | None = None, factory=None, **launch_
                         generation: Annotated[int, Query(ge=0)], native: bool = False):
         labels = manager.get(session_id).semantic_labels(revision, generation, native=native)
         return Response(labels, media_type="application/octet-stream")
+
+    @app.get("/api/sessions/{session_id}/camera-previews")
+    def camera_previews(session_id: str, revision: Annotated[int, Query(ge=1)]):
+        return manager.get(session_id).camera_previews(revision)
+
+    @app.get("/api/sessions/{session_id}/camera-image/{camera_id:path}")
+    def camera_image(session_id: str, camera_id: str, revision: Annotated[int, Query(ge=1)]):
+        content = manager.get(session_id).camera_asset(revision, camera_id)
+        return Response(content, media_type="image/jpeg")
+
+    @app.get("/api/sessions/{session_id}/camera-points/{camera_id:path}")
+    def camera_points(session_id: str, camera_id: str, revision: Annotated[int, Query(ge=1)]):
+        content = manager.get(session_id).camera_asset(revision, camera_id, projected_points=True)
+        return Response(content, media_type="application/octet-stream")
 
     # Only bundled assets are served. Dataset paths are never mounted.
     static = Path(__file__).with_name("static")

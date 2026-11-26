@@ -1,9 +1,8 @@
 # 🏗️ Visualization architecture
 
-One dataset adapter connects native storage to shared records. Both
-viewers consume those records directly, while detection review adds an
-independent prediction source. This guide explains where each responsibility
-belongs when you extend the code.
+One dataset adapter connects native storage to shared records. The browser
+workspace consumes those records directly and attaches detector exports through
+an independent prediction source.
 
 **[Viewer overview](../viz_tools/README.md)** ·
 **[Dataset interface](../visual_utils/docs/loader_contract.md)** ·
@@ -17,9 +16,9 @@ nuScenes / Waymo / your storage
         DatasetLoader adapter
               |
          shared records
-          /          \
-   Tk camera    browser workspace
-     viewer     (cloud + predictions + lidarseg)
+              |
+        browser workspace
+  (cloud + detections + lidarseg + cameras)
 ```
 
 `DatasetLoader` adapts native storage and scientific conventions into the
@@ -34,8 +33,8 @@ The records carry scene, frame, and box information through to the renderer.
 | `visual_utils/models.py` | Shared records, shapes, coordinate/time metadata and geometric validation. |
 | `visual_utils/nuscenes`, `waymo` | Native decoding, catalogs, calibration, pairing, RGB and acquisition processing. |
 | `visual_utils/config.py`, `registry.py` | Configuration and optional name-based construction. |
-| `cameraviz` | Camera slots, box projection/clipping, display styles and Tk navigation. |
-| `threedviz.web` | Local sessions, frame transfer and the bundled Three.js workspace for point clouds, detections, and segmentation. |
+| `visual_utils/box_projection.py` | Cuboid projection and clipping in the camera's image coordinates. |
+| `threedviz.web` | Local sessions, frame and camera transfer, and the bundled browser workspace. |
 | `threedviz.detection` | Prediction readers, coordinate normalization, filters, BEV NMS, and review presets. |
 | `threedviz.processing` | Shared box geometry and point color palettes. |
 
@@ -58,13 +57,20 @@ the box layer without replacing the frame packet or camera view.
 5. Render the observation, resolving display labels and colors in the UI.
 
 The public methods call `_list_scenes`, `_list_frames`, `_load_point_cloud`,
-`_load_cameras`, `_load_lidar_segmentation`, and optional `_prepare_point_cloud`.
+`_load_cameras`, `_load_lidarseg_ground_truth`, and optional `_prepare_point_cloud`.
 The base class handles closed state, splits, and capabilities,
 leaving storage and scientific processing to the provider.
 
-Camera projection works directly in the camera set's declared reference.
-Class IDs remain unchanged in the records. Display groups are looked up when
-building controls, filtering displayed classes and choosing styles.
+Camera projection uses the camera set's declared reference. The browser opens
+the image overlay on the selected cloud's frame and transfers camera JPEGs,
+projected cuboid edges, and optional LiDAR point coordinates. Class IDs remain
+unchanged in the records. Display groups supply labels and styles.
+
+The shared projector clips pinhole cuboids against the near plane and image
+bounds. Nonlinear camera models approximate curved edges by sampling. Camera
+exposure, pose, and annotation timestamps remain separate. Moving objects can
+shift between those times, and projected points or edges can pass behind objects
+visible in the image.
 
 ## 🧪 Keep checks tied to data correctness
 

@@ -1,0 +1,75 @@
+.camera-review {
+  /* Leave room for two rows of wide camera images in short windows. */
+  width: min(calc(100vw - 24px), max(900px, calc(266dvh - 190px)));
+  max-width: none;
+  max-height: calc(100dvh - 24px);
+  margin: auto;
+  padding: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-radius: var(--panel-radius);
+  color: var(--text);
+  box-shadow: 0 28px 85px rgba(0, 0, 0, .34), inset 0 1px rgba(255, 255, 255, .08);
+}
+.camera-review::backdrop { background: rgba(0, 0, 0, .43); backdrop-filter: blur(4px); }
+.camera-review-heading {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 54px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: #202022;
+}
+.camera-review-heading h2 { margin: 0; font-size: 19px; letter-spacing: -.25px; font-weight: 700; }
+#camera-review-close { font-size: 23px; line-height: 1; }
+.camera-review-status { margin: 0; padding: 10px 16px; border-bottom: 1px solid var(--border); color: var(--muted); }
+.camera-review-body { display: grid; grid-template-columns: minmax(0, 1fr) clamp(194px, 13.5vw, 258px); align-items: start; gap: 10px; padding: 10px; }
+.camera-review-body:has(.camera-review-controls[hidden]) { grid-template-columns: minmax(0, 1fr); }
+.camera-review-grid { display: grid; grid-template-columns: repeat(var(--camera-columns, 3), minmax(0, 1fr)); gap: 8px; }
+.camera-review-grid:empty { display: none; }
+.camera-review-tile {
+  display: grid;
+  min-width: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--control-border);
+  border-radius: var(--control-radius);
+  background: #252527;
+  text-align: left;
+}
+.camera-review-tile[aria-pressed=true] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.camera-review-tile:focus-visible { outline-offset: 3px; }
+.camera-review-preview { position: relative; display: block; min-width: 0; overflow: hidden; background: #121214; }
+.camera-review-preview img, .camera-review-preview canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+.camera-review-preview canvas { pointer-events: none; }
+.camera-image-fallback { position: absolute; inset: 0; display: grid; place-items: center; padding: 3px; color: var(--muted); text-align: center; }
+.camera-review-caption { min-width: 0; padding: 6px 9px; font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.camera-review-tile[aria-pressed=true] .camera-review-caption { font-weight: 700; }
+.camera-review-controls { padding: 10px 12px 12px; border: 1px solid var(--border); border-radius: var(--control-radius); background: var(--surface); }
+.camera-review-controls h3 { margin: 0 0 5px; font-size: 14px; font-weight: 700; }
+.camera-review-controls .check-row { justify-content: space-between; font-size: 13px; }
+.camera-review-controls .check-row:has(input:disabled) { color: var(--muted); cursor: default; }
+.camera-review-controls input[type=color] { flex: none; }
+.camera-review-controls input[type=color]::-webkit-color-swatch-wrapper { padding: 0; }
+.camera-review-controls input[type=color]::-webkit-color-swatch { border: 1px solid var(--control-border); border-radius: 2px; }
+.camera-review-controls input[type=color]::-moz-color-swatch { border: 1px solid var(--control-border); border-radius: 2px; }
+.camera-point-switch { margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--border); }
+.camera-review-controls .field-label { margin: 7px 0 4px; }
+.camera-review-controls .hint { margin-top: 5px; }
+@media (max-width: 760px) {
+  .camera-review { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); }
+  .camera-review-heading { min-height: 48px; padding-inline: 10px; }
+  .camera-review-status { padding-inline: 10px; }
+  .camera-review-body { grid-template-columns: minmax(0, 1fr); padding: 8px; }
+  .camera-review-grid { gap: 5px; }
+  .camera-review-caption { padding: 5px; font-size: 12px; }
+  .camera-image-fallback { font-size: 11px; }
+}
+@media (pointer: coarse) {
+  .camera-review-controls .check-row { min-height: 44px; }
+}

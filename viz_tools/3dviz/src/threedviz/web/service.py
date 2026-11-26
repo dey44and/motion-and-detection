@@ -7,6 +7,7 @@ view, and closing a session prevents late results from becoming visible.
 
 from __future__ import annotations
 
+from base64 import b64encode
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
@@ -21,7 +22,7 @@ from typing import TYPE_CHECKING, Callable
 import numpy as np
 
 from visual_utils import (
-    Capability, DatasetConfig, DatasetConfigurationError, DatasetLoader,
+    Capability, DatasetConfig, DatasetConfigurationError, DatasetError, DatasetLoader, DataUnavailableError,
     Modality, PointCloudFrame, PointCloudPreparation, UnsupportedCapabilityError, load_dataset_config,
 )
 from threedviz.dataloader import available_datasets, create_dataset
@@ -32,6 +33,7 @@ from .detection import DetectionReview
 from .wire import encode_frame
 
 if TYPE_CHECKING:
+    from .cameras import CameraReview
     from .segmentation import FrameSegmentation, PredictionRun
 
 
@@ -114,6 +116,9 @@ class _Connection:
     packet: bytes
     detection: DetectionReview
     segmentation: _Segmentation
+    camera_rig: tuple[dict, ...] = ()
+    camera_review: CameraReview | None = None
+    camera_review_dirty: bool = False
 
 
 def _supports_raw(metadata):
@@ -159,6 +164,9 @@ def _state(connection):
         "has_frame": True, "display": {"rgb": connection.rgb, "raw": connection.raw},
         "detection": connection.detection.public(metadata),
         "segmentation": connection.segmentation.public(metadata),
+        "camera_rig": list(connection.camera_rig),
+        "camera_review": (None if connection.camera_review is None or connection.camera_review_dirty
+                          else connection.camera_review.public()),
     }
 
 
@@ -194,6 +202,7 @@ class BrowserSession:
         self._connection = None
         self._jobs = OrderedDict()
         self._active_job = None
+        self._camera_preview_job = None
         self._revision = 0
         self.last_access = time.monotonic()
 
@@ -232,6 +241,55 @@ class BrowserSession:
                 raise BrowserError(404, "The requested LiDAR labels are unavailable for this scan.")
             return labels.tobytes()
 
+    def _camera_frame(self, revision: int):
+        self._check_open()
+        connection = self._connection
+        if connection is None or connection.revision != revision:
+            raise BrowserError(409, "The requested camera frame is no longer current.")
+        return connection
+
+    def camera_previews(self, revision: int):
+        with self._lock:
+            connection = self._camera_frame(revision)
+            if not any(marker.get("corner_rays") for marker in connection.camera_rig):
+                return {}
+            if self._camera_preview_job is None:
+                self._camera_preview_job = self._executor.submit(self._read_camera_previews, revision)
+            pending = self._camera_preview_job
+        previews = pending.result()
+        with self._lock:
+            self._camera_frame(revision)
+        return previews
+
+    def _read_camera_previews(self, revision: int):
+        from .cameras import build_camera_thumbnails
+
+        with self._lock:
+            connection = self._camera_frame(revision)
+        try:
+            thumbnails = build_camera_thumbnails(
+                connection.loader, connection.frame, revision=revision, review=connection.camera_review,
+            )
+        except DatasetError as error:
+            _LOG.debug("Camera previews are unavailable for %s: %s", connection.frame.info.frame_id, error)
+            return {}
+        calibrated = {marker["id"] for marker in connection.camera_rig if marker.get("corner_rays")}
+        return {
+            camera_id: b64encode(thumbnails.image(camera_id)).decode("ascii")
+            for camera_id in thumbnails.camera_ids if camera_id in calibrated
+        }
+
+    def camera_asset(self, revision: int, camera_id: str, *, projected_points: bool = False):
+        with self._lock:
+            connection = self._camera_frame(revision)
+            review = connection.camera_review
+            if review is None or connection.camera_review_dirty:
+                raise BrowserError(404, "Open the camera review for the current frame first.")
+            try:
+                return review.points(camera_id) if projected_points else review.image(camera_id)
+            except (KeyError, DataUnavailableError):
+                raise BrowserError(404, "The requested camera asset is unavailable for this frame.") from None
+
     def start(self, values: dict):
         values = dict(values)
         op = values.get("op")
@@ -241,6 +299,7 @@ class BrowserSession:
             "prepare": {"rgb", "raw"},
             "detection": {"revision", "prediction_path", "prediction_format", "filters"},
             "segmentation": {"revision", "segmentation_mode", "segmentation_path", "segmentation_format"},
+            "cameras": {"revision", "camera_points"},
         }
         if op not in operations:
             raise BrowserError(422, "Unknown browser operation.")
@@ -252,7 +311,7 @@ class BrowserSession:
                 raise BrowserError(409, "This session is already loading. Wait for the current operation.")
             if op != "connect" and self._connection is None:
                 raise BrowserError(409, "Connect a dataset before changing the view.")
-            if op in {"detection", "segmentation"}:
+            if op in {"detection", "segmentation", "cameras"}:
                 if "revision" not in values:
                     raise BrowserError(422, "An overlay operation requires a frame revision.")
                 if values["revision"] != self._connection.revision:
@@ -290,6 +349,8 @@ class BrowserSession:
                 candidate = self._detection(job_id, values, previous)
             elif values["op"] == "segmentation":
                 candidate = self._segmentation(job_id, values, previous)
+            elif values["op"] == "cameras":
+                candidate = self._cameras(job_id, values, previous)
             else:
                 candidate = self._select_or_prepare(job_id, values, previous)
             state = _state(candidate)
@@ -297,6 +358,8 @@ class BrowserSession:
                 if self._closed:
                     return
                 self._connection = candidate
+                if candidate.revision != self._revision:
+                    self._camera_preview_job = None
                 self._revision = candidate.revision
                 self._jobs[job_id].update(status="done", stage="Ready", state=state)
                 self._active_job = None
@@ -473,7 +536,7 @@ class BrowserSession:
                 job_id, detection, connection.frame, values["prediction_path"].strip(),
                 values.get("prediction_format", "auto"),
             )
-        return replace(connection, detection=detection)
+        return replace(connection, detection=detection, camera_review_dirty=True)
 
     def _attach_detections(self, job_id, detection, frame, path, format):
         self._stage(job_id, "Opening detection export")
@@ -505,6 +568,36 @@ class BrowserSession:
         ).for_frame(loader, connection.frame)
         return replace(connection, segmentation=segmentation)
 
+    def _cameras(self, job_id, values, connection):
+        from .cameras import build_camera_review
+
+        detection = connection.detection.review
+        retained = () if detection is None or detection.filtered is None else detection.filtered.detections
+        review = build_camera_review(
+            connection.loader, connection.frame, retained, revision=connection.revision,
+            include_points=values.get("camera_points", False), previous=connection.camera_review,
+            progress=lambda message: self._stage(job_id, message),
+        )
+        return replace(connection, camera_review=review, camera_review_dirty=False)
+
+    @staticmethod
+    def _camera_rig(loader, frame):
+        metadata = loader.metadata
+        if Capability.CAMERAS not in metadata.capabilities:
+            return ()
+        try:
+            poses = loader.camera_rig(frame)
+        except DatasetError as error:
+            _LOG.debug("Camera mounting data is unavailable for %s: %s", frame.info.frame_id, error)
+            return ()
+        sensors = {sensor.sensor_id: sensor for sensor in metadata.sensors if sensor.modality == Modality.CAMERAS}
+        return tuple({
+            "id": pose.sensor_id,
+            "name": sensors[pose.sensor_id].display_name if pose.sensor_id in sensors else pose.sensor_id,
+            "position": pose.position.tolist(), "forward": pose.forward.tolist(),
+            **({"corner_rays": pose.corner_rays.tolist()} if pose.corner_rays is not None else {}),
+        } for pose in poses)
+
     def _candidate(self, job_id, loader, dataset, split, scenes, scene_id, frames, index, frame,
                    rgb, raw, detection, segmentation):
         if frame.info.frame_id != frames[index].frame_id or frame.info.scene_id != scene_id:
@@ -512,8 +605,11 @@ class BrowserSession:
         revision = self._revision + 1
         self._stage(job_id, "Transferring geometry")
         packet = encode_frame(frame, revision, rgb=rgb, raw=raw, class_groups=_groups(loader.metadata))
+        prior = self._connection
+        rig = (prior.camera_rig if prior is not None and prior.loader is loader and prior.frame.info == frame.info
+               else self._camera_rig(loader, frame))
         return _Connection(loader, dataset, split, scenes, scene_id, frames, index, frame, rgb, raw, revision, packet,
-                           detection, segmentation)
+                           detection, segmentation, rig)
 
     def close(self, *, wait=False):
         with self._lock:
@@ -526,6 +622,7 @@ class BrowserSession:
     def _dispose(self):
         with self._lock:
             connection, self._connection = self._connection, None
+            self._camera_preview_job = None
             self._jobs.clear()
         _close_replaced(connection)
         self._disposed.set()

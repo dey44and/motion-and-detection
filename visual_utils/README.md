@@ -1,9 +1,9 @@
 # 🧩 visual-utils
 
-Load a dataset once and use it in the camera viewer or the browser workspace
-for point clouds and detection review. `visual_utils` translates nuScenes, Waymo, or your own storage into
-shared Python records, with explicit calibration, coordinate references, and
-timing. It works in scripts and notebooks without importing a GUI.
+Load a dataset once and use it in the `3dviz` browser workspace or in Python.
+`visual_utils` translates nuScenes, Waymo, or your own storage into shared
+records for point clouds and camera observations, with explicit calibration,
+coordinate references, and timing.
 
 **[Visualization tools](../viz_tools/README.md)** ·
 **[Dataset interface](docs/loader_contract.md)** ·
@@ -39,26 +39,20 @@ The context manager closes the loader, and returned observations remain usable
 after it closes. If you do not have a dataset available, try the
 [small generated example](docs/custom_datasets.md) to explore the same interface.
 
-## 🔭 Choose a viewer
+## 🔭 Open the browser workspace
 
-Install only the viewer you need alongside `visual_utils`. Run these commands
-from the repository root in the environment where you installed the shared
-package.
-
-| Tool | Use it for |
-| --- | --- |
-| [2dcameraviz](../viz_tools/2dcameraviz/README.md) | Camera images and projected 3D ground truth. |
-| [3dviz](../viz_tools/3dviz/README.md) | Point clouds, colors, acquisition geometry, ground-truth and predicted boxes, and LiDAR segmentation. |
-
-For example, install and launch the point-cloud viewer:
+From the repository root, install `3dviz` alongside `visual_utils` and launch
+the synthetic demo.
 
 ```bash
 python -m pip install -e './viz_tools/3dviz'
 3dviz --demo
 ```
 
-Both viewers use the same dataset records. The `3dviz` workspace reads
-experimental predictions through an independent source.
+The workspace uses the shared dataset records for point clouds, annotations,
+and camera images. Click a camera preview in the 3D scene on a calibrated
+dataset to open its image and overlays. Experimental predictions attach through
+an independent source. [3dviz guide](../viz_tools/3dviz/README.md)
 
 ## 📂 Configure your data
 
@@ -80,7 +74,7 @@ live separately, provide both paths through `source_paths`. The
 [native reader guide](docs/dataset_readers.md) explains the supported layouts,
 sensor conventions, and lower-level APIs.
 
-For a configuration you can reuse across viewers, save a JSON file:
+To reuse a configuration in `3dviz` and Python, save a JSON file.
 
 ```json
 {
@@ -91,7 +85,7 @@ For a configuration you can reuse across viewers, save a JSON file:
 }
 ```
 
-Pass it to any viewer with `--dataset-config FILE`, or read it in Python with
+Pass it to `3dviz` with `--dataset-config FILE`, or read it in Python with
 `load_dataset_config(FILE)`. A relative root resolves against the JSON file's
 directory. Relative named sources resolve against that root, or against the
 file's directory when the root is absent.
@@ -132,9 +126,9 @@ explains how they affect the display.
 
 Implement `DatasetLoader` in your own package and return the shared
 `PointCloudFrame` and/or `CameraFrameSet` records. Declare the available
-modalities, classes, sensors, and optional features in metadata. A point-only
-provider can support both 3D viewers, while a camera provider can support the
-camera viewer.
+modalities, classes, sensors, and optional features in metadata. The browser
+workspace requires a point cloud. Providers with a calibrated camera rig can
+also expose synchronized camera previews in that workspace.
 
 For an installed package, expose your constructor through an entry point:
 
@@ -144,7 +138,7 @@ my_dataset = "my_package:MyDatasetLoader"
 ```
 
 The constructor accepts one `DatasetConfig` and returns a `DatasetLoader`.
-Viewer commands discover the name automatically. `available_loaders()` lists
+`3dviz` discovers the name automatically. `available_loaders()` lists
 built-in, registered, and installed names without importing plugin code, and
 only the selected provider is imported during construction. Existing names
 cannot be overridden.

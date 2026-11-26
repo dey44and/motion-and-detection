@@ -200,6 +200,37 @@ def test_native_box_identity_anchored_geometry_and_pinhole_projection(contract_r
     assert not cloud.attributes["intensity"].flags.writeable
 
 
+def test_camera_rig_uses_mount_transforms_without_opening_images(contract_root, open_loader, monkeypatch):
+    s = float(np.sqrt(.5))
+
+    def set_mounts(rows):
+        rows[0].update(rotation=[s, 0, 0, s], translation=[2, 3, 1])
+        rows[1].update(rotation=[s, 0, s, 0], translation=[4, 4, 1],
+                       camera_intrinsic=[[10, 2, 3], [0, 10, 3], [0, 0, 1]])
+
+    update(contract_root, "calibrated_sensor", set_mounts)
+    monkeypatch.setattr(Image, "open", lambda *args, **kwargs: pytest.fail("Rig markers must not decode images."))
+    (contract_root / "samples/CAM_FRONT/image.png").unlink()
+    loader = open_loader()
+    frame = loader.load_point_cloud("both")
+    pose, = loader.camera_rig(frame)
+    assert pose.sensor_id == "CAM_FRONT"
+    np.testing.assert_allclose(pose.position, [1, -2, 0], atol=1e-12)
+    np.testing.assert_allclose(pose.forward, [0, -1, 0], atol=1e-12)
+    np.testing.assert_allclose(pose.corner_rays, [
+        [-.3, -1, .24], [-.3, -1, -.56], [.5, -1, -.4], [.5, -1, .4],
+    ], atol=1e-12)
+    assert loader.camera_rig(loader.load_point_cloud("lidar-only")) == ()
+
+
+def test_camera_rig_keeps_valid_mount_without_intrinsics(contract_root, open_loader):
+    update(contract_root, "calibrated_sensor", lambda rows: rows[1].pop("camera_intrinsic"))
+    loader = open_loader()
+    pose, = loader.camera_rig(loader.load_point_cloud("both"))
+    assert pose.sensor_id == "CAM_FRONT"
+    assert pose.corner_rays is None
+
+
 def test_payload_indices_belong_to_their_own_modality_list(contract_root, open_loader):
     update(contract_root, "sample", lambda rows: rows[1].update(timestamp=500_100))
     loader = open_loader()
@@ -295,6 +326,7 @@ def test_uncalibrated_images_are_valid_and_missing_pose_time_stays_unknown(contr
     assert camera.pose_timestamp_us is None
     assert camera.timestamp_us == 975_000
     assert camera.image.shape == (8, 8, 3)
+    assert loader.camera_rig(loader.load_point_cloud("both")) == ()
     cloud = loader.load_point_cloud("lidar-only")
     # Its recorded ego pose timestamp is known even though sample_data lacks it.
     assert cloud.reference_pose_timestamp_us == 1_000_000

@@ -13,26 +13,21 @@ I recommend to use Python 3.10–3.12. From the repository's root:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -e './visual_utils' \
-  -e './viz_tools/2dcameraviz' \
-  -e './viz_tools/3dviz'
+python -m pip install -e './visual_utils' -e './viz_tools/3dviz'
 3dviz --demo
-2dcameraviz --demo
 ```
 
-`3dviz` serves the workspace on localhost and opens it in your browser. The
-camera viewer opens a separate desktop window.
-
-**Note: We plan to integrate the 2d camera viewer into 3dviz.**
+`3dviz` opens a local browser workspace for point clouds, detection, and LiDAR
+segmentation. On a calibrated dataset, click a camera preview in the 3D scene
+to review its image and overlays. [Camera review guide](viz_tools/3dviz/README.md#camera-images)
 
 ## 🔌 Integrate your own dataset
 
 Implement one `DatasetLoader` in your own package. It adapts native storage to
-shared metadata and sensor records used directly by both viewers. There
-is one frame/box model at that boundary. Declare point clouds, cameras, or both
-through capabilities.
+shared metadata and sensor records used by the browser workspace and Python
+clients. Declare point clouds, cameras, or both through capabilities.
 Register the constructor in a script, or publish an installed
-`visual_utils.loaders` entry point so it appears in the viewer commands.
+`visual_utils.loaders` entry point so it appears in `3dviz`.
 Prediction-file adapters are a separate extension interface.
 
 Start with the [runnable custom-dataset tutorial](visual_utils/docs/custom_datasets.md),

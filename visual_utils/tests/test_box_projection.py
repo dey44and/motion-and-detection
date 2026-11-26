@@ -9,7 +9,7 @@ from visual_utils import (
     AnnotationSet, AnnotationStatus, Box3D, CameraFrameSet, CameraObservation,
     FrameInfo, Modality, PinholeProjection, ProjectionResult,
 )
-from cameraviz.processing import ProjectedBox, class_color, project_box, project_boxes
+from visual_utils.box_projection import ProjectedBox, project_box, project_boxes
 
 
 def camera(*, pose=None, intrinsics=None, channel="CAM_FRONT", width=101, height=101):
@@ -154,26 +154,6 @@ def test_each_camera_uses_its_own_pose_and_preserves_visible_box_order():
 def test_invalid_near_plane_is_rejected(near):
     with pytest.raises(ValueError, match="near_plane"):
         project_box(box(), camera(), near_plane=near)
-
-
-@pytest.mark.parametrize("name,color", [
-    ("car", "#0d59bf"), ("truck", "#bf400d"), ("bus", "#8c33b2"),
-    ("trailer", "#8c5926"), ("construction_vehicle", "#a67300"),
-    ("pedestrian", "#d91a33"), ("motorcycle", "#008066"),
-    ("bicycle", "#1a8c1a"), ("traffic_cone", "#e65900"), ("barrier", "#4c5966"),
-])
-def test_known_class_palette_matches_3d_viewer(name, color):
-    assert class_color(name) == color
-
-
-def test_unknown_class_color_is_deterministic_and_valid_hex():
-    color = class_color("vehicle.emergency.ambulance")
-    assert color == class_color("vehicle.emergency.ambulance")
-    assert len(color) == 7 and color[0] == "#"
-    assert 0 <= int(color[1:], 16) <= 0xFFFFFF
-    assert color != class_color("vehicle.emergency.police")
-    with pytest.raises(ValueError, match="nonempty string"):
-        class_color("")
 
 
 @pytest.mark.parametrize("undefined_depth", [False, True])

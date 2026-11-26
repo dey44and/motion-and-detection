@@ -1,6 +1,7 @@
 import './style.css';
-import { bootstrap, closeSession, createSession, fetchFrame, fetchSegmentation, runJob } from './api';
+import { bootstrap, closeSession, createSession, fetchCameraPreviews, fetchFrame, fetchSegmentation, runJob } from './api';
 import { parseCamera } from './camera';
+import { CameraReviewModal } from './camera-review';
 import { detectionPanel, predictionSources, segmentationPanel, wireReviewControls } from './review';
 import { Viewer, rgbHex } from './viewer';
 import type { ClassStyle } from './viewer';
@@ -107,6 +108,7 @@ const predictionLayer = el<HTMLInputElement>('layer-predictions');
 const groundTruthOverride = el<HTMLInputElement>('override-gt-color');
 const groundTruthColor = el<HTMLInputElement>('ground-truth-color');
 const predictionColor = el<HTMLInputElement>('prediction-color');
+const cameraReviewModal = new CameraReviewModal();
 let info: Bootstrap | null = null;
 let state: ViewerState | null = null;
 let packet: FramePacket | null = null;
@@ -118,7 +120,10 @@ let generation = 0;
 let cameraDirty = false;
 let committedColor: Scheme = 'gray';
 let segmentationFailure = '';
+let semanticLabels: Uint8Array | null = null;
+let hiddenSemanticClasses: ReadonlySet<number> = new Set();
 let cameraSync: ReturnType<typeof setTimeout> | null = null;
+let cameraPreviews: AbortController | null = null;
 const classStyles = new Map<string, ClassStyle>();
 const review = wireReviewControls({
   run: executeReview,
@@ -131,7 +136,10 @@ const review = wireReviewControls({
     range.value = String(appearance.line_width);
     updateBoxStyle();
   },
-  setClassVisibility: hidden => viewer?.setSemanticClasses(state?.segmentation?.classes ?? [], hidden),
+  setClassVisibility: hidden => {
+    hiddenSemanticClasses = hidden;
+    viewer?.setSemanticClasses(state?.segmentation?.classes ?? [], hidden);
+  },
   error,
 });
 
@@ -301,6 +309,19 @@ async function readSegmentation(id: string, next: ViewerState, nextPacket: Frame
   }
 }
 
+function displayCameraRig(id: string, next: ViewerState, hasFrame: boolean) {
+  cameraPreviews?.abort();
+  cameraPreviews = null;
+  const markers = hasFrame ? next.camera_rig ?? [] : [];
+  viewer!.setCameraMarkers(markers);
+  if (!markers.some(marker => marker.corner_rays)) return;
+  const controller = new AbortController();
+  cameraPreviews = controller;
+  void fetchCameraPreviews(id, next.revision, controller.signal).then(images => {
+    if (!controller.signal.aborted && !disposed && state?.revision === next.revision) viewer?.setCameraImages(images);
+  }).catch(() => { /* The frustums remain available when previews cannot be loaded. */ });
+}
+
 async function execute(body: FrameJob) {
   if (busy || !session || disposed) return;
   const token = ++generation;
@@ -324,6 +345,8 @@ async function execute(body: FrameJob) {
     }
     else viewer!.clearFrame();
     state = next; packet = nextPacket; segmentationFailure = failure;
+    displayCameraRig(session, next, nextPacket !== null);
+    semanticLabels = labels;
     cameraDirty = false;
     cameraMessage('', false);
     if (body.op === 'prepare' && body.rgb !== undefined) color.value = body.rgb ? 'rgb' : color.value;
@@ -345,7 +368,8 @@ async function executeReview(body: ReviewJob): Promise<boolean> {
   const token = ++generation;
   const revision = state.revision;
   el('error').hidden = true;
-  setBusy(true, body.op === 'detection' ? 'Updating detections…' : 'Reading LiDAR labels…');
+  const startMessages = {detection: 'Updating detections…', segmentation: 'Reading LiDAR labels…', cameras: 'Loading camera images…'};
+  setBusy(true, startMessages[body.op]);
   try {
     const next = await runJob(session, {...body, revision}, stage => {if (token === generation) setStatus(stage);});
     if (disposed || token !== generation || state.revision !== revision) return false;
@@ -356,20 +380,40 @@ async function executeReview(body: ReviewJob): Promise<boolean> {
       review.renderDetection(next.detection);
       renderClasses();
       updateBoxStyle();
-    } else {
+    } else if (body.op === 'segmentation') {
       const {labels, failure} = await readSegmentation(session, next, packet);
       if (disposed || token !== generation || state.revision !== revision) return false;
       state = next; segmentationFailure = failure;
+      semanticLabels = labels;
       viewer!.setSemanticLabels(labels);
       review.renderSegmentation(next.segmentation, failure);
       if (body.segmentation_mode && body.segmentation_mode !== 'off') color.value = 'semantic';
       updatePointStyle();
+    } else {
+      state = next;
     }
     return true;
   } catch (issue) {
+    if (body.op === 'cameras') throw issue;
     if (!disposed && token === generation) {error(issue); setStatus('Previous review retained.');}
     return false;
   } finally {if (!disposed && token === generation) setBusy(false);}
+}
+function openCameraImages(cameraId: string) {
+  if (busy || !session || !state || !info || !packet || !supports('cameras')) return;
+  const revision = state.revision;
+  cameraReviewModal.open({
+    session, packet, palettes: info.palettes, cameraId,
+    scheme: committedColor, maxDistance: Number(el<HTMLInputElement>('max-distance').value),
+    semanticLabels, semanticClasses: state.segmentation?.classes ?? [], hiddenSemanticClasses,
+    classStyles, predictionColor: predictionColor.value,
+    lineWidth: Number(el<HTMLInputElement>('box-width-number').value),
+    load: async points => {
+      if (state?.revision !== revision) return null;
+      const success = await executeReview({op: 'cameras', camera_points: points});
+      return success && state?.revision === revision ? state.camera_review ?? null : null;
+    },
+  });
 }
 function desiredDisplay() {return {rgb:color.value === 'rgb', raw:raw.checked};}
 function selectFrame(index: number) {if (state && dataset.value !== state.dataset.name) return; if (!state || !Number.isInteger(index) || index < 0 || index >= state.frames.length) {renderState(); return;} if (index !== state.frame_index) void execute({op:'select', frame_index:index, ...desiredDisplay()});}
@@ -515,11 +559,19 @@ narrowLayout.addEventListener('change', e => {cameraPanel.open = !e.matches;});
 el('dismiss-error').addEventListener('click', () => {el('error').hidden=true; if (packet && !busy) setStatus('');});
 el('try-demo').addEventListener('click', () => {dataset.value='demo'; root.value=''; version.value=''; connect();});
 document.addEventListener('keydown', e => {
-  if (e.defaultPrevented || e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement || e.ctrlKey || e.altKey || e.metaKey) return;
+  if (cameraReviewModal.isOpen || e.defaultPrevented || e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement || e.ctrlKey || e.altKey || e.metaKey) return;
   if (e.key === 'ArrowRight') {e.preventDefault(); selectFrame((state?.frame_index??0)+1);}
   if (e.key === 'ArrowLeft') {e.preventDefault(); selectFrame((state?.frame_index??0)-1);}
 });
-window.addEventListener('pagehide', () => {disposed=true; generation++; if (cameraSync) clearTimeout(cameraSync); viewer?.dispose(); if(session) void closeSession(session);}, {once:true});
+window.addEventListener('pagehide', () => {
+  disposed = true;
+  generation++;
+  if (cameraSync) clearTimeout(cameraSync);
+  cameraPreviews?.abort();
+  cameraReviewModal.close();
+  viewer?.dispose();
+  if (session) void closeSession(session);
+}, {once: true});
 async function start() {
   try {
     review.renderDetection(); review.renderSegmentation(); updateBoxStyle();
@@ -527,7 +579,7 @@ async function start() {
     review.setDetectionDefaults(info.prediction_formats, info.initial.prediction_path, info.initial.prediction_format);
     option(dataset,info.datasets.map(value=>({value,text:value==='demo'?'Synthetic demo':value==='nuscenes'?'nuScenes':value==='waymo'?'Waymo':value})),info.initial.dataset);
     root.value=info.initial.root||''; version.value=info.initial.version||'';
-    viewer=new Viewer(el('viewport'),info.palettes); viewer.onCameraChange=queueCameraRefresh;
+    viewer=new Viewer(el('viewport'),info.palettes); viewer.onCameraChange=queueCameraRefresh; viewer.onCameraSelect=openCameraImages;
     session=(await createSession()).id; syncDisabled(); el('sidebar').classList.remove('is-loading'); setStatus('Ready to load a dataset.');
     if(info.initial.autoload) await execute({op:'connect',dataset:info.initial.dataset,root:info.initial.root,version:info.initial.version,config_path:info.initial.config_path,split:info.initial.split,scene_id:info.initial.scene||undefined,frame_index:info.initial.frame,...desiredDisplay()});
   } catch(issue) {el('sidebar').classList.remove('is-loading'); error(issue); setStatus('Unable to connect to the local viewer.');}

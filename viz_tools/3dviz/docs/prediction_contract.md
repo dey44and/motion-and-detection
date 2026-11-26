@@ -213,5 +213,4 @@ filtering cannot recover removed boxes or establish benchmark performance.
 
 Return to the [viewer guide](../README.md) for launch options and workspace
 controls. The [dataset extension guide](../../../visual_utils/docs/custom_datasets.md)
-explains how the same provider supplies observations to the browser 3D viewer
-and standalone camera viewer.
+explains how providers supply point clouds and camera observations to `3dviz`.

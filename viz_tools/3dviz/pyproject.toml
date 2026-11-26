@@ -5,12 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "threedviz"
 version = "0.3.0"
-description = "Local browser viewer for point clouds, 3D detections, and LiDAR segmentation"
+description = "Local browser viewer for point clouds, cameras, 3D detections, and LiDAR segmentation"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "visual-utils>=0.3,<0.4",
     "numpy>=1.24,<3",
+    "Pillow>=10,<13",
     "matplotlib>=3.6,<4",
     "fastapi>=0.115,<1",
     "uvicorn>=0.30,<1",

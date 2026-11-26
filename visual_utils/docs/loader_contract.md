@@ -1,9 +1,8 @@
 # 📐 Dataset interface
 
-Implement one dataset adapter to connect your storage to the viewers. The
-adapter returns shared Python records that the camera, point-cloud, and
-detection viewers consume directly. This reference describes the methods and
-scientific conventions they rely on.
+Implement one dataset adapter to connect your storage to `3dviz` and Python
+clients. The adapter returns shared point-cloud and camera records with
+explicit scientific conventions.
 
 **[Package overview](../README.md)** ·
 **[Runnable tutorial](custom_datasets.md)** ·
@@ -30,6 +29,7 @@ def _load_point_cloud(self, frame_id: str) -> PointCloudFrame: ...
 def _load_cameras(self, frame_id: str) -> CameraFrameSet: ...
 
 # Optional:
+def _camera_rig(self, frame: PointCloudFrame) -> tuple[CameraPose, ...]: ...
 def _prepare_point_cloud(self, frame, *, request: PointCloudPreparation): ...
 def _lidar_scan_token(self, frame_id: str) -> str: ...
 def _load_lidarseg_ground_truth(self, frame: PointCloudFrame) -> LidarSegmentation: ...
@@ -56,11 +56,13 @@ serialize reads and wait for pending work before closing. The
 | `PointCloudFrame` | XYZ points, attributes, annotations, spatial reference and optional prepared data. |
 | `LidarSegmentation` | Exact LiDAR scan token, evaluation IDs, and original native IDs for each point. |
 | `CameraFrameSet` | Ordered RGB observations, annotations and their shared spatial reference. |
+| `CameraPose` | Camera mount position, unit forward direction, and optional calibrated corner rays in the point cloud's reference. |
 | `Box3D` | Annotation/class IDs, center, LWH size and full rotation. |
 
-A point-only adapter needs only the point-cloud payload. A camera-only adapter
-needs only the camera payload. Metadata describes the configured sources, and
-unsupported operations raise `UnsupportedCapabilityError`.
+A point-only adapter needs only the point-cloud payload. Python clients can
+use camera-only adapters with only the camera payload. The `3dviz` workspace
+requires a point cloud. Metadata describes configured sources, and unsupported
+operations raise `UnsupportedCapabilityError`.
 
 Class IDs retain native identity. `display_name` and optional `display_group`
 control labels and grouped checkboxes without rewriting boxes. Camera sensor
@@ -97,6 +99,21 @@ the same small protocol. An image without calibration remains viewable.
 Projection validity means a finite, positive-depth projection, not image bounds
 or proven visibility. Retain signed depth for behind-camera points when defined
 so the viewer can clip box edges correctly. Invalid UV may be NaN.
+
+`camera_rig(frame)` gives the viewer camera mount markers from calibration
+metadata. The frame comes from the same loader. Each marker uses the camera
+`sensor_id`, its position in metres, and its optical +Z direction expressed as
+a unit vector in the cloud reference. Use the mounted rig at the cloud's
+reference pose. Separately, `load_cameras` uses the image's exposure pose for
+projection. Rig lookup leaves images unopened and returns only available,
+calibrated markers. Providers without rig data return an empty tuple.
+
+When the image extent and lens calibration are available, `corner_rays` holds
+four vectors in top-left, top-right, bottom-right, bottom-left order. They
+correspond to image bounds `(0, 0)`, `(width, 0)`, `(width, height)`, and
+`(0, height)`. Each vector has dot product 1 with `forward`. The expression
+`position + depth * corner_rays` places the quad on a plane at that optical
+depth in metres. `3dviz` uses these rays for the clickable camera preview.
 
 ## 🎨 Describe annotations and optional processing
 
@@ -140,7 +157,7 @@ through the viewer and are matched to the scan token at review time.
 settings. `load_dataset_config(path)` reads the same fields from JSON. Relative
 roots resolve against the JSON location, and relative named sources resolve
 against that root when present. Without a root, named sources resolve against
-the JSON directory. All three commands accept `--dataset-config FILE`.
+the JSON directory. `3dviz` accepts `--dataset-config FILE`.
 
 Register a constructor with `register_loader("name", MyDataset)`. Installed
 packages may expose a `visual_utils.loaders` entry point instead. The registry

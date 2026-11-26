@@ -74,6 +74,34 @@ class SensorInfo:
         object.__setattr__(self, "modality", _enum(Modality, self.modality))
 
 
+@dataclass(frozen=True, eq=False)
+class CameraPose:
+    """A rig marker in its cloud reference, with optional calibrated image rays.
+
+    Rays point through the top-left, top-right, bottom-right and bottom-left
+    image corners. Each ray has unit depth along the optical forward axis.
+    """
+
+    sensor_id: str
+    position: np.ndarray
+    forward: np.ndarray
+    corner_rays: np.ndarray | None = None
+
+    def __post_init__(self):
+        _text(self.sensor_id, "sensor_id")
+        position = _array(self.position, (3,), "camera position", dtype=np.float64)
+        forward = _array(self.forward, (3,), "camera forward direction", dtype=np.float64)
+        if not np.isclose(np.linalg.norm(forward), 1.0, rtol=0, atol=1e-6):
+            raise DatasetValidationError("Camera forward direction must have unit length.")
+        object.__setattr__(self, "position", position)
+        object.__setattr__(self, "forward", forward)
+        if self.corner_rays is not None:
+            rays = _array(self.corner_rays, (4, 3), "camera corner rays", dtype=np.float64)
+            if not np.allclose(rays @ forward, 1.0, rtol=0, atol=1e-6):
+                raise DatasetValidationError("Camera corner rays must have unit depth along the forward axis.")
+            object.__setattr__(self, "corner_rays", rays)
+
+
 @dataclass(frozen=True)
 class DatasetMetadata:
     dataset_id: str
